@@ -1,0 +1,3 @@
+/target
+/packages/*.webc
+/packages/*.sha256

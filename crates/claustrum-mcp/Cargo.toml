@@ -1,0 +1,17 @@
+[package]
+name = "claustrum-mcp"
+description = "MCP server exposing Claustrum's sandboxed tools to Claude Code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claustrum-sandbox.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

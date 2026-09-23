@@ -1,0 +1,60 @@
+# Example Claustrum configuration.
+#
+# Copy to `claustrum.toml` in your project (or to
+# ~/Library/Application Support/de.buschmanuel.claustrum/config.toml on macOS,
+# ~/.config/claustrum/config.toml on Linux). Every setting is optional.
+
+[sandbox]
+# Host directory mounted read/write at /workspace. Defaults to the current directory.
+# workspace = "."
+
+# Network access for guest processes: "disabled" (default), "host", or a
+# list of Wasmer ruleset entries such as ["dns:allow=*.crates.io:443"].
+network = "disabled"
+
+# Default per-command timeout in seconds (0 = unlimited).
+timeout_secs = 120
+
+# Bytes retained per output stream of a command.
+max_output_bytes = 1048576
+
+# Extra environment variables for guest commands.
+[sandbox.env]
+# RUST_LOG = "info"
+
+[packages]
+# Directory holding the .webc files. Defaults to the user data directory.
+# dir = "~/.local/share/claustrum/packages"
+
+# Allow the runtime to fetch missing packages from the Wasmer registry.
+online = false
+
+# Packages loaded into the sandbox. When this list is empty, bash and
+# coreutils are used. `source` is what `claustrum pkg sync` downloads; `id`
+# is only needed for files obtained elsewhere that other packages depend on.
+[[packages.package]]
+file = "bash.webc"
+source = "wasmer/bash"
+
+[[packages.package]]
+file = "coreutils.webc"
+source = "wasmer/coreutils"
+
+# Additional host directories, mounted read/write at absolute guest paths.
+# [[mounts]]
+# guest = "/data"
+# host = "~/datasets"
+
+[claude]
+# Path to the claude binary. Defaults to `claude` on PATH.
+# binary = "/usr/local/bin/claude"
+
+# Built-in Claude Code tools to keep. Empty removes all of them; WebSearch is
+# safe to keep because it runs on the API side.
+tools = []
+
+# Extra arguments always passed to claude.
+args = []
+
+# Text appended to the system prompt in addition to the sandbox notice.
+# system_prompt = "Always run the test suite before finishing."

@@ -1,0 +1,36 @@
+[package]
+name = "claustrum-sandbox"
+description = "WASIX sandbox runtime for Claustrum: file system, packages, processes and native tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wasmer.workspace = true
+wasmer-wasix.workspace = true
+virtual-fs.workspace = true
+virtual-net.workspace = true
+webc.workspace = true
+wasmer-package.workspace = true
+wasmer-wasix-types.workspace = true
+wasmer-config.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+globset.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+grep-matcher.workspace = true
+similar.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+directories.workspace = true
+bytes.workspace = true
+semver.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
