@@ -125,7 +125,8 @@ fn system_prompt(extra: Option<&str>) -> String {
          built-in tools of the same name and take the same parameters. The project directory is \
          mounted at {WORKSPACE}, which is the working directory; refer to files by paths under \
          {WORKSPACE} or relative to it. Only the sandbox's own commands are available in Bash \
-         (bash, coreutils and whatever packages are installed); there is no network, no host \
+         (bash, coreutils, python, jq and whatever else is installed; the MCP server \
+         instructions list them); there is no git, no network, no host \
          toolchain and no access to files outside the sandbox. If a needed command is missing, \
          say so instead of trying workarounds on the host."
     );

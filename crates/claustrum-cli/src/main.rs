@@ -39,7 +39,14 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("CLAUSTRUM_LOG")
                 .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                // The module cache logs a warning on every cache miss
+                // ("unable to remove the corrupted cache file"); that is
+                // normal on first use, so keep it out of the default output.
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "warn,wasmer_wasix::runtime::module_cache::filesystem=error",
+                    )
+                }),
         )
         .with_writer(std::io::stderr)
         .init();

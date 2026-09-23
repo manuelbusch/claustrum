@@ -16,11 +16,26 @@ use crate::{
     runtime::build_runtime,
 };
 
+/// Guest directory holding Claustrum's own support files.
+const ETC_DIR: &str = "/etc/claustrum";
+const PROFILE_FILE: &str = "/profile.sh";
+
+/// Sourced by every bash via `BASH_ENV`. The guest cannot tell that stdout is
+/// not a terminal (WASIX reports stdio as character devices), so tools that
+/// colourise or page based on `isatty` are tamed here.
+const PROFILE: &str = r#"# Claustrum sandbox profile. Output is captured for a language model, not shown
+# on a terminal: no colours, no pagers, no interactive prompts.
+export PAGER=cat GIT_PAGER=cat NO_COLOR=1 CLICOLOR=0 PYTHONUNBUFFERED=1
+jq() { command jq -M "$@"; }
+ls() { command ls --color=never "$@"; }
+"#;
+
 /// Builder for a [`Sandbox`].
 #[derive(Debug)]
 pub struct SandboxBuilder {
     workspace: Option<PathBuf>,
     packages: Vec<BundledPackage>,
+    dir_packages: Vec<PathBuf>,
     policy: Policy,
     runtime: RuntimeConfig,
     env: BTreeMap<String, String>,
@@ -39,6 +54,7 @@ impl Default for SandboxBuilder {
         Self {
             workspace: None,
             packages: Vec::new(),
+            dir_packages: Vec::new(),
             policy: Policy::default(),
             runtime: RuntimeConfig::default(),
             env,
@@ -64,6 +80,13 @@ impl SandboxBuilder {
     /// so that other bundled packages can depend on it.
     pub fn package_named(mut self, webc: impl Into<PathBuf>, id: impl Into<String>) -> Self {
         self.packages.push(BundledPackage::named(webc, id));
+        self
+    }
+
+    /// Add a directory package (`wasmer.toml` plus `.wasm` modules), e.g. a
+    /// self-built WASIX binary.
+    pub fn package_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dir_packages.push(dir.into());
         self
     }
 
@@ -110,6 +133,17 @@ impl SandboxBuilder {
         for package in &self.packages {
             packages.add_webc(&package.path, &*base_runtime).await?;
         }
+        for dir in &self.dir_packages {
+            packages.add_dir(dir, &*base_runtime).await?;
+        }
+
+        let etc = fs::mem_dir();
+        crate::native::write_file(&*etc, Path::new(PROFILE_FILE), PROFILE.as_bytes())
+            .await
+            .map_err(|e| Error::fs(format!("{ETC_DIR}{PROFILE_FILE}"), e))?;
+        self.env
+            .entry("BASH_ENV".into())
+            .or_insert_with(|| format!("{ETC_DIR}{PROFILE_FILE}"));
 
         let mut mounts = vec![
             Mount {
@@ -123,6 +157,10 @@ impl SandboxBuilder {
             Mount {
                 guest: "/home/claude".into(),
                 fs: fs::mem_dir(),
+            },
+            Mount {
+                guest: ETC_DIR.into(),
+                fs: etc,
             },
         ];
         for (guest, host) in &self.extra_mounts {
@@ -216,6 +254,39 @@ impl Sandbox {
     /// Names of all guest commands (from the loaded packages).
     pub fn commands(&self) -> Vec<String> {
         self.inner.packages.command_names()
+    }
+
+    /// Compile every distinct module of the loaded packages into the module
+    /// cache, so that the first invocation of a large tool (python takes
+    /// close to a minute to compile) does not eat into a command timeout.
+    /// Returns the number of modules compiled or loaded.
+    pub async fn precompile(&self) -> Result<usize> {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut count = 0;
+        for package in self.inner.packages.packages() {
+            for command in &package.commands {
+                if !seen.insert(*command.hash()) {
+                    continue;
+                }
+                tracing::info!(command = command.name(), "compiling module");
+                self.inner
+                    .runtime
+                    .resolve_module(
+                        wasmer_wasix::runtime::ModuleInput::Command(std::borrow::Cow::Borrowed(
+                            command,
+                        )),
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::Other(format!("cannot compile `{}`: {e}", command.name()))
+                    })?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Current working directory used for commands and relative paths.

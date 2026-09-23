@@ -29,9 +29,10 @@ max_output_bytes = 1048576
 # Allow the runtime to fetch missing packages from the Wasmer registry.
 online = false
 
-# Packages loaded into the sandbox. When this list is empty, bash and
-# coreutils are used. `source` is what `claustrum pkg sync` downloads; `id`
-# is only needed for files obtained elsewhere that other packages depend on.
+# Packages loaded into the sandbox. When this list is empty, bash, coreutils,
+# python and jq are used. `source` is what `claustrum pkg sync` downloads;
+# `id` is only needed for files obtained elsewhere that other packages depend
+# on. `file` may also name a directory package created by `pkg add-wasm`.
 [[packages.package]]
 file = "bash.webc"
 source = "wasmer/bash"
@@ -39,6 +40,18 @@ source = "wasmer/bash"
 [[packages.package]]
 file = "coreutils.webc"
 source = "wasmer/coreutils"
+
+[[packages.package]]
+file = "python.webc"
+source = "python/python"
+
+[[packages.package]]
+file = "jq.webc"
+source = "syrusakbary/jq"
+
+# A self-built WASIX binary, e.g. from scripts/build-jaq.sh:
+# [[packages.package]]
+# file = "jaq"
 
 # Additional host directories, mounted read/write at absolute guest paths.
 # [[mounts]]

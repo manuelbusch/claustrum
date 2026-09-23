@@ -2,6 +2,7 @@
 
 use std::{path::Path, sync::Arc};
 
+use wasmer_config::package::PackageId;
 use wasmer_wasix::{Runtime, bin_factory::BinaryPackage};
 
 use crate::{Error, Result};
@@ -35,6 +36,28 @@ impl PackageSet {
         Ok(())
     }
 
+    /// Load a directory package: a `wasmer.toml` next to its `.wasm` modules.
+    ///
+    /// This is how self-built WASIX binaries are added without the `wasmer`
+    /// CLI. The package gets a hash identity derived from the directory path,
+    /// so other packages cannot depend on it by name.
+    pub async fn add_dir(
+        &mut self,
+        dir: &Path,
+        runtime: &(dyn Runtime + Send + Sync),
+    ) -> Result<()> {
+        let pkg = BinaryPackage::from_dir(dir, runtime)
+            .await
+            .map_err(|e| Error::Package {
+                path: dir.to_path_buf(),
+                message: format!("{e:#}"),
+            })?;
+        if !self.packages.iter().any(|p| p.id == pkg.id) {
+            self.packages.push(Arc::new(pkg));
+        }
+        Ok(())
+    }
+
     /// All loaded packages.
     pub fn packages(&self) -> &[Arc<BinaryPackage>] {
         &self.packages
@@ -53,20 +76,36 @@ impl PackageSet {
     }
 
     /// Find the package that provides `command`.
+    ///
+    /// A loaded package also carries the commands of its dependencies (bash
+    /// brings coreutils along), so the same command can be reachable through
+    /// several packages. Prefer the package the command originates from and
+    /// otherwise accept any provider as long as they all point at the same
+    /// origin.
     pub fn resolve(&self, command: &str) -> Result<Arc<BinaryPackage>> {
-        let matches: Vec<&Arc<BinaryPackage>> = self
+        let providers: Vec<(&Arc<BinaryPackage>, Option<&PackageId>)> = self
             .packages
             .iter()
             .filter(|p| p.get_command(command).is_some())
+            .map(|p| (p, p.get_command_origin_package(command)))
             .collect();
-        match matches.as_slice() {
-            [] => Err(Error::CommandNotFound(command.to_owned())),
-            [pkg] => Ok(Arc::clone(pkg)),
-            many => Err(Error::CommandAmbiguous {
-                command: command.to_owned(),
-                packages: many.iter().map(|p| p.id.to_string()).collect(),
-            }),
+        if providers.is_empty() {
+            return Err(Error::CommandNotFound(command.to_owned()));
         }
+        if let Some((pkg, _)) = providers
+            .iter()
+            .find(|(p, origin)| origin.is_some_and(|o| *o == p.id))
+        {
+            return Ok(Arc::clone(pkg));
+        }
+        let first_origin = providers[0].1;
+        if providers.iter().all(|(_, o)| *o == first_origin) {
+            return Ok(Arc::clone(providers[0].0));
+        }
+        Err(Error::CommandAmbiguous {
+            command: command.to_owned(),
+            packages: providers.iter().map(|(p, _)| p.id.to_string()).collect(),
+        })
     }
 }
 

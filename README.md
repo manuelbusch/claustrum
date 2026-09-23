@@ -83,9 +83,11 @@ Use `claustrum run --dry-run` to print the exact `claude` command line.
 | --- | --- |
 | `claustrum run [--workspace DIR] [--permission-mode MODE] [-- claude args…]` | Launch Claude Code against the sandbox. |
 | `claustrum serve [--workspace DIR]` | Serve the tools over MCP on stdio (what `run` starts under the hood). |
-| `claustrum pkg sync [--force]` | Download the configured packages. |
-| `claustrum pkg add <spec>` | Download one package, e.g. `wasmer/python`. |
+| `claustrum pkg sync [--force]` | Download the configured packages and precompile them. |
+| `claustrum pkg add <spec>` | Download one package, e.g. `python/python`. |
+| `claustrum pkg add-wasm <name> <file.wasm> [--alias cmd]` | Register a self-built WASIX binary as a package. |
 | `claustrum pkg list` / `pkg commands` | Show installed packages and the commands they provide. |
+| `claustrum pkg precompile` | Compile all packages into the module cache ahead of time. |
 
 Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (or
 `CLAUSTRUM_PACKAGES_DIR`). Logging goes to stderr and is controlled by `CLAUSTRUM_LOG`
@@ -105,8 +107,20 @@ stores them in the user data directory and records each package's identity in a 
 file next to it, which is how dependencies between packages (bash depends on coreutils) resolve
 offline. Files obtained some other way can be given an explicit `id` in the configuration.
 
-Only packages built for WASIX work. Known good: `wasmer/bash`, `wasmer/coreutils`,
-`python/python`.
+The default set is `wasmer/bash`, `wasmer/coreutils`, `python/python` (CPython 3.13 with the
+standard library, about 60 MB) and `syrusakbary/jq` (jq 1.6). Python takes close to a minute
+to compile on first use, which is why `pkg sync` precompiles everything into the module cache.
+
+Self-built tools can be added without the `wasmer` CLI: compile a Rust program with
+[`cargo wasix`](https://github.com/wasix-org/cargo-wasix) and register the result with
+`claustrum pkg add-wasm <name> <file.wasm>`, which writes a directory package (`wasmer.toml`
+plus the module) into the packages directory. [`scripts/build-jaq.sh`](scripts/build-jaq.sh)
+does this for [jaq](https://github.com/01mf02/jaq), a current jq implementation in Rust.
+
+**git is not available yet.** No WASIX build of git is published anywhere; the only known
+recipe is the [wasinix](https://github.com/wasix-org/wasinix) Nix flake, which builds on
+x86_64 Linux only and needs a patched runtime. gitoxide does not target WASIX either. Until
+that changes, git operations have to happen on the host.
 
 ## Sandbox layout
 
@@ -115,10 +129,13 @@ Only packages built for WASIX work. Known good: `wasmer/bash`, `wasmer/coreutils
 | `/workspace` | host project directory | read/write, this is the working directory |
 | `/tmp`, `/home/claude` | in-memory | persist for the lifetime of the server |
 | `/bin`, `/usr/bin` | package commands | populated from the loaded `.webc` files |
+| `/etc/claustrum/profile.sh` | in-memory | sourced by every bash via `BASH_ENV` |
 
 Guest commands get a fixed environment (`HOME=/home/claude`, `PATH=/usr/local/bin:/bin:/usr/bin`,
-`TERM=dumb`) plus anything set under `[sandbox.env]`. Each `Bash` call is a fresh process;
-only the file system persists between calls.
+`TERM=dumb`) plus anything set under `[sandbox.env]`. Because WASIX reports stdio as a
+terminal, the profile disables colours and pagers (`NO_COLOR`, `PAGER=cat`, `jq -M`) so that
+captured output stays clean. Each `Bash` call is a fresh process; only the file system
+persists between calls.
 
 ## Development
 
@@ -141,7 +158,7 @@ The integration tests skip themselves when the packages are missing.
 
 ## Roadmap
 
-- More guest tools: git, python, jq, sed/awk/grep as WASIX builds.
+- git inside the sandbox (blocked on a WASIX build, see Packages); sed/awk/grep as WASIX builds.
 - Expose the native tools inside the guest as well (so `grep` in a Bash call hits the fast
   path), via Wasmer's builtin-command mechanism.
 - Network allowlists per project.

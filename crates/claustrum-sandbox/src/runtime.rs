@@ -8,8 +8,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use wasmer_wasix::{
     PluggableRuntime, Runtime,
+    os::tty::{TtyBridge, WasiTtyState},
     runtime::{
-        DefaultTty,
         module_cache::{FileSystemCache, ModuleCache, SharedCache},
         package_loader::BuiltinPackageLoader,
         resolver::{BackendSource, InMemorySource, MultiSource, PackageSummary},
@@ -34,8 +34,12 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        let cache_dir = directories::ProjectDirs::from("de", "buschmanuel", "claustrum")
-            .map(|d| d.cache_dir().to_path_buf())
+        let cache_dir = std::env::var_os("CLAUSTRUM_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                directories::ProjectDirs::from("de", "buschmanuel", "claustrum")
+                    .map(|d| d.cache_dir().to_path_buf())
+            })
             .unwrap_or_else(|| std::env::temp_dir().join("claustrum-cache"));
         Self {
             cache_dir,
@@ -93,6 +97,32 @@ impl BundledPackage {
     }
 }
 
+/// A TTY bridge that reports "not a terminal" on all three standard streams.
+///
+/// Guest output is captured and handed to a model, so tools must not emit
+/// colours, pagers or progress bars. Wasmer's `DefaultTty` claims a terminal
+/// on every stream, which makes `jq`, `ls` and friends colourise.
+#[derive(Debug)]
+struct NoTty;
+
+impl TtyBridge for NoTty {
+    fn reset(&self) {}
+
+    fn tty_get(&self) -> WasiTtyState {
+        WasiTtyState {
+            stdin_tty: false,
+            stdout_tty: false,
+            stderr_tty: false,
+            echo: false,
+            line_buffered: false,
+            line_feeds: false,
+            ..WasiTtyState::default()
+        }
+    }
+
+    fn tty_set(&self, _state: WasiTtyState) {}
+}
+
 /// Build the shared runtime. Must be called from within a tokio runtime.
 pub(crate) fn build_runtime(config: &RuntimeConfig) -> Result<Arc<dyn Runtime + Send + Sync>> {
     let handle = tokio::runtime::Handle::try_current()
@@ -130,7 +160,7 @@ pub(crate) fn build_runtime(config: &RuntimeConfig) -> Result<Arc<dyn Runtime + 
     }
 
     runtime
-        .set_tty(Arc::new(DefaultTty::default()))
+        .set_tty(Arc::new(NoTty))
         .set_module_cache(module_cache)
         .set_source(source)
         .set_package_loader(BuiltinPackageLoader::new().with_cache_dir(packages_dir))

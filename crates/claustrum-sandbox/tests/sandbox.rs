@@ -24,16 +24,103 @@ async fn sandbox(workspace: &std::path::Path) -> Option<Sandbox> {
         default_timeout: Some(Duration::from_secs(60)),
         ..Policy::default()
     };
-    Some(
-        Sandbox::builder()
-            .workspace(workspace)
-            .package_named(dir.join("bash.webc"), "wasmer/bash@1.0.25")
-            .package_named(dir.join("coreutils.webc"), "wasmer/coreutils@1.0.25")
-            .policy(policy)
-            .build()
-            .await
-            .expect("sandbox builds"),
+    let mut builder = Sandbox::builder()
+        .workspace(workspace)
+        .package_named(dir.join("bash.webc"), "wasmer/bash@1.0.25")
+        .package_named(dir.join("coreutils.webc"), "wasmer/coreutils@1.0.25")
+        .policy(policy);
+    // Optional packages: only loaded when present.
+    for (file, id) in [
+        ("jq.webc", "syrusakbary/jq@0.1.0"),
+        ("python.webc", "python/python@3.13.20"),
+    ] {
+        if dir.join(file).exists() {
+            builder = builder.package_named(dir.join(file), id);
+        }
+    }
+    Some(builder.build().await.expect("sandbox builds"))
+}
+
+fn has_command(sb: &Sandbox, name: &str) -> bool {
+    if sb.commands().iter().any(|c| c == name) {
+        true
+    } else {
+        eprintln!("skipping: `{name}` package not installed");
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jq_filters_json_without_colours() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("d.json"), r#"{"a":[1,2,3],"b":"x"}"#).unwrap();
+    let Some(sb) = sandbox(ws.path()).await else {
+        return;
+    };
+    if !has_command(&sb, "jq") {
+        return;
+    }
+    let out = sb
+        .bash(
+            "jq -c .a d.json; cat d.json | jq -r .b",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(out.stdout_lossy(), "[1,2,3]\nx\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_runs_scripts() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(
+        ws.path().join("t.py"),
+        "import json\nprint(json.dumps({'n': 2**70}))\n",
     )
+    .unwrap();
+    let Some(sb) = sandbox(ws.path()).await else {
+        return;
+    };
+    if !has_command(&sb, "python") {
+        return;
+    }
+    let out = sb
+        .bash(
+            "python t.py && python3 -c 'import sys; print(sys.platform)'",
+            ExecOptions {
+                // First use compiles a 60 MB module.
+                timeout: Some(Duration::from_secs(300)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(
+        out.stdout_lossy(),
+        "{\"n\": 1180591620717411303424}\nwasix\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profile_disables_pagers_and_colours() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox(ws.path()).await else {
+        return;
+    };
+    let out = sb
+        .bash(
+            "echo $PAGER $NO_COLOR; type jq | head -1",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.stdout_lossy().starts_with("cat 1\n"),
+        "{}",
+        out.stdout_lossy()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

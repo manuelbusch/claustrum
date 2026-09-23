@@ -13,6 +13,8 @@ use serde::Deserialize;
 pub const DEFAULT_PACKAGES: &[(&str, &str)] = &[
     ("wasmer/bash", "bash.webc"),
     ("wasmer/coreutils", "coreutils.webc"),
+    ("python/python", "python.webc"),
+    ("syrusakbary/jq", "jq.webc"),
 ];
 
 #[derive(Debug, Deserialize, Default)]
@@ -68,7 +70,9 @@ pub struct PackagesSection {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PackageEntry {
-    /// File name inside the packages directory, or an absolute path.
+    /// A `.webc` file, or a directory containing `wasmer.toml` and `.wasm`
+    /// modules (see `claustrum pkg add-wasm`). Relative to the packages
+    /// directory unless absolute.
     pub file: PathBuf,
     /// Registry identity `namespace/name@version`, needed when other
     /// packages depend on this one.
@@ -237,7 +241,7 @@ impl Config {
             });
 
         let packages = self.packages();
-        let missing: Vec<_> = packages.iter().filter(|p| !p.file.is_file()).collect();
+        let missing: Vec<_> = packages.iter().filter(|p| !p.is_installed()).collect();
         if !missing.is_empty() {
             anyhow::bail!(
                 "missing package file(s): {}\nRun `claustrum pkg sync` to download them.",
@@ -249,6 +253,10 @@ impl Config {
             );
         }
         for p in packages {
+            if p.file.is_dir() {
+                builder = builder.package_dir(&p.file);
+                continue;
+            }
             let id = p.id.clone().or_else(|| read_stamp(&p.file));
             builder = match id {
                 Some(id) => builder.package_named(&p.file, id),
@@ -262,6 +270,13 @@ impl Config {
             builder = builder.mount(&m.guest, expand_home(&m.host));
         }
         Ok(builder.build().await?)
+    }
+}
+
+impl PackageEntry {
+    /// True when the `.webc` file exists, or the directory holds a manifest.
+    pub fn is_installed(&self) -> bool {
+        self.file.is_file() || self.file.join("wasmer.toml").is_file()
     }
 }
 

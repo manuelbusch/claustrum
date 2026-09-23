@@ -121,7 +121,7 @@ impl ClaustrumServer {
 
     #[tool(
         name = "Bash",
-        description = "Run a shell command inside the sandbox with `bash -c`. The project is mounted at /workspace (the working directory). Only the sandbox's own commands are available (bash, coreutils, ...); there is no network. Output is captured and returned when the command finishes.",
+        description = "Run a shell command inside the sandbox with `bash -c`. The project is mounted at /workspace (the working directory). Only the sandbox's own commands are available (bash, coreutils, python, jq, ...; see the server instructions for the full list); there is no git and no network. Output is captured and returned when the command finishes.",
         annotations(
             title = "Bash (sandboxed)",
             read_only_hint = false,

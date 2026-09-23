@@ -70,7 +70,7 @@ pub(crate) fn fs_err(path: &str) -> impl FnOnce(virtual_fs::FsError) -> Error + 
 }
 
 /// Read a whole file from a virtual file system.
-pub(crate) async fn read_file(
+pub async fn read_file(
     fs: &dyn FileSystem,
     path: &std::path::Path,
 ) -> std::result::Result<Vec<u8>, virtual_fs::FsError> {
@@ -82,7 +82,7 @@ pub(crate) async fn read_file(
 }
 
 /// Create or truncate a file and write `data` to it.
-pub(crate) async fn write_file(
+pub async fn write_file(
     fs: &dyn FileSystem,
     path: &std::path::Path,
     data: &[u8],
