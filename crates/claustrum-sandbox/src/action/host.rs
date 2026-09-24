@@ -122,12 +122,22 @@ impl ActionHost {
         p.read_everything = true;
         p.deny_read = self.deny_read.clone();
         p.write = vec![self.workspace.clone(), tmp.to_path_buf()];
-        p.write.extend(spec.writable.iter().cloned());
+        for dir in &spec.writable {
+            // Bind mounts (Linux) need the directory to exist; the
+            // configuration asked for it, so create it like the program would.
+            if !dir.exists()
+                && let Err(e) = std::fs::create_dir_all(dir)
+            {
+                tracing::warn!(action = spec.name, path = %dir.display(), error = %e, "cannot create a writable directory");
+            }
+            p.write.push(dir.clone());
+        }
         p.deny_write = self.protected.clone();
         p.network = match &self.proxy {
             Some(proxy) => Network::Loopback(proxy.addr().port()),
             None => Network::Any,
         };
+        p.proxy_socket = self.proxy.as_ref().and_then(ProxyHandle::unix_socket);
         p
     }
 }

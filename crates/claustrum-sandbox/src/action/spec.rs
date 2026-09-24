@@ -98,8 +98,8 @@ pub struct InputDef {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Confine {
-    /// The operating system sandbox (Seatbelt on macOS), as far as
-    /// `[sandbox] confinement` enables it.
+    /// The operating system sandbox (Seatbelt on macOS; bubblewrap, Landlock
+    /// and seccomp on Linux) as far as `[sandbox] confinement` enables it.
     #[default]
     #[serde(alias = "seatbelt")]
     Os,

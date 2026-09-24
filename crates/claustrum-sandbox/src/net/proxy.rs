@@ -11,9 +11,13 @@
 //!
 //! The proxy listens on loopback only and requires Basic credentials: the
 //! user name is the action (used as the log source), the password a random
-//! per-sandbox secret, so other local processes cannot use it. It is
-//! cooperative: a program that ignores the proxy variables is not stopped
-//! until actions are confined.
+//! per-sandbox secret, so other local processes cannot use it. Confined
+//! actions cannot reach anything else, so for them the proxy is enforced; an
+//! unconfined action could ignore the proxy variables.
+//!
+//! On Linux the proxy also listens on a Unix socket in a private directory:
+//! a confined action there has its own network namespace, where the
+//! confinement helper relays `localhost:<port>` to that socket.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -23,7 +27,7 @@ use std::{
 
 use base64::Engine as _;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
@@ -48,11 +52,18 @@ pub struct ProxyHandle {
     addr: SocketAddr,
     secret: String,
     task: JoinHandle<()>,
+    /// Unix socket of the proxy and its private directory (Linux only).
+    unix: Option<(std::path::PathBuf, JoinHandle<()>)>,
 }
 
 impl ProxyHandle {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The proxy's Unix socket, where there is one (see the module docs).
+    pub fn unix_socket(&self) -> Option<std::path::PathBuf> {
+        self.unix.as_ref().map(|(dir, _)| dir.join(UNIX_SOCKET))
     }
 
     /// Proxy URL for one action; its name becomes the log source.
@@ -64,8 +75,15 @@ impl ProxyHandle {
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some((dir, task)) = self.unix.take() {
+            task.abort();
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
+
+/// File name of the Unix socket inside its private directory.
+const UNIX_SOCKET: &str = "proxy.sock";
 
 impl ActionProxy {
     /// Listen on `127.0.0.1` on a free port. Needs a tokio runtime.
@@ -76,6 +94,11 @@ impl ActionProxy {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
         let secret = random_secret()?;
+        let unix = if cfg!(target_os = "linux") {
+            Some(start_unix(&policy, &log, &secret)?)
+        } else {
+            None
+        };
         let expected = secret.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -92,8 +115,56 @@ impl ActionProxy {
                 });
             }
         });
-        Ok(ProxyHandle { addr, secret, task })
+        Ok(ProxyHandle {
+            addr,
+            secret,
+            task,
+            unix,
+        })
     }
+}
+
+/// Listen on a Unix socket in a fresh directory only the user can enter.
+#[cfg(unix)]
+fn start_unix(
+    policy: &Arc<NetPolicy>,
+    log: &Arc<ConnectionLog>,
+    secret: &str,
+) -> std::io::Result<(std::path::PathBuf, JoinHandle<()>)> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let dir = std::env::temp_dir().canonicalize()?.join(format!(
+        "claustrum-proxy-{}-{}",
+        std::process::id(),
+        &random_secret()?[..8]
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let listener = tokio::net::UnixListener::bind(dir.join(UNIX_SOCKET))?;
+    let (policy, log, expected) = (Arc::clone(policy), Arc::clone(log), secret.to_owned());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let policy = Arc::clone(&policy);
+            let log = Arc::clone(&log);
+            let expected = expected.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve(stream, &policy, &log, &expected).await {
+                    tracing::debug!(error = %e, "proxy connection ended");
+                }
+            });
+        }
+    });
+    Ok((dir, task))
+}
+
+#[cfg(not(unix))]
+fn start_unix(
+    _: &Arc<NetPolicy>,
+    _: &Arc<ConnectionLog>,
+    _: &str,
+) -> std::io::Result<(std::path::PathBuf, JoinHandle<()>)> {
+    Err(std::io::Error::other("no Unix sockets on this platform"))
 }
 
 fn random_secret() -> std::io::Result<String> {
@@ -103,7 +174,7 @@ fn random_secret() -> std::io::Result<String> {
 }
 
 async fn respond(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     status: u16,
     reason: &str,
     body: &str,
@@ -122,7 +193,9 @@ async fn respond(
 }
 
 /// Read until the end of the request head. Returns head and any bytes after it.
-async fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+async fn read_head(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     loop {
@@ -246,7 +319,7 @@ async fn open_upstream(
 }
 
 async fn serve(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     policy: &NetPolicy,
     log: &ConnectionLog,
     secret: &str,

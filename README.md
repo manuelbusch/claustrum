@@ -96,8 +96,24 @@ without it, and `"off"` runs everything in one process as a single layer. `claus
 | Platform | Backend | Status |
 | --- | --- | --- |
 | macOS | Seatbelt (`sandbox-exec`, generated SBPL profile) | implemented |
-| Linux | Landlock (file system, TCP) + seccomp | planned; runs unconfined with a warning until then |
+| Linux | bubblewrap (mount, PID, IPC and network namespaces) + Landlock + seccomp | implemented |
+| Linux without user namespaces | Landlock + seccomp | implemented, weaker (see below) |
 | Windows | AppContainer + Job object | planned; runs unconfined with a warning until then |
+
+On Linux, bubblewrap builds the file system view: the root read-only, writable trees
+bound read/write, credential stores hidden behind empty mounts, the configuration
+bound read-only over itself, and a private network namespace when the process may not use
+the network. A helper stage (`claustrum __confine-exec`) then applies Landlock (file
+access, TCP ports, abstract sockets and signals) and a seccomp filter. The filter refuses
+new namespaces, `ptrace`, `mount`, `bpf`, `io_uring`, kernel keyrings, new Unix sockets
+(so host daemons such as `docker.sock` stay out of reach) and, where the profile has no
+network, IP sockets. Confined actions reach the proxy through a relay inside their network
+namespace and a Unix socket. Where unprivileged user namespaces are disabled (Ubuntu
+24.04+ restricts them through AppArmor), Claustrum falls back to Landlock and seccomp and
+says so on start. Landlock can only grant, not deny, so two guarantees get weaker there:
+a file inside a writable tree cannot be made read-only, which leaves the configuration to
+the WASIX layer and the restore after each action, and the proxy's port is reachable on
+every address, not only on `localhost`.
 
 Stronger isolation (a Linux micro-VM through Virtualization.framework, Firecracker or
 Hyper-V) is possible later and would also allow running real Linux toolchains inside it.
@@ -380,7 +396,8 @@ shim/                  guest-side WASI shim for host commands (wasm32-wasip1)
   claustrum-mcp/       MCP server (rmcp) exposing the tools
   claustrum-cli/       `claustrum` binary: run, serve (broker + confined worker), pkg,
                        configuration
-  claustrum-confine/   OS confinement profiles and backends (Seatbelt on macOS)
+  claustrum-confine/   OS confinement profiles and backends (Seatbelt on macOS,
+                       bubblewrap + Landlock + seccomp on Linux)
 ```
 
 ```sh
@@ -399,7 +416,7 @@ The integration tests skip themselves when the packages are missing.
 - Expose the native tools inside the guest as well (so `grep` in a Bash call hits the fast
   path), via Wasmer's builtin-command mechanism.
 - UDP to explicit addresses; TLS server name checks in the guest gate.
-- OS confinement on Linux (Landlock + seccomp) and Windows (AppContainer + Job objects).
+- OS confinement on Windows (AppContainer + Job objects).
 - Brush (a bash-compatible shell written in Rust) compiled to WASIX as an alternative shell.
 - `.gitignore`-aware Glob/Grep, persistent working directory across `cd` in Bash calls,
   PTY emulation for interactive tools.

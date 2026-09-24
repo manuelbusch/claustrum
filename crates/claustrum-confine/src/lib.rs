@@ -17,11 +17,19 @@ use std::{
     process::Command,
 };
 
+use serde::{Deserialize, Serialize};
+
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
+/// First argument that makes a Claustrum binary act as the confinement
+/// helper (see [`helper_main`]).
+pub const HELPER_ARG: &str = "__confine-exec";
+
 /// Network access granted to a confined process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Network {
     /// No sockets to anywhere (local IPC through inherited descriptors still
     /// works).
@@ -35,7 +43,7 @@ pub enum Network {
 }
 
 /// Which programs a confined process may execute.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Exec {
     /// Only these files (the process's own binary must be listed).
     Only(Vec<PathBuf>),
@@ -46,7 +54,7 @@ pub enum Exec {
 /// What a confined process may access. Paths should be absolute; they are
 /// resolved (symlinks followed) when the profile is applied, because the
 /// backends match resolved paths.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
     /// Short label for logs and errors, e.g. `worker` or `action build`.
     pub name: String,
@@ -66,6 +74,10 @@ pub struct Profile {
     pub deny_write: Vec<PathBuf>,
     pub exec: Exec,
     pub network: Network,
+    /// Unix socket of the proxy behind [`Network::Loopback`]. Backends that
+    /// give the process its own network namespace (Linux with bubblewrap)
+    /// bridge `localhost:<port>` inside it to this socket.
+    pub proxy_socket: Option<PathBuf>,
 }
 
 impl Profile {
@@ -81,6 +93,7 @@ impl Profile {
             deny_write: Vec::new(),
             exec: Exec::Only(vec![binary.into()]),
             network: Network::None,
+            proxy_socket: None,
         }
     }
 }
@@ -90,12 +103,21 @@ impl Profile {
 pub enum Backend {
     /// macOS Seatbelt through `/usr/bin/sandbox-exec`.
     Seatbelt,
+    /// Linux: bubblewrap (mount, PID and network namespaces) plus Landlock
+    /// and seccomp inside.
+    Bubblewrap,
+    /// Linux without usable user namespaces: Landlock and seccomp only.
+    /// Weaker: files inside writable trees cannot be made read-only, and the
+    /// proxy port is reachable on every address.
+    Landlock,
 }
 
 impl Backend {
     pub fn as_str(self) -> &'static str {
         match self {
             Backend::Seatbelt => "seatbelt",
+            Backend::Bubblewrap => "bubblewrap+landlock",
+            Backend::Landlock => "landlock",
         }
     }
 }
@@ -124,7 +146,11 @@ pub fn backend() -> Result<Backend, Unavailable> {
     {
         seatbelt::available().map(|()| Backend::Seatbelt)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::backend()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Err(Unavailable(format!(
             "no OS confinement backend is implemented for {} yet",
@@ -150,9 +176,42 @@ pub fn command(profile: &Profile, program: impl AsRef<OsStr>) -> Result<Command,
     match backend {
         #[cfg(target_os = "macos")]
         Backend::Seatbelt => Ok(seatbelt::command(profile, program)),
+        #[cfg(target_os = "linux")]
+        Backend::Bubblewrap | Backend::Landlock => linux::command(backend, profile, program),
         #[allow(unreachable_patterns)]
         _ => Err(Unavailable(format!("{backend} is not supported here"))),
     }
+}
+
+/// Entry point of the confinement helper: `<binary> __confine-exec <profile
+/// json> <program> [args...]`. Backends that must restrict the process from
+/// the inside (Landlock, seccomp) start the confined program through it.
+/// Binaries that use [`command`] call this first thing in `main` when their
+/// first argument is [`HELPER_ARG`]. Never returns.
+pub fn helper_main() -> ! {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    #[cfg(target_os = "linux")]
+    {
+        linux::helper(args)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        eprintln!("claustrum: {HELPER_ARG} is only used on Linux");
+        std::process::exit(126)
+    }
+}
+
+/// The binary that acts as the helper: `CLAUSTRUM_CONFINE_HELPER` if set,
+/// otherwise the running executable.
+#[cfg(target_os = "linux")]
+fn helper_binary() -> Result<PathBuf, Unavailable> {
+    if let Some(p) = std::env::var_os("CLAUSTRUM_CONFINE_HELPER") {
+        return Ok(PathBuf::from(p));
+    }
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| Unavailable(format!("cannot locate the confinement helper: {e}")))
 }
 
 /// Places under the home directory that hold credentials or private data and
@@ -231,6 +290,7 @@ pub fn resolve(path: &Path) -> PathBuf {
 
 /// Directories that must not be renamed or removed so that `path` stays
 /// where it is: every ancestor except the root.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn ancestors(path: &Path) -> impl Iterator<Item = &Path> {
     path.ancestors().skip(1).filter(|a| a.parent().is_some())
 }

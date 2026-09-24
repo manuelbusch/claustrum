@@ -42,6 +42,11 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The confinement helper runs between the sandbox setup and the confined
+    // program; it must not load configuration or print anything.
+    if std::env::args_os().nth(1).as_deref() == Some(claustrum_confine::HELPER_ARG.as_ref()) {
+        claustrum_confine::helper_main();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("CLAUSTRUM_LOG")

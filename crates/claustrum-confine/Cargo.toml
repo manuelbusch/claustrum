@@ -9,6 +9,19 @@ repository.workspace = true
 [dependencies]
 tracing.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
+[[bin]]
+# Stand-in for the Claustrum binary in this crate's own tests: it only runs
+# the confinement helper (see `helper_main`).
+name = "claustrum-confine-helper"
+path = "src/bin/helper.rs"
+test = false
 
 [dev-dependencies]
 tempfile.workspace = true

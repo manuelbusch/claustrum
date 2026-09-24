@@ -1,7 +1,7 @@
 //! The confined worker, tested through the real binary: a simulated WASIX
 //! escape (raw host calls from the worker process) must hit the OS sandbox.
 
-#![cfg(all(target_os = "macos", debug_assertions))]
+#![cfg(all(any(target_os = "macos", target_os = "linux"), debug_assertions))]
 
 use std::process::{Command, Stdio};
 
@@ -22,12 +22,22 @@ fn worker_escape_is_contained() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("confinement: seatbelt"), "{stderr}");
+    let backend = claustrum_confine::backend().expect("a confinement backend");
+    assert!(
+        stderr.contains(&format!("confinement: {backend} around")),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("probe workspace-write: ALLOWED"),
         "{stderr}"
     );
-    for what in ["config-write", "home-write", "ssh-read", "exec", "network"] {
+    let mut denied = vec!["home-write", "ssh-read", "exec", "network"];
+    // Landlock alone cannot keep a file read-only inside the writable
+    // workspace; that needs bubblewrap (or the WASIX layer's own check).
+    if backend != claustrum_confine::Backend::Landlock {
+        denied.push("config-write");
+    }
+    for what in denied {
         assert!(
             stderr.contains(&format!("probe {what}: denied")),
             "{what} was not denied:\n{stderr}"

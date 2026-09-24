@@ -20,7 +20,8 @@ max_output_bytes = 1048576
 # OS sandbox around the Wasmer worker and the host actions, the second layer
 # behind WASIX: "best-effort" (default; confine where supported, warn where
 # not), "required" (refuse to start without it) or "off" (single process,
-# host actions run with your full rights). macOS only for now.
+# host actions run with your full rights). macOS (Seatbelt) and Linux
+# (bubblewrap + Landlock + seccomp) for now.
 # confinement = "best-effort"
 
 # Host paths confined processes may never read, in addition to the built-in

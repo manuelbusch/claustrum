@@ -5,8 +5,8 @@
 //! - guest sockets through [`FilteredNetworking`], a `VirtualNetworking`
 //!   wrapper the guest cannot bypass;
 //! - host actions through [`ActionProxy`], a local HTTP CONNECT proxy the
-//!   actions are pointed at with `HTTP(S)_PROXY`. Programs that ignore those
-//!   variables are not covered until actions are confined.
+//!   actions are pointed at with `HTTP(S)_PROXY`. Confined actions cannot
+//!   reach anything else; unconfined ones could ignore those variables.
 //!
 //! Both ask the same [`NetPolicy`] and record into the same
 //! [`ConnectionLog`].

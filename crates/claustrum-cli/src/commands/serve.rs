@@ -219,7 +219,11 @@ mod broker {
         for m in &config.file.mounts {
             p.write.push(crate::config::expand_home(&m.host));
         }
-        p.write.push(RuntimeConfig::default().cache_dir);
+        let cache = RuntimeConfig::default().cache_dir;
+        // Bind mounts need the directory to exist.
+        std::fs::create_dir_all(&cache)
+            .with_context(|| format!("cannot create {}", cache.display()))?;
+        p.write.push(cache);
         if let Some(dir) = log_path.parent() {
             // The directory, so that the log can be created on first use.
             std::fs::create_dir_all(dir)
