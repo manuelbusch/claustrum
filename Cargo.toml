@@ -4,6 +4,7 @@ members = [
     "crates/claustrum-sandbox",
     "crates/claustrum-mcp",
     "crates/claustrum-cli",
+    "crates/claustrum-confine",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ repository = "https://github.com/manuelbusch/claustrum"
 [workspace.dependencies]
 claustrum-sandbox = { path = "crates/claustrum-sandbox" }
 claustrum-mcp = { path = "crates/claustrum-mcp" }
+claustrum-confine = { path = "crates/claustrum-confine" }
 
 # Wasmer / WASIX. All pinned to the same release; Wasmer pins internally with `=`.
 wasmer = { version = "=7.4.2", default-features = false, features = ["sys", "cranelift", "wat"] }

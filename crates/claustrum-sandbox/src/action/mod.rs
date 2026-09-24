@@ -11,11 +11,15 @@
 
 mod bind;
 mod command;
+mod host;
+#[cfg(unix)]
+pub mod remote;
 mod run;
 mod spec;
 
 pub use bind::{Bound, Refusal, bind, parse_args};
 pub(crate) use command::ActionSet;
+pub use host::{ActionExecutor, ActionHost};
 pub use run::{ActionOutcome, KILLED_EXIT_CODE};
 pub use spec::{
     ActionDef, ActionSpec, CompileContext, Confine, DEFAULT_MAX_LEN, InputDef, InputKind,

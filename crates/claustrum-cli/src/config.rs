@@ -2,13 +2,15 @@
 
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use claustrum_sandbox::{
-    ActionDef, NetworkPolicy, Policy, RuntimeConfig, Sandbox, SandboxBuilder,
-    action::{self, CompileContext},
+    ActionDef, Confinement, ConfinementMode, NetworkPolicy, Policy, RuntimeConfig, Sandbox,
+    SandboxBuilder,
+    action::{self, ActionExecutor, CompileContext},
     net::{NetMode, NetPolicy},
 };
 use serde::Deserialize;
@@ -68,6 +70,13 @@ pub struct SandboxSection {
     /// Extra environment variables for guest commands.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// OS sandbox around the Wasmer worker and the host actions (the second
+    /// layer): `"best-effort"` (default), `"required"` or `"off"`.
+    pub confinement: Option<String>,
+    /// Host paths confined processes may never read, in addition to the
+    /// built-in list of credential stores (`~/.ssh`, `~/.aws`, keychains...).
+    #[serde(default)]
+    pub deny_read: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,7 +186,7 @@ pub fn load(explicit: Option<&Path>, packages_dir: Option<&Path>) -> Result<Conf
     })
 }
 
-fn default_config_paths() -> Vec<PathBuf> {
+pub fn default_config_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("claustrum.toml")];
     if let Some(dirs) = project_dirs() {
         paths.push(dirs.config_dir().join("config.toml"));
@@ -195,7 +204,7 @@ pub fn default_packages_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("packages"))
 }
 
-fn expand_home(p: &Path) -> PathBuf {
+pub fn expand_home(p: &Path) -> PathBuf {
     if let Ok(rest) = p.strip_prefix("~")
         && let Some(home) = std::env::var_os("HOME")
     {
@@ -262,25 +271,65 @@ impl Config {
                 workspace,
                 default_timeout: policy.default_timeout,
                 max_output_bytes: policy.max_output_bytes,
+                resolve_programs: true,
             },
         )
         .map_err(|e| anyhow::anyhow!("invalid [actions] configuration: {e}"))
     }
 
-    /// One line for stderr saying which actions are live, so that every start
-    /// shows what the sandbox can reach on the host.
-    pub fn actions_notice(specs: &[claustrum_sandbox::ActionSpec]) -> Option<String> {
+    /// One line for stderr saying which actions are live and whether they
+    /// run in the OS sandbox, so that every start shows what the sandbox can
+    /// reach on the host.
+    pub fn actions_notice(
+        specs: &[claustrum_sandbox::ActionSpec],
+        confined: bool,
+    ) -> Option<String> {
         if specs.is_empty() {
             return None;
         }
         Some(format!(
-            "host actions enabled (run on the host as your user, no confinement): {}",
+            "host actions enabled: {}",
             specs
                 .iter()
-                .map(|s| format!("{} → {}", s.name, s.command_line()))
+                .map(|s| {
+                    let how = if confined && s.confine == action::Confine::Os {
+                        "confined"
+                    } else {
+                        "UNCONFINED, full user rights"
+                    };
+                    format!("{} → {} ({how})", s.name, s.command_line())
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         ))
+    }
+
+    /// One line for stderr describing the second sandbox layer.
+    pub fn confinement_notice(confined: bool) -> String {
+        match claustrum_confine::backend() {
+            Ok(backend) if confined => {
+                format!("confinement: {backend} around the Wasmer worker and the host actions")
+            }
+            _ => "confinement: OFF, the Wasmer runtime and host actions run with your full \
+                  rights"
+                .to_owned(),
+        }
+    }
+
+    /// The `[sandbox] confinement` settings.
+    pub fn confinement(&self) -> Result<Confinement> {
+        let s = &self.file.sandbox;
+        let mode = match &s.confinement {
+            Some(m) => m
+                .parse::<ConfinementMode>()
+                .map_err(|e| anyhow::anyhow!("[sandbox] {e}"))?,
+            None => ConfinementMode::BestEffort,
+        };
+        let mut deny_read = std::env::var_os("HOME")
+            .map(|h| claustrum_confine::secret_paths(Path::new(&h)))
+            .unwrap_or_default();
+        deny_read.extend(s.deny_read.iter().map(|p| expand_home(p)));
+        Ok(Confinement { mode, deny_read })
     }
 
     pub fn workspace(&self, override_dir: Option<&Path>) -> Result<PathBuf> {
@@ -322,7 +371,11 @@ impl Config {
     pub fn network_log_path(&self, workspace: &Path) -> PathBuf {
         if let Some(p) = &self.file.network.log {
             let p = expand_home(p);
-            return if p.is_relative() { workspace.join(p) } else { p };
+            return if p.is_relative() {
+                workspace.join(p)
+            } else {
+                p
+            };
         }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -400,11 +453,18 @@ impl Config {
         if let Some(threads) = s.max_threads {
             policy.max_threads = Some(threads);
         }
+        policy.confinement = self.confinement()?;
         Ok(policy)
     }
 
-    /// Build the sandbox described by this configuration.
-    pub async fn build_sandbox(&self, workspace: Option<&Path>) -> Result<Sandbox> {
+    /// Build the sandbox described by this configuration. With `executor`,
+    /// host actions are forwarded to it (the broker) instead of being started
+    /// from this process.
+    pub async fn build_sandbox(
+        &self,
+        workspace: Option<&Path>,
+        executor: Option<Arc<dyn ActionExecutor>>,
+    ) -> Result<Sandbox> {
         let workspace = self.workspace(workspace)?;
         let mut builder: SandboxBuilder = Sandbox::builder()
             .workspace(&workspace)
@@ -449,6 +509,9 @@ impl Config {
         builder = builder
             .action_command(self.action_command())
             .actions(self.file.actions.list.iter().cloned());
+        if let Some(executor) = executor {
+            builder = builder.action_executor(executor);
+        }
         Ok(builder.build().await?)
     }
 }
@@ -522,11 +585,15 @@ pattern = "[a-z]+"
         assert!(p.log.unwrap().to_string_lossy().contains("ws-"));
 
         assert_eq!(
-            config("[sandbox]\nnetwork = \"host\"\n").network_mode().unwrap(),
+            config("[sandbox]\nnetwork = \"host\"\n")
+                .network_mode()
+                .unwrap(),
             NetMode::Host
         );
         assert_eq!(
-            config("[sandbox]\nnetwork = \"disabled\"\n").network_mode().unwrap(),
+            config("[sandbox]\nnetwork = \"disabled\"\n")
+                .network_mode()
+                .unwrap(),
             NetMode::Disabled
         );
         let p = config(

@@ -1,7 +1,8 @@
 //! Running a bound action on the host.
 //!
 //! The program gets exactly the argv from [`Bound`], a clean environment, a
-//! closed stdin and its own process group. Output is captured with a limit,
+//! closed stdin, its own process group and, when a [`Profile`] is given, the
+//! OS sandbox. Output is captured with a limit,
 //! the wall-clock timeout and the guest's cancel flag both end in a SIGKILL
 //! of the whole group, and the protected files (the Claustrum configuration)
 //! are put back if the program touched them.
@@ -14,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use claustrum_confine::Profile;
+use serde::{Deserialize, Serialize};
+
 use super::{bind::Bound, spec::ActionSpec};
 use crate::hostcmd::Cancel;
 
@@ -23,19 +27,38 @@ const POLL: Duration = Duration::from_millis(50);
 /// Exit code reported when the timeout or the cancel flag killed the program.
 pub const KILLED_EXIT_CODE: i32 = 124;
 
-/// Result of one action run.
-#[derive(Clone, Debug, Default)]
+/// Result of one action run. Serialisable because a confined worker gets it
+/// from the broker.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ActionOutcome {
     pub exit_code: i32,
     /// Set when the timeout or the guest's death killed the program.
     pub killed: bool,
+    #[serde(with = "base64_bytes")]
     pub stdout: Vec<u8>,
     pub stdout_truncated: bool,
+    #[serde(with = "base64_bytes")]
     pub stderr: Vec<u8>,
     pub stderr_truncated: bool,
     pub duration: Duration,
     /// Protected files the program changed and Claustrum restored.
     pub restored: Vec<PathBuf>,
+    /// Network refusals (through the proxy) during the run, for the model.
+    pub network_notes: Vec<String>,
+}
+
+mod base64_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Run the program. Errors are host-side failures to start it at all.
@@ -43,13 +66,17 @@ pub(crate) fn execute(
     spec: &ActionSpec,
     bound: &Bound,
     protected: &[PathBuf],
-    proxy_env: &BTreeMap<String, String>,
+    extra_env: &BTreeMap<String, String>,
     cancel: &Cancel,
+    profile: Option<&Profile>,
 ) -> Result<ActionOutcome, String> {
     let started = Instant::now();
     let snapshot = snapshot(protected);
 
-    let mut command = Command::new(&spec.program);
+    let mut command = match profile {
+        Some(p) => claustrum_confine::command(p, &spec.program).map_err(|e| e.to_string())?,
+        None => Command::new(&spec.program),
+    };
     command
         .args(&bound.argv)
         .current_dir(&spec.cwd)
@@ -61,8 +88,9 @@ pub(crate) fn execute(
                 .filter_map(|k| std::env::var_os(k).map(|v| (k.clone(), v))),
         )
         .envs(&bound.env)
-        // Last, so that nothing in the definition can point around the proxy.
-        .envs(proxy_env)
+        // Last, so that nothing in the definition can point around the proxy
+        // or the private temporary directory.
+        .envs(extra_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -109,7 +137,8 @@ pub(crate) fn execute(
             err.join().unwrap_or_default(),
         )
     });
-    let status = status.map_err(|e| format!("waiting for `{}` failed: {e}", spec.program.display()))?;
+    let status =
+        status.map_err(|e| format!("waiting for `{}` failed: {e}", spec.program.display()))?;
 
     let mut outcome = ActionOutcome {
         exit_code: if killed {
@@ -124,6 +153,7 @@ pub(crate) fn execute(
         stderr_truncated: err.1,
         duration: started.elapsed(),
         restored: restore(&snapshot),
+        network_notes: Vec::new(),
     };
     if !outcome.restored.is_empty() {
         let names: Vec<_> = outcome
@@ -267,13 +297,22 @@ mod tests {
             workspace: ws,
             default_timeout: Some(Duration::from_secs(10)),
             max_output_bytes: 4096,
+            resolve_programs: true,
         })
         .unwrap()
     }
 
     fn run(spec: &ActionSpec, ws: &Path, protected: &[PathBuf]) -> ActionOutcome {
         let bound = bind(spec, &[], &BTreeMap::new(), crate::WORKSPACE, ws).unwrap();
-        execute(spec, &bound, protected, &BTreeMap::new(), &Cancel::new()).unwrap()
+        execute(
+            spec,
+            &bound,
+            protected,
+            &BTreeMap::new(),
+            &Cancel::new(),
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -305,7 +344,10 @@ mod tests {
         let ws = ws.path().canonicalize().unwrap();
         let s = spec(&ws, &["/bin/pwd"], None);
         let out = run(&s, &ws, &[]);
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), ws.display().to_string());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            ws.display().to_string()
+        );
 
         let s = spec(&ws, &["/usr/bin/yes"], Some(1));
         let out = run(&s, &ws, &[]);
@@ -357,7 +399,7 @@ mod tests {
             flag.cancel();
         });
         let started = Instant::now();
-        let out = execute(&s, &bound, &[], &BTreeMap::new(), &cancel).unwrap();
+        let out = execute(&s, &bound, &[], &BTreeMap::new(), &cancel, None).unwrap();
         assert!(out.killed);
         assert!(started.elapsed() < Duration::from_secs(5));
     }

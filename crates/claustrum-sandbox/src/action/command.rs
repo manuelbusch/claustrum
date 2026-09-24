@@ -1,21 +1,15 @@
 //! The configured actions as a set: the `host` guest command and the entry
 //! point the MCP `Action` tool uses.
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
-    bind::{Refusal, bind, parse_args},
-    run::{ActionOutcome, execute},
+    bind::{Refusal, parse_args},
+    host::ActionExecutor,
+    run::ActionOutcome,
     spec::ActionSpec,
 };
-use crate::{
-    hostcmd::{Cancel, HostCommand, HostOutput, Invocation},
-    net::ProxyHandle,
-};
+use crate::hostcmd::{Cancel, HostCommand, HostOutput, Invocation};
 
 /// Exit code of a refused invocation (bad inputs, unknown action).
 const REFUSED: i32 = 2;
@@ -24,29 +18,19 @@ const REFUSED: i32 = 2;
 pub(crate) struct ActionSet {
     command: String,
     specs: Vec<ActionSpec>,
-    workspace: PathBuf,
-    protected: Vec<PathBuf>,
-    /// Network proxy the actions are pointed at; `None` in host mode.
-    proxy: Option<Arc<ProxyHandle>>,
-    /// One action at a time per sandbox.
-    running: Mutex<()>,
+    executor: Arc<dyn ActionExecutor>,
 }
 
 impl ActionSet {
     pub(crate) fn new(
         command: String,
         specs: Vec<ActionSpec>,
-        workspace: PathBuf,
-        protected: Vec<PathBuf>,
-        proxy: Option<Arc<ProxyHandle>>,
+        executor: Arc<dyn ActionExecutor>,
     ) -> Self {
         Self {
             command,
             specs,
-            workspace,
-            protected,
-            proxy,
-            running: Mutex::new(()),
+            executor,
         }
     }
 
@@ -66,8 +50,17 @@ impl ActionSet {
              listed or as name=value):\n",
             self.command
         );
+        let confined = self
+            .specs
+            .iter()
+            .filter(|spec| self.executor.is_confined(spec))
+            .count();
+        let mixed = confined > 0 && confined < self.specs.len();
         for spec in &self.specs {
             s.push_str(&format!("  {}", spec.name));
+            if mixed && !self.executor.is_confined(spec) {
+                s.push_str(" [unconfined]");
+            }
             if !spec.description.is_empty() {
                 s.push_str(&format!(": {}", spec.description));
             }
@@ -79,10 +72,23 @@ impl ActionSet {
                 s.push_str(&format!("      {}\n", input.describe()));
             }
         }
+        if confined > 0 {
+            s.push_str(if mixed {
+                "Actions not marked [unconfined] run in an OS sandbox: "
+            } else {
+                "The actions run in an OS sandbox: "
+            });
+            s.push_str(
+                "they can write only the workspace, their own $TMPDIR and declared caches, \
+                 cannot read credential stores, cannot change the Claustrum configuration, \
+                 and reach the network only through Claustrum's proxy under the same rules as \
+                 the sandbox.\n",
+            );
+        }
         s
     }
 
-    /// Validate, run and log one invocation.
+    /// Validate and run one invocation (on the executor's side).
     pub(crate) fn run(
         &self,
         name: &str,
@@ -91,47 +97,8 @@ impl ActionSet {
         guest_cwd: &str,
         cancel: &Cancel,
     ) -> Result<ActionOutcome, Refusal> {
-        let spec = self
-            .specs
-            .iter()
-            .find(|s| s.name == name)
-            .ok_or_else(|| {
-                Refusal(format!(
-                    "unknown action `{name}`; run `{}` without arguments for the list",
-                    self.command
-                ))
-            })?;
-        let bound = bind(spec, positional, named, guest_cwd, &self.workspace)?;
-        tracing::info!(
-            action = name,
-            program = %spec.program.display(),
-            argv = ?bound.argv,
-            inputs = ?bound.values,
-            cwd = %spec.cwd.display(),
-            "running host action"
-        );
-        let _guard = self
-            .running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if cancel.is_cancelled() {
-            return Err(Refusal(format!("action `{name}`: cancelled before it started")));
-        }
-        let proxy_env = self
-            .proxy
-            .as_ref()
-            .map(|p| proxy_env(&p.url_for(name)))
-            .unwrap_or_default();
-        let outcome = execute(spec, &bound, &self.protected, &proxy_env, cancel)
-            .map_err(|e| Refusal(format!("action `{name}`: {e}")))?;
-        tracing::info!(
-            action = name,
-            exit_code = outcome.exit_code,
-            killed = outcome.killed,
-            duration = ?outcome.duration,
-            "host action finished"
-        );
-        Ok(outcome)
+        self.executor
+            .run(name, positional, named, guest_cwd, cancel)
     }
 }
 
@@ -150,7 +117,7 @@ pub(crate) const PROXY_VARS: &[&str] = &[
     "no_proxy",
 ];
 
-fn proxy_env(url: &str) -> BTreeMap<String, String> {
+pub(crate) fn proxy_env(url: &str) -> BTreeMap<String, String> {
     PROXY_VARS
         .iter()
         .map(|k| {
@@ -187,7 +154,13 @@ impl HostCommand for ActionSet {
             );
         };
         let (positional, named) = parse_args(spec, rest);
-        match self.run(name, &positional, &named, &invocation.cwd, &invocation.cancel) {
+        match self.run(
+            name,
+            &positional,
+            &named,
+            &invocation.cwd,
+            &invocation.cancel,
+        ) {
             Ok(outcome) => {
                 let mut stderr = outcome.stderr;
                 if outcome.stdout_truncated {

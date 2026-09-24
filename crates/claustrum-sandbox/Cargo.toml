@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+claustrum-confine.workspace = true
 wasmer.workspace = true
 wasmer-wasix.workspace = true
 virtual-fs.workspace = true

@@ -515,9 +515,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "claustrum-confine",
  "claustrum-mcp",
  "claustrum-sandbox",
  "directories",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -526,6 +528,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "which",
+]
+
+[[package]]
+name = "claustrum-confine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -550,6 +561,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "claustrum-confine",
  "directories",
  "futures",
  "getrandom 0.3.4",

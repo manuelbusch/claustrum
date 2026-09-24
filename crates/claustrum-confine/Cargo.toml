@@ -1,0 +1,14 @@
+[package]
+name = "claustrum-confine"
+description = "OS-level confinement (Seatbelt, Landlock, AppContainer) for Claustrum's host processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

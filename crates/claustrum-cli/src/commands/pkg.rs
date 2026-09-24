@@ -78,7 +78,9 @@ pub async fn run(config: Config, cmd: Command) -> Result<()> {
             Ok(())
         }
         Command::Commands => {
-            let sandbox = config.build_sandbox(Some(&std::env::temp_dir())).await?;
+            let sandbox = config
+                .build_sandbox(Some(&std::env::temp_dir()), None)
+                .await?;
             for c in sandbox.commands() {
                 println!("{c}");
             }
@@ -89,7 +91,9 @@ pub async fn run(config: Config, cmd: Command) -> Result<()> {
 }
 
 async fn precompile(config: &Config) -> Result<()> {
-    let sandbox = config.build_sandbox(Some(&std::env::temp_dir())).await?;
+    let sandbox = config
+        .build_sandbox(Some(&std::env::temp_dir()), None)
+        .await?;
     let started = std::time::Instant::now();
     let n = sandbox.precompile().await?;
     println!("{n} module(s) ready in {:.1?}", started.elapsed());

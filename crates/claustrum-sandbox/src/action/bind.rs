@@ -138,7 +138,10 @@ fn check(
             if re.is_match(raw) {
                 Ok(raw.to_owned())
             } else {
-                Err(format!("does not match the pattern `{}`", pattern_source(re)))
+                Err(format!(
+                    "does not match the pattern `{}`",
+                    pattern_source(re)
+                ))
             }
         }
         InputKind::Choices(choices) => {
@@ -216,6 +219,7 @@ mod tests {
             workspace: ws,
             default_timeout: Some(Duration::from_secs(1)),
             max_output_bytes: 1024,
+            resolve_programs: true,
         })
         .unwrap()
     }
@@ -242,7 +246,11 @@ mod tests {
         let ws = ws.path().canonicalize().unwrap();
         let s = spec(&ws, &["/bin/echo", "fixed"], vec![]);
         assert_eq!(run(&s, &[], &ws).unwrap(), ["fixed"]);
-        assert!(run(&s, &["x"], &ws).unwrap_err().contains("takes no inputs"));
+        assert!(
+            run(&s, &["x"], &ws)
+                .unwrap_err()
+                .contains("takes no inputs")
+        );
     }
 
     #[test]
@@ -380,7 +388,9 @@ mod tests {
         let bind_in = |args: &[&str], cwd: &str| {
             let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
             let (pos, named) = parse_args(&s, &args);
-            bind(&s, &pos, &named, cwd, &ws).map(|b| b.argv).map_err(|r| r.0)
+            bind(&s, &pos, &named, cwd, &ws)
+                .map(|b| b.argv)
+                .map_err(|r| r.0)
         };
         assert_eq!(bind_in(&["src/a.rs"], WORKSPACE).unwrap(), ["src/a.rs"]);
         assert_eq!(bind_in(&["a.rs"], "/workspace/src").unwrap(), ["src/a.rs"]);

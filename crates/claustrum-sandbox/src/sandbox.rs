@@ -8,12 +8,12 @@ use std::{
 
 use wasmer_wasix::{Runtime, runtime::OverriddenRuntime, virtual_net::DynVirtualNetworking};
 
-use crate::net::{self as netgate, ConnectionLog, FilteredNetworking, NetMode, NetPolicy, ProxyHandle};
+use crate::net::{ConnectionLog, FilteredNetworking, NetPolicy};
 
 use crate::{
     BundledPackage, Error, ExecOptions, ExecOutput, ExitReason, HostCommand, PackageSet, Policy,
     Result, RuntimeConfig, WORKSPACE,
-    action::{self, ActionDef, ActionSet, ActionSpec, CompileContext},
+    action::{self, ActionDef, ActionExecutor, ActionHost, ActionSet, ActionSpec, CompileContext},
     fs::{self, GuestFs, Mount},
     hostcmd, native, process,
     runtime::build_runtime,
@@ -47,6 +47,7 @@ pub struct SandboxBuilder {
     host_commands: Vec<Arc<dyn HostCommand>>,
     actions: Vec<ActionDef>,
     action_command: String,
+    action_executor: Option<Arc<dyn ActionExecutor>>,
 }
 
 impl Default for SandboxBuilder {
@@ -70,6 +71,7 @@ impl Default for SandboxBuilder {
             host_commands: Vec::new(),
             actions: Vec::new(),
             action_command: action::DEFAULT_COMMAND.to_owned(),
+            action_executor: None,
         }
     }
 }
@@ -154,6 +156,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run the actions through `executor` (the broker of a confined worker,
+    /// see [`action::remote`]) instead of starting them from this process.
+    /// The definitions are still needed here for the listing and argument
+    /// parsing; the executor validates every invocation again.
+    pub fn action_executor(mut self, executor: Arc<dyn ActionExecutor>) -> Self {
+        self.action_executor = Some(executor);
+        self
+    }
+
     /// Build the sandbox. Must be called from within a tokio runtime.
     pub async fn build(mut self) -> Result<Sandbox> {
         let workspace_dir = self
@@ -216,7 +227,6 @@ impl SandboxBuilder {
         });
 
         let mut actions = None;
-        let mut proxy = None;
         if !self.actions.is_empty() {
             let name = &self.action_command;
             if !action::is_action_name(name) {
@@ -235,26 +245,29 @@ impl SandboxBuilder {
                     workspace: &workspace_dir,
                     default_timeout: self.policy.default_timeout,
                     max_output_bytes: self.policy.max_output_bytes,
+                    resolve_programs: self.action_executor.is_none(),
                 },
             )
             .map_err(Error::Init)?;
-            // Actions reach the network through the proxy, which applies the
-            // same policy. In host mode they are left alone.
-            if self.policy.network.mode != NetMode::Host {
-                let handle =
-                    netgate::ActionProxy::start(Arc::clone(&net_policy), Arc::clone(&net_log))
-                        .await
-                        .map_err(|e| Error::Init(format!("cannot start the action proxy: {e}")))?;
-                proxy = Some(Arc::new(handle));
-            }
-            let set = Arc::new(ActionSet::new(
-                name.clone(),
-                specs,
-                workspace_dir.clone(),
-                protected.clone(),
-                proxy.clone(),
-            ));
-            self.host_commands.push(Arc::clone(&set) as Arc<dyn HostCommand>);
+            let executor: Arc<dyn ActionExecutor> = match self.action_executor.take() {
+                Some(executor) => executor,
+                None => Arc::new(
+                    ActionHost::start(
+                        name.clone(),
+                        specs.clone(),
+                        workspace_dir.clone(),
+                        protected.clone(),
+                        Arc::clone(&net_policy),
+                        Arc::clone(&net_log),
+                        &self.policy.confinement,
+                    )
+                    .await
+                    .map_err(Error::Init)?,
+                ),
+            };
+            let set = Arc::new(ActionSet::new(name.clone(), specs, executor));
+            self.host_commands
+                .push(Arc::clone(&set) as Arc<dyn HostCommand>);
             actions = Some(set);
         }
         if !self.host_commands.is_empty() {
@@ -324,7 +337,6 @@ impl SandboxBuilder {
                 actions,
                 net_policy,
                 net_log,
-                _proxy: proxy,
             }),
         })
     }
@@ -350,8 +362,6 @@ struct Inner {
     actions: Option<Arc<ActionSet>>,
     net_policy: Arc<NetPolicy>,
     net_log: Arc<ConnectionLog>,
-    /// Keeps the action proxy running as long as the sandbox lives.
-    _proxy: Option<Arc<ProxyHandle>>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -432,7 +442,6 @@ impl Sandbox {
             .ok_or_else(|| Error::Action("no host actions are configured".into()))?;
         let name = name.to_owned();
         let cwd = self.cwd();
-        let seq = self.inner.net_log.next_seq();
         let outcome = tokio::task::spawn_blocking(move || {
             set.run(&name, &[], &inputs, &cwd, &hostcmd::Cancel::new())
         })
@@ -451,7 +460,7 @@ impl Sandbox {
             stderr: outcome.stderr,
             stderr_truncated: outcome.stderr_truncated,
             duration: outcome.duration,
-            network_notes: self.inner.net_log.notes_since(seq),
+            network_notes: outcome.network_notes,
         })
     }
 

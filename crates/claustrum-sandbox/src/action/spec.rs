@@ -49,9 +49,17 @@ pub struct ActionDef {
     /// Host environment variables forwarded by name.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
-    /// Confinement of the host process. Reserved; only `"none"` works today.
+    /// Confinement of the host process: `"os"` (default) runs it in the
+    /// operating system sandbox when `[sandbox] confinement` allows it,
+    /// `"none"` opts this action out.
     #[serde(default)]
     pub confine: Confine,
+    /// Host directories the confined program may write besides the
+    /// workspace and its private temporary directory, e.g. a package cache
+    /// (`~/.cargo/registry`). `~/` is expanded; relative paths are taken
+    /// against the workspace.
+    #[serde(default)]
+    pub writable: Vec<PathBuf>,
     /// Inputs the guest may supply, in the order they are taken positionally.
     #[serde(default, rename = "input")]
     pub inputs: Vec<InputDef>,
@@ -86,14 +94,17 @@ pub struct InputDef {
     pub allow_leading_dash: bool,
 }
 
-/// How the host process is confined. `Seatbelt` is reserved for a later
-/// version and refused at load time.
+/// How the host process of an action is confined.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Confine {
+    /// The operating system sandbox (Seatbelt on macOS), as far as
+    /// `[sandbox] confinement` enables it.
     #[default]
+    #[serde(alias = "seatbelt")]
+    Os,
+    /// No confinement: the program runs with the user's full rights.
     None,
-    Seatbelt,
 }
 
 /// Sandbox-wide values a definition falls back to.
@@ -103,6 +114,10 @@ pub struct CompileContext<'a> {
     pub workspace: &'a Path,
     pub default_timeout: Option<Duration>,
     pub max_output_bytes: usize,
+    /// Look `command[0]` up on `PATH` and check that it exists. Off in a
+    /// confined worker, which only lists the actions (the broker that runs
+    /// them resolves the program itself) and may not see the host `PATH`.
+    pub resolve_programs: bool,
 }
 
 /// A validated action, ready to be bound to inputs and run.
@@ -122,6 +137,8 @@ pub struct ActionSpec {
     pub max_output_bytes: usize,
     pub inputs: Vec<InputSpec>,
     pub confine: Confine,
+    /// Resolved extra writable host directories.
+    pub writable: Vec<PathBuf>,
     /// Risky but legal traits of the definition, logged at startup. See
     /// [`audit`].
     pub warnings: Vec<String>,
@@ -278,14 +295,15 @@ impl ActionDef {
                 "action name `{name}` is invalid: use [a-z][a-z0-9-]{{0,31}}"
             ));
         }
-        if self.confine == Confine::Seatbelt {
-            return Err(err("confine = \"seatbelt\" is not implemented yet".into()));
-        }
 
         let Some((program, rest)) = self.command.split_first() else {
             return Err(err("`command` must not be empty".into()));
         };
-        let program = resolve_program(program).map_err(&err)?;
+        let program = if ctx.resolve_programs {
+            resolve_program(program).map_err(&err)?
+        } else {
+            PathBuf::from(program)
+        };
         let argv = rest
             .iter()
             .map(|a| Template::parse(a))
@@ -394,11 +412,40 @@ impl ActionDef {
             max_output_bytes: self.max_output_bytes.unwrap_or(ctx.max_output_bytes),
             inputs,
             confine: self.confine,
+            writable: self
+                .writable
+                .iter()
+                .map(|p| expand_writable(p, ctx.workspace))
+                .collect::<Result<_, _>>()
+                .map_err(&err)?,
             warnings: Vec::new(),
         };
         spec.warnings = audit(&spec);
         Ok(spec)
     }
+}
+
+/// Resolve one `writable` entry: `~/` is the home directory, relative paths
+/// are taken against the workspace.
+fn expand_writable(path: &Path, workspace: &Path) -> Result<PathBuf, String> {
+    let text = path.to_string_lossy();
+    let expanded = if let Some(rest) = text.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| format!("writable `{text}`: HOME is not set"))?;
+        PathBuf::from(home).join(rest)
+    } else if text.starts_with('~') {
+        return Err(format!("writable `{text}`: only `~/` is expanded"));
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    if expanded.parent().is_none() {
+        return Err(format!(
+            "writable `{text}`: the root directory cannot be writable"
+        ));
+    }
+    Ok(expanded)
 }
 
 /// Programs that re-parse an argument as code. A placeholder in the argument
@@ -424,9 +471,15 @@ const REPARSING_PROGRAMS: &[(&str, &[&str])] = &[
 /// which the guest can write. Triggering them is code execution on the host
 /// even without inputs.
 const WORKSPACE_CODE_PROGRAMS: &[(&str, &str)] = &[
-    ("cargo", ".cargo/config.toml (rustc-wrapper, runner), build.rs and proc macros"),
+    (
+        "cargo",
+        ".cargo/config.toml (rustc-wrapper, runner), build.rs and proc macros",
+    ),
     ("rustc", "proc macros"),
-    ("git", ".git/config (core.hooksPath, core.fsmonitor, aliases) and hooks"),
+    (
+        "git",
+        ".git/config (core.hooksPath, core.fsmonitor, aliases) and hooks",
+    ),
     ("npm", "package.json scripts and .npmrc"),
     ("npx", "package.json scripts and .npmrc"),
     ("pnpm", "package.json scripts and .npmrc"),
@@ -434,8 +487,14 @@ const WORKSPACE_CODE_PROGRAMS: &[(&str, &str)] = &[
     ("node", "the scripts it is given"),
     ("make", "the Makefile"),
     ("cmake", "CMakeLists.txt"),
-    ("python", "the scripts it is given, sitecustomize and .pth files"),
-    ("python3", "the scripts it is given, sitecustomize and .pth files"),
+    (
+        "python",
+        "the scripts it is given, sitecustomize and .pth files",
+    ),
+    (
+        "python3",
+        "the scripts it is given, sitecustomize and .pth files",
+    ),
     ("pip", "setup.py of the packages it installs"),
     ("sh", "the scripts it is given"),
     ("bash", "the scripts it is given"),
@@ -498,9 +557,9 @@ fn refuse_reparsed_inputs(program: &Path, argv: &[Template]) -> Result<(), Strin
         let text = arg.to_string();
         // `-c code` and `-ccode` / `--eval=code`.
         let flag_before = i > 0 && flags.contains(&argv[i - 1].to_string().as_str());
-        let flag_inline = flags.iter().any(|f| {
-            text.len() > f.len() && text.starts_with(f) && !arg.is_literal()
-        });
+        let flag_inline = flags
+            .iter()
+            .any(|f| text.len() > f.len() && text.starts_with(f) && !arg.is_literal());
         if (flag_before && !arg.is_literal()) || flag_inline {
             return Err(format!(
                 "`{base}` would re-parse the placeholder in `{text}` as code; put the code in \
@@ -515,10 +574,13 @@ fn refuse_reparsed_inputs(program: &Path, argv: &[Template]) -> Result<(), Strin
 pub fn audit(spec: &ActionSpec) -> Vec<String> {
     let mut warnings = Vec::new();
     let base = program_basename(&spec.program);
-    if let Some((_, what)) = WORKSPACE_CODE_PROGRAMS.iter().find(|(p, _)| *p == base) {
+    if spec.confine == Confine::None
+        && let Some((_, what)) = WORKSPACE_CODE_PROGRAMS.iter().find(|(p, _)| *p == base)
+    {
         warnings.push(format!(
-            "`{base}` executes {what} from the workspace, which the guest can write: \
-             triggering this action is code execution on the host until confinement is available"
+            "`{base}` executes {what} from the workspace, which the guest can write, and \
+             `confine = \"none\"` lets it run unconfined: triggering this action is code \
+             execution on the host"
         ));
     }
     for input in &spec.inputs {
@@ -677,7 +739,9 @@ impl InputDef {
         };
         let max_len = self.max_len.unwrap_or(DEFAULT_MAX_LEN);
         if max_len == 0 || max_len > MAX_MAX_LEN {
-            return Err(err(format!("`max_len` must be between 1 and {MAX_MAX_LEN}")));
+            return Err(err(format!(
+                "`max_len` must be between 1 and {MAX_MAX_LEN}"
+            )));
         }
         Ok(InputSpec {
             name: name.clone(),
@@ -692,7 +756,10 @@ impl InputDef {
 
 /// Compile every definition, check that names are unique and log the
 /// warnings of each one.
-pub fn compile_all(defs: &[ActionDef], ctx: &CompileContext<'_>) -> Result<Vec<ActionSpec>, String> {
+pub fn compile_all(
+    defs: &[ActionDef],
+    ctx: &CompileContext<'_>,
+) -> Result<Vec<ActionSpec>, String> {
     let mut specs = Vec::with_capacity(defs.len());
     let mut names = BTreeSet::new();
     for def in defs {
@@ -764,6 +831,7 @@ mod tests {
             workspace: ws,
             default_timeout: Some(Duration::from_secs(5)),
             max_output_bytes: 1024,
+            resolve_programs: true,
         }
     }
 
@@ -801,7 +869,9 @@ mod tests {
     fn compiles_a_plain_action() {
         let ws = tempfile::tempdir().unwrap();
         let ws = ws.path().canonicalize().unwrap();
-        let spec = def("echo", &["/bin/echo", "hi"]).compile(&ctx(&ws)).unwrap();
+        let spec = def("echo", &["/bin/echo", "hi"])
+            .compile(&ctx(&ws))
+            .unwrap();
         assert_eq!(spec.program, PathBuf::from("/bin/echo"));
         assert_eq!(spec.cwd, ws);
         assert_eq!(spec.timeout, Some(Duration::from_secs(5)));
@@ -834,6 +904,13 @@ mod tests {
         let spec = with_input(&["/bin/sh", "-c", "echo \"$1\"", "sh", "{x}"])
             .compile(&c)
             .unwrap();
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+        let spec = ActionDef {
+            confine: Confine::None,
+            ..with_input(&["/bin/sh", "-c", "echo \"$1\"", "sh", "{x}"])
+        }
+        .compile(&c)
+        .unwrap();
         assert!(spec.warnings.iter().any(|w| w.contains("executes")));
         // A literal `-c` script without placeholders is fine too.
         with_input(&["/bin/sh", "-c", "echo hi", "{x}"])
@@ -859,12 +936,21 @@ mod tests {
         .compile(&c)
         .unwrap();
         let joined = spec.warnings.join("\n");
-        assert!(joined.contains("input `a` accepts almost anything"), "{joined}");
+        assert!(
+            joined.contains("input `a` accepts almost anything"),
+            "{joined}"
+        );
         assert!(!joined.contains("input `b`"), "{joined}");
-        assert!(joined.contains("`RUSTFLAGS` contains a placeholder"), "{joined}");
+        assert!(
+            joined.contains("`RUSTFLAGS` contains a placeholder"),
+            "{joined}"
+        );
         assert!(joined.contains("`RUSTFLAGS` controls"), "{joined}");
         assert!(!joined.contains("PLAIN"), "{joined}");
-        assert!(joined.contains("forwards `DYLD_INSERT_LIBRARIES`"), "{joined}");
+        assert!(
+            joined.contains("forwards `DYLD_INSERT_LIBRARIES`"),
+            "{joined}"
+        );
         assert!(!joined.contains("CARGO_TERM_COLOR"), "{joined}");
 
         let quiet = def("t", &["/bin/echo", "hi"]).compile(&c).unwrap();
@@ -901,10 +987,10 @@ mod tests {
             ),
             (
                 ActionDef {
-                    confine: Confine::Seatbelt,
+                    writable: vec!["~nobody/x".into()],
                     ..def("x", &["/bin/echo"])
                 },
-                "not implemented",
+                "writable",
             ),
             (
                 ActionDef {
@@ -984,7 +1070,10 @@ mod tests {
         ];
         for (d, expected) in cases {
             let e = d.compile(&c).expect_err(&format!("{d:?} should fail"));
-            assert!(e.contains(expected), "{d:?}: got `{e}`, expected `{expected}`");
+            assert!(
+                e.contains(expected),
+                "{d:?}: got `{e}`, expected `{expected}`"
+            );
         }
         let spec = ActionDef {
             cwd: Some("sub".into()),
@@ -994,11 +1083,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.cwd, ws.join("sub"));
 
-        let e = compile_all(
-            &[def("x", &["/bin/echo"]), def("x", &["/bin/echo"])],
-            &c,
-        )
-        .unwrap_err();
+        let e = compile_all(&[def("x", &["/bin/echo"]), def("x", &["/bin/echo"])], &c).unwrap_err();
         assert!(e.contains("declared twice"));
     }
 }

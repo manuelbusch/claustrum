@@ -48,6 +48,60 @@ claude (host)                          claustrum (host process, Rust)
    pre-approved, and a system prompt that explains the sandbox layout. From Claude's point of
    view nothing changes: it still has file and shell access, but only inside the sandbox.
 
+### Two sandbox layers
+
+WASIX is the first layer: guest code only sees what the runtime hands it. Everything
+Claustrum itself runs natively on the host is the attack surface behind it: the Wasmer
+runtime and its JIT, the native file tools, and host actions, which start real host
+programs. A bug in the runtime would otherwise land an attacker directly in your user
+account, and an action like `cargo test` runs code from the workspace.
+
+So Claustrum wraps those processes in an operating-system sandbox as a second layer. Because
+macOS Seatbelt profiles cannot be nested (a confined process cannot confine its children
+more tightly), `claustrum serve` splits into a small unconfined **broker** and a confined
+**worker**:
+
+```
+claude ──stdio/MCP──▶ worker: Wasmer + tools            [OS profile: workspace, cache, log;
+                        │                                 no exec, no other files, no
+                        │ socket: "run action X"          network unless configured]
+                        ▼
+                     broker: config, action proxy ──▶ action: host program
+                     (never runs guest code)           [own OS profile per run]
+```
+
+- The **worker** hosts the Wasmer runtime and serves MCP on the inherited stdio. It may
+  read its binary, the packages and the configuration, write the workspace, extra mounts,
+  the module cache, the network log and a private temporary directory, and nothing else.
+  It cannot start programs. It has no network access unless the network mode or online
+  package loading needs it. The configuration files and their directories stay
+  read-only, and credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser
+  profiles, ...) stay unreadable even when they lie inside a mount.
+- The **broker** loads the configuration, runs the action proxy and starts every action on
+  the worker's request. It receives only an action name plus raw inputs and validates them
+  against its own copy of the definitions, so a compromised worker cannot run anything
+  that was not declared.
+- Every **action** runs in its own profile. It may read the file system except the
+  credential stores, and write only the workspace, a fresh `$TMPDIR` and the directories
+  listed in the action's `writable`. The configuration is never writable. Network access
+  is limited to Claustrum's proxy on `localhost`, so the allowlist is enforced, not just
+  suggested; in `host` network mode, network access is unrestricted.
+
+`[sandbox] confinement` selects how strict this is: `"best-effort"` (default) confines
+where the platform supports it and warns loudly where not, `"required"` refuses to start
+without it, and `"off"` runs everything in one process as a single layer. `claustrum run` and
+`serve` print the active state on start. Additional unreadable paths go in
+`[sandbox] deny_read`.
+
+| Platform | Backend | Status |
+| --- | --- | --- |
+| macOS | Seatbelt (`sandbox-exec`, generated SBPL profile) | implemented |
+| Linux | Landlock (file system, TCP) + seccomp | planned; runs unconfined with a warning until then |
+| Windows | AppContainer + Job object | planned; runs unconfined with a warning until then |
+
+Stronger isolation (a Linux micro-VM through Virtualization.framework, Firecracker or
+Hyper-V) is possible later and would also allow running real Linux toolchains inside it.
+
 ## Why
 
 Claude Code's built-in tools run with the full privileges of the user who started it.
@@ -148,9 +202,11 @@ How the gate decides:
 - **Host actions go through a local proxy.** Actions are started with `HTTP_PROXY`,
   `HTTPS_PROXY` and the variants cargo and npm read, pointing at a proxy on `127.0.0.1`
   that applies the same allowlist and checks the host name of every `CONNECT`. It requires
-  a per-session credential, so other local processes cannot use it. This is cooperative:
-  git over SSH, raw sockets and programs that ignore proxy variables are not covered until
-  actions are confined (see the caveats under Host actions).
+  a per-session credential, so other local processes cannot use it. Confined actions
+  cannot reach anything but the proxy (see [Two sandbox layers](#two-sandbox-layers)), so
+  git over SSH, raw sockets and programs that ignore the proxy variables simply fail.
+  Unconfined actions (`confine = "none"`, or no OS confinement on the platform) can
+  ignore the proxy.
 
 Refused connections are logged and appended to the tool result as
 `[network: refused tcp example.com:443 (example.com is not in the allowlist)]`, so Claude
@@ -242,15 +298,26 @@ What holds, by construction:
 - **The configuration stays what it was.** The protected files are snapshotted before and
   restored after every action, so an action cannot loosen the sandbox for the next run.
 
+- **The program is confined** by the OS sandbox (see
+  [Two sandbox layers](#two-sandbox-layers)): writes stay in the workspace, `$TMPDIR` and
+  the action's `writable` list, credential stores are unreadable, and the network is only
+  reachable through the proxy. An action that needs a package cache declares it, e.g.
+  `writable = ["~/.cargo/registry"]` for cargo. Never make a directory writable that the
+  host executes from later (`~/.cargo/bin`, `~/.cargo/config.toml`, shell profiles). A
+  single action can opt out with `confine = "none"`.
+
 **Use with care.** Every action is a hole in the sandbox that you cut on purpose, and the
-validation only guards the edges you declared. The host process runs with your full user
-privileges and without confinement, so these ways around the sandbox remain:
+validation only guards the edges you declared. Confinement narrows what the program can do,
+but it still runs as your user with read access to most of the file system, so these ways
+around the sandbox remain:
 
 - **Trigger-only is not safe by itself.** Many programs execute configuration or scripts
   from the workspace, which Claude can write: `cargo` honours `.cargo/config.toml`
   (`rustc-wrapper`, `runner`), `build.rs` and proc macros; `git` honours `.git/config`
   (`core.hooksPath`, `core.fsmonitor`, aliases); `npm` runs `package.json` scripts;
-  `make` runs the Makefile. Triggering such an action is code execution on the host.
+  `make` runs the Makefile. Confined, such code can read your files (except credential
+  stores) and write the workspace and the declared caches. Unconfined, it is plain code
+  execution on the host.
 - **Validated inputs can still be interpreted.** A pattern only limits characters; the
   program decides what they mean. `ext::sh -c …` is a valid git URL, `user@host:` is a
   remote for scp and rsync, `@file` reads a file for curl, `key=value` after `git -c` or
@@ -265,8 +332,8 @@ privileges and without confinement, so these ways around the sandbox remain:
 - **Path inputs are checked before the program opens them.** Claude Code can run tools in
   parallel, so a file could in principle be replaced by a symlink between the check and
   the open. Do not rely on `path` inputs to keep a program away from host files.
-- **Network access is only cooperative.** Actions are pointed at the network proxy, but a
-  program that ignores `HTTP(S)_PROXY`, or git over SSH, reaches the network directly.
+- **What the proxy lets through leaves the machine.** A confined action can send what it
+  reads to any allowed destination. Keep the allowlist short.
 - **Side effects leave the sandbox.** `git push`, `deploy` or `npm publish` ship whatever
   the workspace contains. Only the Claustrum configuration files are restored afterwards,
   not anything else an action may write on the host.
@@ -276,9 +343,8 @@ logs a warning for the rest: programs known to execute workspace code, patterns 
 `.*`, placeholders in `env`, forwarded loader variables. `claustrum run` and `serve` also
 print which actions are enabled. Rules of thumb: declare no inputs when you can, make
 patterns as narrow as possible, and only declare a command you would let Claude run on the
-host directly. The `confine` field is reserved for process confinement (macOS Seatbelt
-first) and currently accepts only `"none"`; until it lands, an action is as trusted as the
-host command behind it.
+host directly. Without OS confinement (`confine = "none"`, `confinement = "off"`, or a
+platform without a backend yet), an action is as trusted as the host command behind it.
 
 ## Sandbox layout
 
@@ -312,7 +378,9 @@ crates/
                        network gate and action proxy (net/)
 shim/                  guest-side WASI shim for host commands (wasm32-wasip1)
   claustrum-mcp/       MCP server (rmcp) exposing the tools
-  claustrum-cli/       `claustrum` binary: run, serve, pkg, configuration
+  claustrum-cli/       `claustrum` binary: run, serve (broker + confined worker), pkg,
+                       configuration
+  claustrum-confine/   OS confinement profiles and backends (Seatbelt on macOS)
 ```
 
 ```sh
@@ -330,9 +398,8 @@ The integration tests skip themselves when the packages are missing.
 - git inside the sandbox (blocked on a WASIX build, see Packages); sed/awk/grep as WASIX builds.
 - Expose the native tools inside the guest as well (so `grep` in a Bash call hits the fast
   path), via Wasmer's builtin-command mechanism.
-- Enforce the network proxy for host actions through confinement; UDP to explicit
-  addresses; TLS server name checks in the guest gate.
-- Confinement of host actions (`confine = "seatbelt"` on macOS, bwrap/Landlock on Linux).
+- UDP to explicit addresses; TLS server name checks in the guest gate.
+- OS confinement on Linux (Landlock + seccomp) and Windows (AppContainer + Job objects).
 - Brush (a bash-compatible shell written in Rust) compiled to WASIX as an alternative shell.
 - `.gitignore`-aware Glob/Grep, persistent working directory across `cd` in Bash calls,
   PTY emulation for interactive tools.

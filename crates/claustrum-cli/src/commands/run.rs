@@ -38,8 +38,10 @@ pub fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
     let actions = config.validate_actions(&workspace)?;
     let network = config.network_policy(&workspace)?;
+    let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;
     eprintln!("claustrum: {}", Config::network_notice(&network));
-    if let Some(notice) = Config::actions_notice(&actions) {
+    eprintln!("claustrum: {}", Config::confinement_notice(confined));
+    if let Some(notice) = Config::actions_notice(&actions, confined) {
         eprintln!("claustrum: {notice}");
     }
     // Fail early with a helpful message instead of letting claude report a

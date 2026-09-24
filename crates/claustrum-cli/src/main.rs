@@ -35,6 +35,10 @@ enum Command {
     /// Inspect network decisions and build the allowlist.
     #[command(subcommand)]
     Network(commands::network::Command),
+    /// Internal: the confined half of `serve`, started by it.
+    #[cfg(unix)]
+    #[command(name = "__worker", hide = true)]
+    Worker(commands::serve::WorkerArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,6 +66,8 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => runtime()?.block_on(commands::serve::run(config, args)),
         Command::Pkg(cmd) => runtime()?.block_on(commands::pkg::run(config, cmd)),
         Command::Network(cmd) => commands::network::run(config, cmd),
+        #[cfg(unix)]
+        Command::Worker(args) => runtime()?.block_on(commands::serve::worker(config, args)),
     }
 }
 

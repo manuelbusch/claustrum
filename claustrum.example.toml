@@ -17,6 +17,16 @@ timeout_secs = 120
 # Bytes retained per output stream of a command.
 max_output_bytes = 1048576
 
+# OS sandbox around the Wasmer worker and the host actions, the second layer
+# behind WASIX: "best-effort" (default; confine where supported, warn where
+# not), "required" (refuse to start without it) or "off" (single process,
+# host actions run with your full rights). macOS only for now.
+# confinement = "best-effort"
+
+# Host paths confined processes may never read, in addition to the built-in
+# credential stores (~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles...).
+# deny_read = ["~/private"]
+
 # Extra environment variables for guest commands.
 [sandbox.env]
 # RUST_LOG = "info"
@@ -88,8 +98,10 @@ source = "syrusakbary/jq"
 # read-only inside the sandbox, so Claude cannot add or change actions.
 #
 # CAUTION: every action is a deliberate hole in the sandbox. The command runs
-# with your full user privileges and without confinement, and the validation
-# only guards the inputs you declare. Programs that execute configuration or
+# as your user; with OS confinement (see [sandbox] confinement) it can only
+# write the workspace, its $TMPDIR and `writable`, cannot read credential
+# stores and reaches the network only through the proxy. The validation only
+# guards the inputs you declare. Programs that execute configuration or
 # scripts from the workspace (cargo, git, npm, make, shells, ...) run code
 # Claude can write, even without inputs. Declare no inputs when you can, keep
 # patterns as narrow as possible, never put a placeholder where a shell or
@@ -109,7 +121,8 @@ source = "syrusakbary/jq"
 # max_output_bytes = 1048576                     # default: [sandbox].max_output_bytes
 # env = { CARGO_TERM_COLOR = "never" }           # only PATH, HOME, LANG are inherited
 # env_passthrough = ["CARGO_HOME"]               # host variables forwarded by name
-# confine = "none"                               # reserved: "seatbelt" comes later
+# writable = ["~/.cargo/registry"]               # extra writable dirs (confined only)
+# confine = "os"                                 # default; "none" runs unconfined
 
 # [[actions.action]]
 # name = "test-crate"
