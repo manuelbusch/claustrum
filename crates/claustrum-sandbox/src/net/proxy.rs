@@ -102,7 +102,12 @@ fn random_secret() -> std::io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-async fn respond(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> std::io::Result<()> {
+async fn respond(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let extra = if status == 407 {
         "Proxy-Authenticate: Basic realm=\"claustrum\"\r\n"
     } else {
@@ -413,7 +418,8 @@ mod tests {
         let (proxy, log) = start(&[format!("127.0.0.1:{}", echo.port())]).await;
         let a = auth(&proxy, "build");
 
-        let (mut s, head) = request(proxy.addr(), &format!("CONNECT {echo} HTTP/1.1\r\n{a}\r\n")).await;
+        let (mut s, head) =
+            request(proxy.addr(), &format!("CONNECT {echo} HTTP/1.1\r\n{a}\r\n")).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         s.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -428,12 +434,20 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         assert!(head.contains("local or private"), "{head}");
 
-        let (_, head) = request(proxy.addr(), &format!("CONNECT example.com:443 HTTP/1.1\r\n{a}\r\n")).await;
+        let (_, head) = request(
+            proxy.addr(),
+            &format!("CONNECT example.com:443 HTTP/1.1\r\n{a}\r\n"),
+        )
+        .await;
         assert!(head.contains("not in the allowlist"), "{head}");
 
         let entries = log.entries();
         assert!(entries.iter().all(|e| e.source == "action:build"));
-        assert!(entries.iter().any(|e| e.verdict == "refused" && e.host.as_deref() == Some("example.com")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.verdict == "refused" && e.host.as_deref() == Some("example.com"))
+        );
     }
 
     #[tokio::test]
@@ -468,16 +482,25 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         assert!(resp.contains("GET /index?x=1 HTTP/1.1"), "{resp}");
         assert!(resp.contains("Connection: close"), "{resp}");
-        assert!(!resp.to_ascii_lowercase().contains("proxy-authorization"), "{resp}");
+        assert!(
+            !resp.to_ascii_lowercase().contains("proxy-authorization"),
+            "{resp}"
+        );
 
-        let huge = format!("GET http://x/ HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEAD + 10));
+        let huge = format!(
+            "GET http://x/ HTTP/1.1\r\nX: {}\r\n\r\n",
+            "a".repeat(MAX_HEAD + 10)
+        );
         let (_, resp) = request(proxy.addr(), &huge).await;
         assert!(resp.starts_with("HTTP/1.1 431"), "{resp}");
     }
 
     #[test]
     fn splits_authorities() {
-        assert_eq!(split_authority("a.com:8080", 443), Some(("a.com".into(), 8080)));
+        assert_eq!(
+            split_authority("a.com:8080", 443),
+            Some(("a.com".into(), 8080))
+        );
         assert_eq!(split_authority("a.com", 80), Some(("a.com".into(), 80)));
         assert_eq!(split_authority("[::1]:22", 443), Some(("::1".into(), 22)));
         assert_eq!(split_authority("[::1]", 443), Some(("::1".into(), 443)));

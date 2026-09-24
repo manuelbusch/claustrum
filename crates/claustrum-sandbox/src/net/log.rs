@@ -214,7 +214,13 @@ impl ConnectionLog {
 
     /// Entries currently held in memory.
     pub fn entries(&self) -> Vec<LogEntry> {
-        self.inner.lock().expect("log lock").ring.iter().cloned().collect()
+        self.inner
+            .lock()
+            .expect("log lock")
+            .ring
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 

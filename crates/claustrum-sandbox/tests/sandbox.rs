@@ -546,7 +546,11 @@ fn test_actions() -> Vec<claustrum_sandbox::ActionDef> {
         },
         action(
             "tamper",
-            &["/bin/sh", "-c", "echo 'network = \"host\"' > claustrum.toml; echo done"],
+            &[
+                "/bin/sh",
+                "-c",
+                "echo 'network = \"host\"' > claustrum.toml; echo done",
+            ],
         ),
     ]
 }
@@ -593,7 +597,10 @@ async fn host_actions_run_through_bash() {
         "unknown action `nope`",
         "missing required input `word`",
     ] {
-        assert!(stderr.contains(expected), "missing `{expected}` in {stderr}");
+        assert!(
+            stderr.contains(expected),
+            "missing `{expected}` in {stderr}"
+        );
     }
 }
 
@@ -640,10 +647,17 @@ async fn host_actions_cannot_change_the_configuration() {
     else {
         return;
     };
-    let out = sb.bash("host tamper", ExecOptions::default()).await.unwrap();
+    let out = sb
+        .bash("host tamper", ExecOptions::default())
+        .await
+        .unwrap();
     assert_eq!(out.exit_code, 1);
     assert_eq!(out.stdout_lossy(), "done\n");
-    assert!(out.stderr_lossy().contains("restored"), "{}", out.stderr_lossy());
+    assert!(
+        out.stderr_lossy().contains("restored"),
+        "{}",
+        out.stderr_lossy()
+    );
     assert_eq!(std::fs::read_to_string(&config).unwrap(), "# original\n");
 }
 
@@ -663,7 +677,11 @@ async fn run_action_serves_the_mcp_tool() {
         .await
         .unwrap_err();
     assert!(matches!(err, claustrum_sandbox::Error::Action(_)), "{err}");
-    assert!(sb.action_listing().unwrap().contains("say: test action say"));
+    assert!(
+        sb.action_listing()
+            .unwrap()
+            .contains("say: test action say")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -687,9 +705,14 @@ async fn action_command_must_not_shadow_a_package_command() {
 
 /// A loopback HTTP server that answers every request with `hello`, and
 /// counts the connections it accepted.
-async fn hello_server() -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+async fn hello_server() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = hits.clone();
@@ -700,7 +723,9 @@ async fn hello_server() -> (std::net::SocketAddr, std::sync::Arc<std::sync::atom
                 let mut buf = [0u8; 4096];
                 let _ = s.read(&mut buf).await;
                 let _ = s
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                    )
                     .await;
             });
         }
@@ -722,7 +747,9 @@ const PY_CONNECT: &str = "python3 -c \"import socket,sys; s=socket.create_connec
 async fn guest_connections_follow_the_allowlist() {
     let ws = tempfile::tempdir().unwrap();
     let (addr, hits) = hello_server().await;
-    let allowed = claustrum_sandbox::NetworkPolicy::allowlist(&[format!("127.0.0.1:{}", addr.port())]).unwrap();
+    let allowed =
+        claustrum_sandbox::NetworkPolicy::allowlist(&[format!("127.0.0.1:{}", addr.port())])
+            .unwrap();
     let Some(sb) = sandbox_with(ws.path(), |b| b.policy(network_policy(allowed))).await else {
         return;
     };
@@ -739,11 +766,18 @@ async fn guest_connections_follow_the_allowlist() {
     // A different port on the same address is refused before it reaches the host.
     let (other, other_hits) = hello_server().await;
     let out = sb
-        .bash(&format!("{PY_CONNECT} {}", other.port()), ExecOptions::default())
+        .bash(
+            &format!("{PY_CONNECT} {}", other.port()),
+            ExecOptions::default(),
+        )
         .await
         .unwrap();
     assert!(!out.success());
-    assert!(out.stderr_lossy().contains("PermissionError"), "{}", out.stderr_lossy());
+    assert!(
+        out.stderr_lossy().contains("PermissionError"),
+        "{}",
+        out.stderr_lossy()
+    );
     assert_eq!(other_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(
         out.network_notes
@@ -766,12 +800,22 @@ async fn disabled_and_audit_modes() {
     if !has_command(&sb, "python3") {
         return;
     }
-    let out = sb.bash(&script, ExecOptions {
-        timeout: Some(Duration::from_secs(300)),
-        ..Default::default()
-    }).await.unwrap();
+    let out = sb
+        .bash(
+            &script,
+            ExecOptions {
+                timeout: Some(Duration::from_secs(300)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert!(!out.success());
-    assert!(out.network_notes.iter().any(|n| n.contains("disabled")), "{:?}", out.network_notes);
+    assert!(
+        out.network_notes.iter().any(|n| n.contains("disabled")),
+        "{:?}",
+        out.network_notes
+    );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     let audit = claustrum_sandbox::NetworkPolicy {
@@ -785,7 +829,9 @@ async fn disabled_and_audit_modes() {
     assert!(out.success(), "stderr: {}", out.stderr_lossy());
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(
-        out.network_notes.iter().any(|n| n.starts_with("audit mode allowed")),
+        out.network_notes
+            .iter()
+            .any(|n| n.starts_with("audit mode allowed")),
         "{:?}",
         out.network_notes
     );
@@ -798,7 +844,8 @@ async fn host_actions_go_through_the_proxy() {
     let (blocked, blocked_hits) = hello_server().await;
     let log = ws.path().join("net.jsonl");
     let mut network =
-        claustrum_sandbox::NetworkPolicy::allowlist(&[format!("127.0.0.1:{}", addr.port())]).unwrap();
+        claustrum_sandbox::NetworkPolicy::allowlist(&[format!("127.0.0.1:{}", addr.port())])
+            .unwrap();
     network.log = Some(log.clone());
     let fetch = |name: &str, port: u16| claustrum_sandbox::ActionDef {
         timeout_secs: Some(30),
@@ -814,8 +861,10 @@ async fn host_actions_go_through_the_proxy() {
         )
     };
     let Some(sb) = sandbox_with(ws.path(), |b| {
-        b.policy(network_policy(network))
-            .actions([fetch("fetch", addr.port()), fetch("blocked", blocked.port())])
+        b.policy(network_policy(network)).actions([
+            fetch("fetch", addr.port()),
+            fetch("blocked", blocked.port()),
+        ])
     })
     .await
     else {
@@ -830,18 +879,31 @@ async fn host_actions_go_through_the_proxy() {
     assert_eq!(out.stdout_lossy(), "hello");
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    let out = sb.bash("host blocked", ExecOptions::default()).await.unwrap();
+    let out = sb
+        .bash("host blocked", ExecOptions::default())
+        .await
+        .unwrap();
     assert!(!out.success());
     assert_eq!(blocked_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(
-        out.network_notes.iter().any(|n| n.starts_with("refused http 127.0.0.1:")),
+        out.network_notes
+            .iter()
+            .any(|n| n.starts_with("refused http 127.0.0.1:")),
         "{:?}",
         out.network_notes
     );
 
     let entries = claustrum_sandbox::net::read_log(&log).unwrap();
-    assert!(entries.iter().any(|e| e.source == "action:fetch" && e.verdict == "allowed"));
-    assert!(entries.iter().any(|e| e.source == "action:blocked" && e.verdict == "refused"));
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.source == "action:fetch" && e.verdict == "allowed")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.source == "action:blocked" && e.verdict == "refused")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -854,7 +916,11 @@ async fn network_log_is_read_only_for_the_guest() {
     };
     let allowed = allowed_attempts(
         &sb,
-        &["echo forged > net.jsonl", "rm -f net.jsonl", "mv net.jsonl gone.jsonl"],
+        &[
+            "echo forged > net.jsonl",
+            "rm -f net.jsonl",
+            "mv net.jsonl gone.jsonl",
+        ],
     )
     .await;
     assert_eq!(allowed, "", "these attempts were not refused");

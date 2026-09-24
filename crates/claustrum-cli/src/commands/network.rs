@@ -105,7 +105,11 @@ fn report(entries: &[LogEntry], all: bool, path: &str) -> String {
             } else {
                 format!(
                     ":{}",
-                    row.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+                    row.ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
                 )
             };
             out.push_str(&format!(
@@ -119,9 +123,10 @@ fn report(entries: &[LogEntry], all: bool, path: &str) -> String {
             }
             out.push('\n');
             // Only destinations that a name or address entry can express.
-            let suggestible = row.kinds.iter().any(|k| {
-                matches!(k.as_str(), "dns" | "tcp" | "connect" | "http")
-            });
+            let suggestible = row
+                .kinds
+                .iter()
+                .any(|k| matches!(k.as_str(), "dns" | "tcp" | "connect" | "http"));
             if verdict != "allowed" && suggestible && host != "?" {
                 suggestions
                     .entry(host.clone())
@@ -141,7 +146,11 @@ fn report(entries: &[LogEntry], all: bool, path: &str) -> String {
                     "  \"{host}\",  # port unknown (the name was refused), 443 assumed\n"
                 ));
             } else {
-                let ports = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
+                let ports = ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
                 out.push_str(&format!("  \"{host}:{ports}\",\n"));
             }
         }
@@ -154,7 +163,13 @@ fn report(entries: &[LogEntry], all: bool, path: &str) -> String {
 mod tests {
     use super::*;
 
-    fn entry(verdict: &str, kind: &str, host: Option<&str>, addr: Option<&str>, port: Option<u16>) -> LogEntry {
+    fn entry(
+        verdict: &str,
+        kind: &str,
+        host: Option<&str>,
+        addr: Option<&str>,
+        port: Option<u16>,
+    ) -> LogEntry {
         LogEntry {
             seq: 0,
             time: 0,
@@ -172,11 +187,29 @@ mod tests {
     fn groups_and_suggests() {
         let entries = vec![
             entry("refused", "dns", Some("pypi.org"), None, None),
-            entry("audit", "tcp", Some("crates.io"), Some("1.2.3.4"), Some(443)),
-            entry("audit", "tcp", Some("crates.io"), Some("1.2.3.4"), Some(443)),
+            entry(
+                "audit",
+                "tcp",
+                Some("crates.io"),
+                Some("1.2.3.4"),
+                Some(443),
+            ),
+            entry(
+                "audit",
+                "tcp",
+                Some("crates.io"),
+                Some("1.2.3.4"),
+                Some(443),
+            ),
             entry("refused", "tcp", None, Some("10.0.0.5"), Some(5432)),
             entry("refused", "udp", None, Some("0.0.0.0"), Some(0)),
-            entry("allowed", "tcp", Some("github.com"), Some("5.6.7.8"), Some(443)),
+            entry(
+                "allowed",
+                "tcp",
+                Some("github.com"),
+                Some("5.6.7.8"),
+                Some(443),
+            ),
         ];
         let r = report(&entries, false, "log");
         assert!(r.contains("crates.io:443  2x"), "{r}");

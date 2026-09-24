@@ -154,7 +154,10 @@ impl FromStr for AllowEntry {
                 "" => (host, None),
                 p => (
                     host,
-                    Some(p.strip_prefix(':').ok_or_else(|| err("expected `:` after `]`"))?),
+                    Some(
+                        p.strip_prefix(':')
+                            .ok_or_else(|| err("expected `:` after `]`"))?,
+                    ),
                 ),
             }
         } else if s.matches(':').count() > 1 {
@@ -507,8 +510,18 @@ mod tests {
             assert_eq!(e.to_string(), shown, "{input}");
         }
         for bad in [
-            "", "exa mple.com", "example.com:0", "example.com:99999", "example.com:10-5",
-            "example.com:x", "[::1", "[::1]8080", "*.", "-bad.com", "a..b", "http://x.com",
+            "",
+            "exa mple.com",
+            "example.com:0",
+            "example.com:99999",
+            "example.com:10-5",
+            "example.com:x",
+            "[::1",
+            "[::1]8080",
+            "*.",
+            "-bad.com",
+            "a..b",
+            "http://x.com",
         ] {
             assert!(bad.parse::<AllowEntry>().is_err(), "{bad:?} was accepted");
         }
@@ -527,13 +540,30 @@ mod tests {
     #[test]
     fn classifies_special_addresses() {
         for s in [
-            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
-            "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "::1", "::",
-            "fe80::1", "fd12::1", "::ffff:127.0.0.1", "64:ff9b::a00:1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd12::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::a00:1",
         ] {
             assert!(is_special(ip(s)), "{s} should be special");
         }
-        for s in ["1.1.1.1", "140.82.112.3", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        for s in [
+            "1.1.1.1",
+            "140.82.112.3",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(!is_special(ip(s)), "{s} should not be special");
         }
     }
@@ -547,7 +577,10 @@ mod tests {
         assert!(!p.check_connect(ip("140.82.112.3"), 22).allowed());
         // Never resolved: a literal IP is refused.
         let v = p.check_connect(ip("140.82.112.4"), 443);
-        assert!(matches!(&v, Verdict::Refused(r) if r.contains("not resolved")), "{v:?}");
+        assert!(
+            matches!(&v, Verdict::Refused(r) if r.contains("not resolved")),
+            "{v:?}"
+        );
         assert!(!p.check_resolve("example.com").allowed());
         // Mapped IPv6 is the same address.
         assert!(p.check_connect(ip("::ffff:140.82.112.3"), 443).allowed());
@@ -557,7 +590,10 @@ mod tests {
     #[test]
     fn rebinding_to_local_addresses_is_refused() {
         let p = policy(NetMode::Allowlist, &["evil.example.com"]);
-        p.grant("evil.example.com", &[ip("127.0.0.1"), ip("169.254.169.254")]);
+        p.grant(
+            "evil.example.com",
+            &[ip("127.0.0.1"), ip("169.254.169.254")],
+        );
         assert!(!p.check_connect(ip("127.0.0.1"), 443).allowed());
         assert!(!p.check_connect(ip("169.254.169.254"), 443).allowed());
         assert!(!p.check_resolved_addr(ip("127.0.0.1"), 443).allowed());
@@ -583,9 +619,15 @@ mod tests {
     #[test]
     fn modes() {
         let p = policy(NetMode::Audit, &["crates.io"]);
-        assert!(matches!(p.check_resolve("example.com"), Verdict::Audited(_)));
+        assert!(matches!(
+            p.check_resolve("example.com"),
+            Verdict::Audited(_)
+        ));
         assert_eq!(p.check_resolve("crates.io"), Verdict::Allowed);
-        assert!(matches!(p.check_unchecked_socket("udp"), Verdict::Audited(_)));
+        assert!(matches!(
+            p.check_unchecked_socket("udp"),
+            Verdict::Audited(_)
+        ));
 
         let p = policy(NetMode::Host, &[]);
         assert_eq!(p.check_resolve("example.com"), Verdict::Allowed);

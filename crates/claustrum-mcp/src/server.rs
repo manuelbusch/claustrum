@@ -339,14 +339,19 @@ fn action_route(sandbox: &Sandbox) -> Option<ToolRoute<ClaustrumServer>> {
             .destructive(true)
             .open_world(true),
     );
-    Some(ToolRoute::new_dyn(tool, |ctx: ToolCallContext<'_, ClaustrumServer>| {
-        Box::pin(async move {
-            let args = ctx.arguments.clone().unwrap_or_default();
-            let params: ActionParams = serde_json::from_value(serde_json::Value::Object(args))
-                .map_err(|e| McpError::invalid_params(format!("invalid parameters: {e}"), None))?;
-            Ok(ctx.service.action(params).await?.into())
-        })
-    }))
+    Some(ToolRoute::new_dyn(
+        tool,
+        |ctx: ToolCallContext<'_, ClaustrumServer>| {
+            Box::pin(async move {
+                let args = ctx.arguments.clone().unwrap_or_default();
+                let params: ActionParams = serde_json::from_value(serde_json::Value::Object(args))
+                    .map_err(|e| {
+                        McpError::invalid_params(format!("invalid parameters: {e}"), None)
+                    })?;
+                Ok(ctx.service.action(params).await?.into())
+            })
+        },
+    ))
 }
 
 impl ClaustrumServer {

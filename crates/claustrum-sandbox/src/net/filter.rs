@@ -39,7 +39,11 @@ pub struct FilteredNetworking {
 }
 
 impl FilteredNetworking {
-    pub fn new(inner: DynVirtualNetworking, policy: Arc<NetPolicy>, log: Arc<ConnectionLog>) -> Self {
+    pub fn new(
+        inner: DynVirtualNetworking,
+        policy: Arc<NetPolicy>,
+        log: Arc<ConnectionLog>,
+    ) -> Self {
         Self { inner, policy, log }
     }
 
@@ -218,7 +222,10 @@ mod tests {
     fn setup(mode: NetMode, allow: &[&str]) -> (Arc<Fake>, FilteredNetworking, Arc<ConnectionLog>) {
         let fake = Arc::new(Fake::default());
         let log = Arc::new(ConnectionLog::memory());
-        let policy = Arc::new(NetPolicy::new(mode, NetPolicy::parse_entries(allow).unwrap()));
+        let policy = Arc::new(NetPolicy::new(
+            mode,
+            NetPolicy::parse_entries(allow).unwrap(),
+        ));
         let net = FilteredNetworking::new(fake.clone(), policy, log.clone());
         (fake, net, log)
     }
@@ -245,7 +252,8 @@ mod tests {
             Err(NetworkError::PermissionDenied)
         ));
         assert!(matches!(
-            net.listen_tcp(sa("127.0.0.1:8080"), false, false, false).await,
+            net.listen_tcp(sa("127.0.0.1:8080"), false, false, false)
+                .await,
             Err(NetworkError::PermissionDenied)
         ));
         assert!(fake.calls.lock().unwrap().is_empty());
@@ -262,7 +270,10 @@ mod tests {
             ["resolve example.com", "connect 93.184.216.34:443"]
         );
         let notes = log.notes_since(0);
-        assert!(notes.iter().any(|n| n.contains("dns other.com")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("dns other.com")),
+            "{notes:?}"
+        );
         assert!(
             notes.iter().any(|n| n.contains("tcp example.com:80")),
             "{notes:?}"
@@ -278,7 +289,8 @@ mod tests {
         ));
         assert!(log.entries().is_empty());
         assert!(matches!(
-            net.bind_tcp(sa("127.0.0.1:5000"), false, false, false).await,
+            net.bind_tcp(sa("127.0.0.1:5000"), false, false, false)
+                .await,
             Err(NetworkError::PermissionDenied)
         ));
         assert_eq!(log.notes_since(0).len(), 1);
@@ -299,7 +311,9 @@ mod tests {
     async fn audit_mode_lets_everything_through_and_notes_it() {
         let (fake, net, log) = setup(NetMode::Audit, &[]);
         net.resolve("other.com", None, None).await.unwrap();
-        let _ = net.connect_tcp(sa("0.0.0.0:0"), sa("93.184.216.34:443")).await;
+        let _ = net
+            .connect_tcp(sa("0.0.0.0:0"), sa("93.184.216.34:443"))
+            .await;
         let _ = net.bind_udp(sa("0.0.0.0:0"), false, false).await;
         assert_eq!(fake.calls.lock().unwrap().len(), 3);
         assert_eq!(log.notes_since(0).len(), 3);
