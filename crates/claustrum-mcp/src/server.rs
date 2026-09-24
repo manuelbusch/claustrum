@@ -1,6 +1,6 @@
 //! The MCP server and its tools.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use claustrum_sandbox::{
     ExecOptions, Sandbox, WORKSPACE,
@@ -8,10 +8,14 @@ use claustrum_sandbox::{
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
-    handler::server::wrapper::Parameters,
+    handler::server::{
+        router::tool::{ToolRoute, ToolRouter},
+        tool::ToolCallContext,
+        wrapper::Parameters,
+    },
     model::{
         CallToolResult, ContentBlock, Implementation, ProgressNotificationParam,
-        ServerCapabilities, ServerConfig,
+        ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
     },
     schemars::{self, JsonSchema},
     service::RequestContext,
@@ -30,6 +34,18 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct ClaustrumServer {
     sandbox: Sandbox,
+    tool_router: ToolRouter<Self>,
+}
+
+/// Parameters of the `Action` tool, which exists only when actions are
+/// configured.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ActionParams {
+    /// Name of the action to run.
+    pub name: String,
+    /// Input values by input name. Omit inputs that have a default.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -112,7 +128,14 @@ fn tool_error(e: impl std::fmt::Display) -> CallToolResult {
 #[tool_router]
 impl ClaustrumServer {
     pub fn new(sandbox: Sandbox) -> Self {
-        Self { sandbox }
+        let mut tool_router = Self::tool_router();
+        if let Some(route) = action_route(&sandbox) {
+            tool_router.add_route(route);
+        }
+        Self {
+            sandbox,
+            tool_router,
+        }
     }
 
     pub fn sandbox(&self) -> &Sandbox {
@@ -291,11 +314,62 @@ impl ClaustrumServer {
     }
 }
 
-#[tool_handler]
+/// The `Action` tool: its description is built from the configured actions.
+fn action_route(sandbox: &Sandbox) -> Option<ToolRoute<ClaustrumServer>> {
+    let command = sandbox.action_command()?;
+    let listing = sandbox.action_listing()?;
+    let description = format!(
+        "Run one of the host actions the user declared in claustrum.toml. Actions run on the \
+         host machine, outside the sandbox, with a fixed command line; only the declared \
+         inputs can be supplied and each is validated before the command starts. The same \
+         actions are available in Bash as `{command} <name> [inputs]`. Output and exit code \
+         are returned like Bash results; the action's own timeout applies.\n\n{listing}"
+    );
+    let schema = schemars::schema_for!(ActionParams);
+    let schema = serde_json::to_value(schema)
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::Object(o) => Some(o),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let tool = Tool::new("Action", description, Arc::new(schema)).with_annotations(
+        ToolAnnotations::with_title("Host action")
+            .read_only(false)
+            .destructive(true)
+            .open_world(true),
+    );
+    Some(ToolRoute::new_dyn(tool, |ctx: ToolCallContext<'_, ClaustrumServer>| {
+        Box::pin(async move {
+            let args = ctx.arguments.clone().unwrap_or_default();
+            let params: ActionParams = serde_json::from_value(serde_json::Value::Object(args))
+                .map_err(|e| McpError::invalid_params(format!("invalid parameters: {e}"), None))?;
+            Ok(ctx.service.action(params).await?.into())
+        })
+    }))
+}
+
+impl ClaustrumServer {
+    async fn action(&self, p: ActionParams) -> Result<CallToolResult, McpError> {
+        Ok(match self.sandbox.run_action(&p.name, p.inputs).await {
+            Ok(out) => {
+                let rendered = format::exec(&out);
+                if out.success() {
+                    text(rendered)
+                } else {
+                    CallToolResult::error(vec![ContentBlock::text(rendered)])
+                }
+            }
+            Err(e) => tool_error(e),
+        })
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ClaustrumServer {
     fn get_info(&self) -> ServerConfig {
         let commands = self.sandbox.commands();
-        let instructions = format!(
+        let mut instructions = format!(
             "Claustrum runs your tools inside a WASIX sandbox. The project directory is mounted \
              read/write at {WORKSPACE}, which is also the working directory; changes there are \
              visible on the host. Nothing outside {WORKSPACE}, /tmp and /home/claude is \
@@ -306,6 +380,17 @@ impl ServerHandler for ClaustrumServer {
              Available commands in Bash: {}.",
             commands.join(", ")
         );
+        if let (Some(command), Some(listing)) =
+            (self.sandbox.action_command(), self.sandbox.action_listing())
+        {
+            instructions.push_str(&format!(
+                " The user has declared host actions, fixed commands that run on the host when \
+                 triggered through the Action tool or `{command}` in Bash; they are the only \
+                 way to reach the host. A Bash call that triggers a long action needs a timeout \
+                 at least as long as the action's; the Action tool uses the action's own \
+                 timeout.\n{listing}"
+            ));
+        }
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("claustrum", env!("CARGO_PKG_VERSION")))
             .with_instructions(instructions)

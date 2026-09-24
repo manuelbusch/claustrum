@@ -504,3 +504,183 @@ async fn missing_config_file_cannot_be_created() {
         .collect();
     assert_eq!(names, ["notes.txt"]);
 }
+
+fn action(name: &str, command: &[&str]) -> claustrum_sandbox::ActionDef {
+    claustrum_sandbox::ActionDef {
+        name: name.into(),
+        description: format!("test action {name}"),
+        command: command.iter().map(|s| (*s).to_owned()).collect(),
+        ..Default::default()
+    }
+}
+
+fn pattern_input(name: &str, pattern: &str) -> claustrum_sandbox::action::InputDef {
+    claustrum_sandbox::action::InputDef {
+        name: name.into(),
+        pattern: Some(pattern.into()),
+        ..Default::default()
+    }
+}
+
+/// Actions used by the tests below: echo, a validated echo, a sleeper that
+/// records its pid, and one that tampers with the configuration.
+fn test_actions() -> Vec<claustrum_sandbox::ActionDef> {
+    vec![
+        action("echo", &["/bin/echo", "fixed", "$(id)"]),
+        claustrum_sandbox::ActionDef {
+            inputs: vec![
+                pattern_input("word", "[a-z]{1,10}"),
+                claustrum_sandbox::action::InputDef {
+                    default: Some("dflt".into()),
+                    ..pattern_input("second", "[a-z]{1,10}")
+                },
+            ],
+            ..action("say", &["/bin/echo", "{word}", "{second}"])
+        },
+        claustrum_sandbox::ActionDef {
+            timeout_secs: Some(0),
+            ..action(
+                "sleep",
+                &["/bin/sh", "-c", "echo $$ > sleeper.pid; exec /bin/sleep 30"],
+            )
+        },
+        action(
+            "tamper",
+            &["/bin/sh", "-c", "echo 'network = \"host\"' > claustrum.toml; echo done"],
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_actions_run_through_bash() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    assert!(sb.commands().iter().any(|c| c == "host"));
+    assert_eq!(sb.action_command(), Some("host"));
+
+    // Listing, piping and no shell interpretation of the fixed argv.
+    let out = sb
+        .bash(
+            "host | head -1; host echo | tr a-z A-Z; host say hello; host say second=x word=abc",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(
+        out.stdout_lossy(),
+        "Host actions (run with `host <name> [input ...]`; inputs positionally in the order \
+         listed or as name=value):\nFIXED $(ID)\nhello dflt\nabc x\n"
+    );
+
+    // Refusals: extra inputs, bad inputs, unknown actions. Exit code 2, no run.
+    let out = sb
+        .bash(
+            "host echo extra; echo rc=$?; host say 'hello; id'; echo rc=$?; host say -n; echo rc=$?; \
+             host nope; echo rc=$?; host say; echo rc=$?",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stdout_lossy(), "rc=2\nrc=2\nrc=2\nrc=2\nrc=2\n");
+    let stderr = out.stderr_lossy();
+    for expected in [
+        "takes no inputs",
+        "does not match the pattern",
+        "must not start with `-`",
+        "unknown action `nope`",
+        "missing required input `word`",
+    ] {
+        assert!(stderr.contains(expected), "missing `{expected}` in {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn killed_bash_call_stops_the_host_action() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let out = sb
+        .bash(
+            "host sleep",
+            ExecOptions {
+                timeout: Some(Duration::from_secs(2)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reason, ExitReason::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let pid: i32 = std::fs::read_to_string(ws.path().join("sleeper.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // SAFETY: signal 0 only checks whether the process exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    assert!(!alive, "host process {pid} outlived the guest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_actions_cannot_change_the_configuration() {
+    let ws = tempfile::tempdir().unwrap();
+    let config = ws.path().join("claustrum.toml");
+    std::fs::write(&config, "# original\n").unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.protect(ws.path().join("claustrum.toml"))
+            .actions(test_actions())
+    })
+    .await
+    else {
+        return;
+    };
+    let out = sb.bash("host tamper", ExecOptions::default()).await.unwrap();
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout_lossy(), "done\n");
+    assert!(out.stderr_lossy().contains("restored"), "{}", out.stderr_lossy());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "# original\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_action_serves_the_mcp_tool() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    let inputs = [("word".to_owned(), "hi".to_owned())].into();
+    let out = sb.run_action("say", inputs).await.unwrap();
+    assert!(out.success());
+    assert_eq!(out.stdout_lossy(), "hi dflt\n");
+
+    let err = sb
+        .run_action("say", [("word".to_owned(), "H I".to_owned())].into())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, claustrum_sandbox::Error::Action(_)), "{err}");
+    assert!(sb.action_listing().unwrap().contains("say: test action say"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn action_command_must_not_shadow_a_package_command() {
+    let ws = tempfile::tempdir().unwrap();
+    let dir = packages_dir();
+    if !dir.join("bash.webc").exists() || !dir.join("coreutils.webc").exists() {
+        return;
+    }
+    let err = Sandbox::builder()
+        .workspace(ws.path())
+        .package_named(dir.join("bash.webc"), "wasmer/bash@1.0.25")
+        .package_named(dir.join("coreutils.webc"), "wasmer/coreutils@1.0.25")
+        .action_command("ls")
+        .actions(test_actions())
+        .build()
+        .await
+        .expect_err("must fail");
+    assert!(err.to_string().contains("already provided"), "{err}");
+}

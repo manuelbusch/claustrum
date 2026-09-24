@@ -7,9 +7,11 @@
 //!
 //! The main entry point is [`Sandbox`], built through [`SandboxBuilder`].
 
+pub mod action;
 mod capture;
 mod error;
 pub mod fs;
+pub mod hostcmd;
 pub mod native;
 mod packages;
 mod policy;
@@ -18,7 +20,9 @@ mod protect;
 mod runtime;
 mod sandbox;
 
+pub use action::{ActionDef, ActionSpec};
 pub use error::{Error, Result};
+pub use hostcmd::{Cancel, HostCommand, HostOutput, Invocation};
 pub use packages::{Downloaded, PackageSet, download};
 pub use policy::{NetworkPolicy, Policy};
 pub use process::{ExecOptions, ExecOutput, ExitReason};

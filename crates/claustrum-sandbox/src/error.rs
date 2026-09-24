@@ -38,6 +38,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("{0}")]
+    Action(String),
+
+    #[error("{0}")]
     Other(String),
 }
 

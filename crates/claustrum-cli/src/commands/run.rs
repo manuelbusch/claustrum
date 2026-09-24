@@ -36,6 +36,10 @@ pub struct Args {
 
 pub fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
+    let actions = config.validate_actions(&workspace)?;
+    if let Some(notice) = Config::actions_notice(&actions) {
+        eprintln!("claustrum: {notice}");
+    }
     // Fail early with a helpful message instead of letting claude report a
     // dead MCP server.
     let missing: Vec<_> = config
@@ -101,7 +105,7 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         .arg("--allowedTools")
         .arg(format!("mcp__{SERVER_NAME}__*"))
         .arg("--append-system-prompt")
-        .arg(system_prompt(config.file.claude.system_prompt.as_deref()));
+        .arg(system_prompt(&config, config.file.claude.system_prompt.as_deref()));
     if let Some(mode) = &args.permission_mode {
         cmd.arg("--permission-mode").arg(mode);
     }
@@ -118,7 +122,7 @@ pub fn run(config: Config, args: Args) -> Result<()> {
     Err(anyhow::Error::from(err).context(format!("failed to execute {}", claude.display())))
 }
 
-fn system_prompt(extra: Option<&str>) -> String {
+fn system_prompt(config: &Config, extra: Option<&str>) -> String {
     let mut s = format!(
         "You are running inside Claustrum, a WASIX sandbox. Your only tools are the \
          mcp__{SERVER_NAME}__Bash, Read, Write, Edit, Glob and Grep tools; they replace the \
@@ -132,6 +136,22 @@ fn system_prompt(extra: Option<&str>) -> String {
          ({WORKSPACE}/claustrum.toml) is read-only for you: you can read it but not change, \
          replace or delete it; if a setting there needs to change, ask the user."
     );
+    let actions = &config.file.actions.list;
+    if !actions.is_empty() {
+        let command = config.action_command();
+        s.push_str(&format!(
+            " The user has declared host actions: fixed commands that run on the host machine \
+             outside the sandbox when you trigger them. They are the only way to reach the host. \
+             Trigger one with the mcp__{SERVER_NAME}__Action tool or with `{command} <name> \
+             [inputs]` in Bash; `{command}` alone lists them with their inputs. Inputs are \
+             validated against the declaration and anything else is refused. Available: {}.",
+            actions
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if let Some(extra) = extra {
         s.push_str("\n\n");
         s.push_str(extra);

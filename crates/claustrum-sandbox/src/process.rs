@@ -11,9 +11,10 @@ use wasmer_wasix::{
 use wasmer_wasix_types::wasi::Signal;
 
 use crate::{
-    Error, Policy, Result,
+    Error, HostCommand, Policy, Result,
     capture::{CaptureFile, CaptureHandle},
     fs::Mount,
+    hostcmd::{self, Cancel, HostCommandFs},
     packages::PackageSet,
 };
 
@@ -71,6 +72,9 @@ pub(crate) struct Spawn<'a> {
     pub mounts: &'a [Mount],
     pub policy: &'a Policy,
     pub base_env: &'a BTreeMap<String, String>,
+    /// Host commands reachable through the shim; mounted per process so that
+    /// killing the process also cancels the host work it started.
+    pub host_commands: &'a [Arc<dyn HostCommand>],
     pub command: &'a str,
     pub cwd: String,
     pub options: ExecOptions,
@@ -127,6 +131,16 @@ pub(crate) async fn run(spawn: Spawn<'_>) -> Result<ExecOutput> {
     for mount in spawn.mounts {
         runner.with_mount(mount.guest.clone(), Arc::clone(&mount.fs));
     }
+    let cancel = Cancel::new();
+    if !spawn.host_commands.is_empty() {
+        runner.with_mount(
+            hostcmd::MOUNT.to_owned(),
+            Arc::new(HostCommandFs::new(
+                spawn.host_commands.to_vec(),
+                cancel.clone(),
+            )),
+        );
+    }
 
     let command = package
         .get_command(spawn.command)
@@ -169,6 +183,7 @@ pub(crate) async fn run(spawn: Spawn<'_>) -> Result<ExecOutput> {
                 r = &mut wait => (r, ExitReason::Exited),
                 _ = &mut deadline => {
                     tracing::warn!(command = spawn.command, ?limit, "guest command timed out; killing");
+                    cancel.cancel();
                     (kill_tree(&process, &main_tid, &mut wait).await, ExitReason::TimedOut)
                 }
             }

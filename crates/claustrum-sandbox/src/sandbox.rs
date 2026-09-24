@@ -9,10 +9,11 @@ use std::{
 use wasmer_wasix::{Runtime, runtime::OverriddenRuntime, virtual_net::DynVirtualNetworking};
 
 use crate::{
-    BundledPackage, Error, ExecOptions, ExecOutput, NetworkPolicy, PackageSet, Policy, Result,
-    RuntimeConfig, WORKSPACE,
+    BundledPackage, Error, ExecOptions, ExecOutput, ExitReason, HostCommand, NetworkPolicy,
+    PackageSet, Policy, Result, RuntimeConfig, WORKSPACE,
+    action::{self, ActionDef, ActionSet, ActionSpec, CompileContext},
     fs::{self, GuestFs, Mount},
-    native, process,
+    hostcmd, native, process,
     runtime::build_runtime,
 };
 
@@ -41,6 +42,9 @@ pub struct SandboxBuilder {
     env: BTreeMap<String, String>,
     extra_mounts: Vec<(String, PathBuf)>,
     protected: Vec<PathBuf>,
+    host_commands: Vec<Arc<dyn HostCommand>>,
+    actions: Vec<ActionDef>,
+    action_command: String,
 }
 
 impl Default for SandboxBuilder {
@@ -61,6 +65,9 @@ impl Default for SandboxBuilder {
             env,
             extra_mounts: Vec::new(),
             protected: Vec::new(),
+            host_commands: Vec::new(),
+            actions: Vec::new(),
+            action_command: action::DEFAULT_COMMAND.to_owned(),
         }
     }
 }
@@ -125,6 +132,26 @@ impl SandboxBuilder {
         self
     }
 
+    /// Expose a host-implemented command as `/bin/<name>` inside the guest.
+    pub fn host_command(mut self, command: impl HostCommand) -> Self {
+        self.host_commands.push(Arc::new(command));
+        self
+    }
+
+    /// Declare host actions (see [`crate::action`]). They are validated in
+    /// [`build`](Self::build) and become the guest command `host` (or the
+    /// name set with [`action_command`](Self::action_command)).
+    pub fn actions(mut self, actions: impl IntoIterator<Item = ActionDef>) -> Self {
+        self.actions.extend(actions);
+        self
+    }
+
+    /// Guest command name under which the actions are triggered.
+    pub fn action_command(mut self, name: impl Into<String>) -> Self {
+        self.action_command = name.into();
+        self
+    }
+
     /// Build the sandbox. Must be called from within a tokio runtime.
     pub async fn build(mut self) -> Result<Sandbox> {
         let workspace_dir = self
@@ -163,6 +190,43 @@ impl SandboxBuilder {
         }
         for dir in &self.dir_packages {
             packages.add_dir(dir, &*base_runtime).await?;
+        }
+
+        let mut actions = None;
+        if !self.actions.is_empty() {
+            let name = &self.action_command;
+            if !action::is_action_name(name) {
+                return Err(Error::Init(format!(
+                    "action command name `{name}` is invalid: use [a-z][a-z0-9-]{{0,31}}"
+                )));
+            }
+            if packages.command_names().iter().any(|c| c == name) {
+                return Err(Error::Init(format!(
+                    "action command name `{name}` is already provided by a package"
+                )));
+            }
+            let specs = action::compile_all(
+                &self.actions,
+                &CompileContext {
+                    workspace: &workspace_dir,
+                    default_timeout: self.policy.default_timeout,
+                    max_output_bytes: self.policy.max_output_bytes,
+                },
+            )
+            .map_err(Error::Init)?;
+            let set = Arc::new(ActionSet::new(
+                name.clone(),
+                specs,
+                workspace_dir.clone(),
+                protected.clone(),
+            ));
+            self.host_commands.push(Arc::clone(&set) as Arc<dyn HostCommand>);
+            actions = Some(set);
+        }
+        if !self.host_commands.is_empty() {
+            let dir = hostcmd::write_shim_package(&self.runtime.cache_dir, &self.host_commands)
+                .map_err(|e| Error::Init(format!("cannot write host command package: {e}")))?;
+            packages.add_dir(&dir, &*base_runtime).await?;
         }
 
         let etc = fs::mem_dir();
@@ -216,6 +280,8 @@ impl SandboxBuilder {
                 workspace_dir,
                 protected,
                 cwd: Mutex::new(WORKSPACE.to_owned()),
+                host_commands: self.host_commands,
+                actions,
             }),
         })
     }
@@ -251,6 +317,8 @@ struct Inner {
     workspace_dir: PathBuf,
     protected: Vec<PathBuf>,
     cwd: Mutex<String>,
+    host_commands: Vec<Arc<dyn HostCommand>>,
+    actions: Option<Arc<ActionSet>>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -286,9 +354,60 @@ impl Sandbox {
         &self.inner.policy
     }
 
-    /// Names of all guest commands (from the loaded packages).
+    /// Names of all guest commands (from the loaded packages, including the
+    /// host commands).
     pub fn commands(&self) -> Vec<String> {
         self.inner.packages.command_names()
+    }
+
+    /// The declared host actions, empty when none are configured.
+    pub fn actions(&self) -> &[ActionSpec] {
+        self.inner.actions.as_ref().map_or(&[], |a| a.specs())
+    }
+
+    /// Guest command that triggers the actions, when any are configured.
+    pub fn action_command(&self) -> Option<&str> {
+        self.inner.actions.as_ref().map(|a| a.command())
+    }
+
+    /// The same listing `host` prints without arguments.
+    pub fn action_listing(&self) -> Option<String> {
+        self.inner.actions.as_ref().map(|a| a.listing())
+    }
+
+    /// Run a host action directly (what the MCP `Action` tool does). Refused
+    /// invocations and unknown actions come back as [`Error::Action`].
+    pub async fn run_action(
+        &self,
+        name: &str,
+        inputs: BTreeMap<String, String>,
+    ) -> Result<ExecOutput> {
+        let set = self
+            .inner
+            .actions
+            .clone()
+            .ok_or_else(|| Error::Action("no host actions are configured".into()))?;
+        let name = name.to_owned();
+        let cwd = self.cwd();
+        let outcome = tokio::task::spawn_blocking(move || {
+            set.run(&name, &[], &inputs, &cwd, &hostcmd::Cancel::new())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("action task failed: {e}")))?
+        .map_err(|r| Error::Action(r.to_string()))?;
+        Ok(ExecOutput {
+            exit_code: outcome.exit_code,
+            reason: if outcome.killed {
+                ExitReason::TimedOut
+            } else {
+                ExitReason::Exited
+            },
+            stdout: outcome.stdout,
+            stdout_truncated: outcome.stdout_truncated,
+            stderr: outcome.stderr,
+            stderr_truncated: outcome.stderr_truncated,
+            duration: outcome.duration,
+        })
     }
 
     /// Compile every distinct module of the loaded packages into the module
@@ -354,6 +473,7 @@ impl Sandbox {
             mounts: &self.inner.mounts,
             policy: &self.inner.policy,
             base_env: &self.inner.env,
+            host_commands: &self.inner.host_commands,
             command,
             cwd,
             options,

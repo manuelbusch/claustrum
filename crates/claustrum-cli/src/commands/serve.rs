@@ -20,5 +20,8 @@ pub async fn run(config: Config, args: Args) -> Result<()> {
         commands = sandbox.commands().len(),
         "sandbox ready"
     );
+    if let Some(notice) = Config::actions_notice(sandbox.actions()) {
+        eprintln!("claustrum: {notice}");
+    }
     claustrum_mcp::serve_stdio(sandbox).await
 }

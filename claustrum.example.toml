@@ -58,6 +58,63 @@ source = "syrusakbary/jq"
 # guest = "/data"
 # host = "~/datasets"
 
+# Host actions: fixed commands on the host that Claude may trigger from the
+# sandbox, with inputs validated against the declaration. This file is
+# read-only inside the sandbox, so Claude cannot add or change actions.
+#
+# CAUTION: every action is a deliberate hole in the sandbox. The command runs
+# with your full user privileges and without confinement, and the validation
+# only guards the inputs you declare. Programs that execute configuration or
+# scripts from the workspace (cargo, git, npm, make, shells, ...) run code
+# Claude can write, even without inputs. Declare no inputs when you can, keep
+# patterns as narrow as possible, never put a placeholder where a shell or
+# interpreter would re-parse it, and only declare commands you would let
+# Claude run on the host directly. See README, "Host actions".
+[actions]
+# Guest command that triggers the actions (`host test` in Bash). Must not
+# collide with a package command.
+# command = "host"
+
+# [[actions.action]]
+# name = "test"                                  # [a-z][a-z0-9-]{0,31}
+# description = "Run the whole Rust test suite"  # shown to Claude
+# command = ["cargo", "test", "--workspace"]     # argv; no shell involved
+# cwd = "crates/claustrum-cli"                   # relative to the workspace
+# timeout_secs = 600                             # default: [sandbox].timeout_secs
+# max_output_bytes = 1048576                     # default: [sandbox].max_output_bytes
+# env = { CARGO_TERM_COLOR = "never" }           # only PATH, HOME, LANG are inherited
+# env_passthrough = ["CARGO_HOME"]               # host variables forwarded by name
+# confine = "none"                               # reserved: "seatbelt" comes later
+
+# [[actions.action]]
+# name = "test-crate"
+# description = "Run the tests of one crate, optionally filtered by test name"
+# command = ["cargo", "test", "-p", "{crate}", "--", "{filter}"]
+#
+# [[actions.action.input]]
+# name = "crate"
+# pattern = "[a-z][a-z0-9-]{0,40}"               # whole value must match
+#
+# [[actions.action.input]]
+# name = "filter"
+# pattern = "[A-Za-z0-9_:]{0,80}"
+# default = ""                                   # makes the input optional
+
+# [[actions.action]]
+# name = "fmt-file"
+# description = "Format one file with rustfmt"
+# command = ["rustfmt", "--edition", "2024", "{file}"]
+#
+# [[actions.action.input]]
+# name = "file"
+# kind = "path"                                  # must resolve inside the workspace
+# must_exist = true
+
+# Other input kinds: `choices = ["debug", "release"]` and
+# `kind = "integer"` with `min` / `max`. Every value is limited to `max_len`
+# bytes (default 256), may not contain control characters and may not start
+# with `-` unless `allow_leading_dash = true`.
+
 [claude]
 # Path to the claude binary. Defaults to `claude` on PATH.
 # binary = "/usr/local/bin/claude"

@@ -6,7 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use claustrum_sandbox::{NetworkPolicy, Policy, RuntimeConfig, Sandbox, SandboxBuilder};
+use claustrum_sandbox::{
+    ActionDef, NetworkPolicy, Policy, RuntimeConfig, Sandbox, SandboxBuilder,
+    action::{self, CompileContext},
+};
 use serde::Deserialize;
 
 /// Packages installed by `claustrum pkg sync` when none are configured.
@@ -28,6 +31,8 @@ pub struct FileConfig {
     pub mounts: Vec<MountEntry>,
     #[serde(default)]
     pub claude: ClaudeSection,
+    #[serde(default)]
+    pub actions: ActionsSection,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -86,6 +91,16 @@ pub struct PackageEntry {
 pub struct MountEntry {
     pub guest: String,
     pub host: PathBuf,
+}
+
+/// Host actions the guest may trigger; see `claustrum_sandbox::action`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ActionsSection {
+    /// Guest command that triggers the actions. Defaults to `host`.
+    pub command: Option<String>,
+    #[serde(default, rename = "action")]
+    pub list: Vec<ActionDef>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -208,6 +223,47 @@ impl Config {
         paths
     }
 
+    /// Guest command name for the actions.
+    pub fn action_command(&self) -> &str {
+        self.file
+            .actions
+            .command
+            .as_deref()
+            .unwrap_or(action::DEFAULT_COMMAND)
+    }
+
+    /// Check the action definitions against the workspace without building
+    /// the sandbox, so that `claustrum run` fails before `claude` starts.
+    /// Warnings about risky definitions are logged by `compile_all`.
+    pub fn validate_actions(&self, workspace: &Path) -> Result<Vec<claustrum_sandbox::ActionSpec>> {
+        let policy = self.policy()?;
+        action::compile_all(
+            &self.file.actions.list,
+            &CompileContext {
+                workspace,
+                default_timeout: policy.default_timeout,
+                max_output_bytes: policy.max_output_bytes,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("invalid [actions] configuration: {e}"))
+    }
+
+    /// One line for stderr saying which actions are live, so that every start
+    /// shows what the sandbox can reach on the host.
+    pub fn actions_notice(specs: &[claustrum_sandbox::ActionSpec]) -> Option<String> {
+        if specs.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "host actions enabled (run on the host as your user, no confinement): {}",
+            specs
+                .iter()
+                .map(|s| format!("{} → {}", s.name, s.command_line()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    }
+
     pub fn workspace(&self, override_dir: Option<&Path>) -> Result<PathBuf> {
         let dir = override_dir
             .map(Path::to_path_buf)
@@ -284,6 +340,9 @@ impl Config {
         for p in self.protected_paths(&workspace) {
             builder = builder.protect(p);
         }
+        builder = builder
+            .action_command(self.action_command())
+            .actions(self.file.actions.list.iter().cloned());
         Ok(builder.build().await?)
     }
 }
@@ -306,4 +365,56 @@ pub fn read_stamp(webc: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_actions() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+[actions]
+command = "run"
+
+[[actions.action]]
+name = "test"
+command = ["cargo", "test"]
+
+[[actions.action]]
+name = "say"
+command = ["/bin/echo", "{word}"]
+[[actions.action.input]]
+name = "word"
+pattern = "[a-z]+"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.actions.command.as_deref(), Some("run"));
+        assert_eq!(cfg.actions.list.len(), 2);
+        assert_eq!(cfg.actions.list[1].inputs[0].name, "word");
+
+        let err = toml::from_str::<FileConfig>("[[actions.action]]\nname = \"x\"\nshell = true\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("shell"), "{err}");
+    }
+
+    #[test]
+    fn validate_actions_reports_bad_definitions() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let file: FileConfig = toml::from_str(
+            "[[actions.action]]\nname = \"x\"\ncommand = [\"/bin/echo\", \"{nope}\"]\n",
+        )
+        .unwrap();
+        let config = Config {
+            file,
+            path: None,
+            packages_dir: ws.clone(),
+        };
+        let err = config.validate_actions(&ws).unwrap_err();
+        assert!(err.to_string().contains("no matching input"), "{err}");
+        assert_eq!(config.action_command(), "host");
+    }
 }

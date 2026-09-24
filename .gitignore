@@ -1,3 +1,4 @@
 /target
 /packages/*.webc
 /packages/*.sha256
+/shim/target

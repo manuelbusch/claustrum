@@ -132,6 +132,91 @@ recipe is the [wasinix](https://github.com/wasix-org/wasinix) Nix flake, which b
 x86_64 Linux only and needs a patched runtime. gitoxide does not target WASIX either. Until
 that changes, git operations have to happen on the host.
 
+### Host actions
+
+Sometimes a task needs something that only exists on the host: the Rust toolchain, a
+deploy script, a formatter. Instead of loosening the sandbox, `claustrum.toml` can declare
+**actions**: fixed host commands that Claude may *trigger*, in the spirit of a CI job.
+
+```toml
+[[actions.action]]
+name = "test"
+description = "Run the whole Rust test suite"
+command = ["cargo", "test", "--workspace"]
+timeout_secs = 600
+
+[[actions.action]]
+name = "test-crate"
+description = "Run the tests of one crate, optionally filtered by test name"
+command = ["cargo", "test", "-p", "{crate}", "--", "{filter}"]
+
+[[actions.action.input]]
+name = "crate"
+pattern = "[a-z][a-z0-9-]{0,40}"
+
+[[actions.action.input]]
+name = "filter"
+pattern = "[A-Za-z0-9_:]{0,80}"
+default = ""
+```
+
+Inside the sandbox the actions appear as the `host` command (`host` lists them, `host test`
+triggers one, `host test-crate claustrum-cli` or `host test-crate crate=claustrum-cli`
+passes inputs), and as the `Action` MCP tool whose description carries the same list.
+
+What holds, by construction:
+
+- **No free-form commands.** The argv is fixed in the configuration, which is read-only
+  inside the sandbox. No shell is involved on the host; `command[0]` is resolved once at
+  startup (absolute path or a bare name on `PATH`).
+- **Every input is validated** before it is substituted into a single argv element:
+  `pattern` (anchored regex), `choices`, `path` (must resolve inside the workspace, also
+  through symlinks) or `integer` (with `min`/`max`). Values are limited in length, may not
+  contain control characters and may not start with `-` unless `allow_leading_dash` is
+  set. An action without inputs refuses any argument.
+- **The process is contained in time and output.** It starts with a clean environment
+  (`PATH`, `HOME`, `LANG`, plus `env` and `env_passthrough`), a closed stdin, a working
+  directory inside the workspace and its own process group. The action's timeout or a
+  killed Bash call ends it with SIGKILL, output is capped, and one action runs at a time.
+- **The configuration stays what it was.** The protected files are snapshotted before and
+  restored after every action, so an action cannot loosen the sandbox for the next run.
+
+**Use with care.** Every action is a hole in the sandbox that you cut on purpose, and the
+validation only guards the edges you declared. The host process runs with your full user
+privileges and without confinement, so these ways around the sandbox remain:
+
+- **Trigger-only is not safe by itself.** Many programs execute configuration or scripts
+  from the workspace, which Claude can write: `cargo` honours `.cargo/config.toml`
+  (`rustc-wrapper`, `runner`), `build.rs` and proc macros; `git` honours `.git/config`
+  (`core.hooksPath`, `core.fsmonitor`, aliases); `npm` runs `package.json` scripts;
+  `make` runs the Makefile. Triggering such an action is code execution on the host.
+- **Validated inputs can still be interpreted.** A pattern only limits characters; the
+  program decides what they mean. `ext::sh -c …` is a valid git URL, `user@host:` is a
+  remote for scp and rsync, `@file` reads a file for curl, `key=value` after `git -c` or
+  `cargo --config` changes behaviour. A leading `-` is refused, these are not. Keep patterns
+  to the characters the program needs and check how it treats them.
+- **Placeholders must never reach an interpreter.** `sh -c "… {x}"` or `python -c` would
+  parse the value again on the host, so Claustrum refuses placeholders in those positions.
+  Put the code in a script and pass the input as an argument.
+- **Environment values are inputs too.** A placeholder in `env` (`RUSTFLAGS = "{flags}"`)
+  or an `env_passthrough` of `PATH`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `GIT_*` and the
+  like controls what the program loads or runs.
+- **Path inputs are checked before the program opens them.** Claude Code can run tools in
+  parallel, so a file could in principle be replaced by a symlink between the check and
+  the open. Do not rely on `path` inputs to keep a program away from host files.
+- **Side effects leave the sandbox.** `git push`, `deploy` or `npm publish` ship whatever
+  the workspace contains. Only the Claustrum configuration files are restored afterwards,
+  not anything else an action may write on the host.
+
+Claustrum refuses the clear cases at startup (placeholders after `sh -c` and friends) and
+logs a warning for the rest: programs known to execute workspace code, patterns such as
+`.*`, placeholders in `env`, forwarded loader variables. `claustrum run` and `serve` also
+print which actions are enabled. Rules of thumb: declare no inputs when you can, make
+patterns as narrow as possible, and only declare a command you would let Claude run on the
+host directly. The `confine` field is reserved for process confinement (macOS Seatbelt
+first) and currently accepts only `"none"`; until it lands, an action is as trusted as the
+host command behind it.
+
 ## Sandbox layout
 
 | Guest path | Backing | Notes |
@@ -141,6 +226,7 @@ that changes, git operations have to happen on the host.
 | `/tmp`, `/home/claude` | in-memory | persist for the lifetime of the server |
 | `/bin`, `/usr/bin` | package commands | populated from the loaded `.webc` files |
 | `/etc/claustrum/profile.sh` | in-memory | sourced by every bash via `BASH_ENV` |
+| `/.claustrum/cmd/<name>` | host process | request channel of a host command (see below) |
 
 Guest commands get a fixed environment (`HOME=/home/claude`, `PATH=/usr/local/bin:/bin:/usr/bin`,
 `TERM=dumb`) plus anything set under `[sandbox.env]`. Because WASIX reports stdio as a
@@ -148,11 +234,19 @@ terminal, the profile disables colours and pagers (`NO_COLOR`, `PAGER=cat`, `jq 
 captured output stays clean. Each `Bash` call is a fresh process; only the file system
 persists between calls.
 
+Host commands such as `host` are a small WASI shim (`shim/`, built by
+`scripts/build-shim.sh` and committed as `crates/claustrum-sandbox/assets/hostcmd.wasm`)
+registered under the command name. It writes its arguments to `/.claustrum/cmd/<name>`
+and reads the result back; the host runs the command while serving that read, so pipes
+and redirections in bash behave as usual.
+
 ## Development
 
 ```
 crates/
-  claustrum-sandbox/   runtime, mounts, packages, process execution, native tools
+  claustrum-sandbox/   runtime, mounts, packages, process execution, native tools,
+                       host commands (hostcmd.rs) and host actions (action/)
+shim/                  guest-side WASI shim for host commands (wasm32-wasip1)
   claustrum-mcp/       MCP server (rmcp) exposing the tools
   claustrum-cli/       `claustrum` binary: run, serve, pkg, configuration
 ```
@@ -173,6 +267,7 @@ The integration tests skip themselves when the packages are missing.
 - Expose the native tools inside the guest as well (so `grep` in a Bash call hits the fast
   path), via Wasmer's builtin-command mechanism.
 - Network allowlists per project.
+- Confinement of host actions (`confine = "seatbelt"` on macOS, bwrap/Landlock on Linux).
 - Brush (a bash-compatible shell written in Rust) compiled to WASIX as an alternative shell.
 - `.gitignore`-aware Glob/Grep, persistent working directory across `cd` in Bash calls,
   PTY emulation for interactive tools.

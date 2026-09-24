@@ -1,0 +1,23 @@
+# Guest-side shim for Claustrum host commands.
+#
+# Built separately for wasm32-wasip1 (see scripts/build-shim.sh); the resulting
+# module is committed as crates/claustrum-sandbox/assets/hostcmd.wasm and
+# embedded into the sandbox crate. Deliberately not part of the workspace.
+[package]
+name = "claustrum-hostcmd-shim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "hostcmd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -555,6 +555,8 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "http",
+ "libc",
+ "regex",
  "semver",
  "serde",
  "similar",
@@ -571,6 +573,7 @@ dependencies = [
  "wasmer-wasix",
  "wasmer-wasix-types",
  "webc",
+ "which",
 ]
 
 [[package]]
