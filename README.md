@@ -52,7 +52,9 @@ Claude Code's built-in tools run with the full privileges of the user who starte
 Permission prompts help, but they rely on the user reviewing every command. Claustrum replaces
 that trust boundary with a technical one: the only things Claude can affect are the files that
 were explicitly mounted into the sandbox. This makes it practical to let Claude work
-autonomously on a project without exposing the rest of the machine.
+autonomously on a project without exposing the rest of the machine. The boundary also covers
+Claustrum's own configuration: it usually sits in the project directory, but Claude can only
+read it, never loosen its sandbox for the next run.
 
 ## Getting started
 
@@ -100,6 +102,14 @@ user configuration directory. See [`claustrum.example.toml`](claustrum.example.t
 options: workspace, network policy, timeouts, packages, extra mounts, and which built-in
 Claude tools (if any) to keep.
 
+Inside the sandbox every configuration file Claustrum could load is read-only:
+`claustrum.toml` in the workspace (even when it does not exist yet), the default search
+paths and the file passed with `--config`, in every mount that contains them. The guest
+can read them, but writing, truncating, creating, deleting, renaming or replacing them is
+refused, as is renaming or removing a directory that contains one. The check runs on the
+host below every tool, resolves symlinks and hard links, and compares names
+case-insensitively on macOS. Change the configuration from outside the sandbox.
+
 ### Packages
 
 Packages are `.webc` files from the [Wasmer registry](https://wasmer.io/explore). `pkg sync`
@@ -127,6 +137,7 @@ that changes, git operations have to happen on the host.
 | Guest path | Backing | Notes |
 | --- | --- | --- |
 | `/workspace` | host project directory | read/write, this is the working directory |
+| `/workspace/claustrum.toml` | host file | read-only, see [Configuration](#configuration) |
 | `/tmp`, `/home/claude` | in-memory | persist for the lifetime of the server |
 | `/bin`, `/usr/bin` | package commands | populated from the loaded `.webc` files |
 | `/etc/claustrum/profile.sh` | in-memory | sourced by every bash via `BASH_ENV` |

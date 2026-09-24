@@ -112,9 +112,14 @@ pub fn normalize_guest_path(path: &str, cwd: &str) -> Result<String> {
 }
 
 /// Create a host-backed file system rooted at `dir`.
+///
+/// `protected` lists resolved host paths (see
+/// [`SandboxBuilder::protect`](crate::SandboxBuilder::protect)) that must stay
+/// read-only; those under `dir` are enforced by wrapping the mount.
 pub fn host_dir(
     handle: tokio::runtime::Handle,
     dir: &Path,
+    protected: &[PathBuf],
 ) -> Result<Arc<dyn FileSystem + Send + Sync>> {
     let canonical = dir
         .canonicalize()
@@ -124,7 +129,26 @@ pub fn host_dir(
     }
     let fs = virtual_fs::host_fs::FileSystem::new(handle, &canonical)
         .map_err(|e| Error::Init(format!("cannot mount {}: {e}", canonical.display())))?;
-    Ok(Arc::new(fs))
+    let inside: Vec<PathBuf> = protected
+        .iter()
+        .filter(|p| crate::protect::key(p).starts_with(crate::protect::key(&canonical)))
+        .cloned()
+        .collect();
+    if inside.is_empty() {
+        Ok(Arc::new(fs))
+    } else {
+        Ok(Arc::new(crate::protect::ProtectedFs::new(
+            fs, canonical, inside,
+        )))
+    }
+}
+
+/// Whether `inner` (a path inside the mount `fs`) is a protected, read-only
+/// file.
+pub(crate) fn is_protected(fs: &(dyn FileSystem + Send + Sync), inner: &Path) -> bool {
+    let fs: &dyn FileSystem = fs;
+    fs.downcast_ref::<crate::protect::ProtectedFs>()
+        .is_some_and(|p| p.is_protected(inner))
 }
 
 /// Create an empty in-memory file system.

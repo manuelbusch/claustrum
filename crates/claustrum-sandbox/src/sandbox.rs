@@ -40,6 +40,7 @@ pub struct SandboxBuilder {
     runtime: RuntimeConfig,
     env: BTreeMap<String, String>,
     extra_mounts: Vec<(String, PathBuf)>,
+    protected: Vec<PathBuf>,
 }
 
 impl Default for SandboxBuilder {
@@ -59,6 +60,7 @@ impl Default for SandboxBuilder {
             runtime: RuntimeConfig::default(),
             env,
             extra_mounts: Vec::new(),
+            protected: Vec::new(),
         }
     }
 }
@@ -111,6 +113,18 @@ impl SandboxBuilder {
         self
     }
 
+    /// Make a host file read-only for the guest, whether or not it exists.
+    ///
+    /// Inside every host-backed mount that contains it, the file can be read
+    /// but not written, truncated, created, removed, renamed or replaced, and
+    /// no directory containing it can be renamed or removed. Relative paths
+    /// are resolved against the current directory. Used for the Claustrum
+    /// configuration, which must not be changeable from inside the sandbox.
+    pub fn protect(mut self, path: impl Into<PathBuf>) -> Self {
+        self.protected.push(path.into());
+        self
+    }
+
     /// Build the sandbox. Must be called from within a tokio runtime.
     pub async fn build(mut self) -> Result<Sandbox> {
         let workspace_dir = self
@@ -119,6 +133,20 @@ impl SandboxBuilder {
             .ok_or_else(|| Error::Init("a workspace directory is required".into()))?;
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| Error::Init("a tokio runtime is required".into()))?;
+        let workspace_dir = workspace_dir
+            .canonicalize()
+            .map_err(|e| Error::Init(format!("cannot resolve {}: {e}", workspace_dir.display())))?;
+        let cwd = std::env::current_dir()
+            .map_err(|e| Error::Init(format!("cannot determine the current directory: {e}")))?;
+        let mut protected = Vec::with_capacity(self.protected.len());
+        for p in &self.protected {
+            let abs = cwd.join(p);
+            let resolved = crate::protect::resolve_host_path(&abs)
+                .map_err(|e| Error::Init(format!("cannot resolve {}: {e}", abs.display())))?;
+            if !protected.contains(&resolved) {
+                protected.push(resolved);
+            }
+        }
 
         // Bundled packages double as offline package sources so that
         // dependencies between them (bash → coreutils) resolve locally.
@@ -148,7 +176,7 @@ impl SandboxBuilder {
         let mut mounts = vec![
             Mount {
                 guest: WORKSPACE.into(),
-                fs: fs::host_dir(handle.clone(), &workspace_dir)?,
+                fs: fs::host_dir(handle.clone(), &workspace_dir, &protected)?,
             },
             Mount {
                 guest: "/tmp".into(),
@@ -169,7 +197,7 @@ impl SandboxBuilder {
             }
             mounts.push(Mount {
                 guest: guest.clone(),
-                fs: fs::host_dir(handle.clone(), host)?,
+                fs: fs::host_dir(handle.clone(), host, &protected)?,
             });
         }
 
@@ -186,6 +214,7 @@ impl SandboxBuilder {
                 policy: self.policy,
                 env: self.env,
                 workspace_dir,
+                protected,
                 cwd: Mutex::new(WORKSPACE.to_owned()),
             }),
         })
@@ -220,6 +249,7 @@ struct Inner {
     policy: Policy,
     env: BTreeMap<String, String>,
     workspace_dir: PathBuf,
+    protected: Vec<PathBuf>,
     cwd: Mutex<String>,
 }
 
@@ -245,6 +275,11 @@ impl Sandbox {
     /// The guest view of the persistent mounts, for native tools.
     pub fn guest_fs(&self) -> &GuestFs {
         &self.inner.guest_fs
+    }
+
+    /// Resolved host paths of the files the guest may read but not change.
+    pub fn protected_paths(&self) -> &[PathBuf] {
+        &self.inner.protected
     }
 
     pub fn policy(&self) -> &Policy {

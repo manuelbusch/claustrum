@@ -65,6 +65,18 @@ pub(crate) fn locate(fs: &GuestFs, path: &str, cwd: &str) -> Result<Located> {
     })
 }
 
+/// Refuse early, with a clear message, to change a protected file (the
+/// mount would refuse anyway, but only with "permission denied").
+pub(crate) fn ensure_writable(loc: &Located) -> Result<()> {
+    if crate::fs::is_protected(&*loc.fs, &loc.inner) {
+        return Err(Error::invalid_path(
+            &loc.guest,
+            "this file is protected by the sandbox and read-only; ask the user to change it",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn fs_err(path: &str) -> impl FnOnce(virtual_fs::FsError) -> Error + '_ {
     move |e| Error::fs(path, e)
 }

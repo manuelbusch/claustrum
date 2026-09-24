@@ -198,7 +198,7 @@ impl ClaustrumServer {
 
     #[tool(
         name = "Write",
-        description = "Create or overwrite a file in the sandbox with the given contents. Parent directories are created as needed. Prefer Edit for changes to existing files.",
+        description = "Create or overwrite a file in the sandbox with the given contents. Parent directories are created as needed. Prefer Edit for changes to existing files. The Claustrum configuration (claustrum.toml) is read-only.",
         annotations(
             title = "Write file",
             read_only_hint = false,
@@ -300,7 +300,10 @@ impl ServerHandler for ClaustrumServer {
              read/write at {WORKSPACE}, which is also the working directory; changes there are \
              visible on the host. Nothing outside {WORKSPACE}, /tmp and /home/claude is \
              accessible, and there is no network access. Use Read/Write/Edit/Glob/Grep for file \
-             work and Bash for everything else. Available commands in Bash: {}.",
+             work and Bash for everything else. The Claustrum configuration \
+             ({WORKSPACE}/claustrum.toml) is read-only: it can be read, but every attempt to \
+             change, replace or delete it is refused; ask the user to change it instead. \
+             Available commands in Bash: {}.",
             commands.join(", ")
         );
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())

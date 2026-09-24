@@ -29,6 +29,7 @@ pub async fn edit(
         ));
     }
     let loc = locate(fs, path, cwd)?;
+    super::ensure_writable(&loc)?;
     let bytes = super::read_file(&*loc.fs, &loc.inner)
         .await
         .map_err(fs_err(&loc.guest))?;

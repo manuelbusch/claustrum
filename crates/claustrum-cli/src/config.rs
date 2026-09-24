@@ -196,6 +196,18 @@ impl Config {
             .collect()
     }
 
+    /// Every file Claustrum may read its configuration from. The guest must
+    /// not be able to change or create any of them, or it could loosen its own
+    /// sandbox for the next run: the file in the workspace (where `claustrum
+    /// run` is usually started), the default search paths and the file that
+    /// was actually loaded.
+    pub fn protected_paths(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![workspace.join("claustrum.toml")];
+        paths.extend(default_config_paths());
+        paths.extend(self.path.clone());
+        paths
+    }
+
     pub fn workspace(&self, override_dir: Option<&Path>) -> Result<PathBuf> {
         let dir = override_dir
             .map(Path::to_path_buf)
@@ -268,6 +280,9 @@ impl Config {
         }
         for m in &self.file.mounts {
             builder = builder.mount(&m.guest, expand_home(&m.host));
+        }
+        for p in self.protected_paths(&workspace) {
+            builder = builder.protect(p);
         }
         Ok(builder.build().await?)
     }

@@ -6,7 +6,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use claustrum_sandbox::{
-    ExecOptions, ExitReason, Policy, Sandbox,
+    ExecOptions, ExitReason, Policy, Sandbox, SandboxBuilder,
     native::{GrepMode, GrepOptions, ReadOptions},
 };
 
@@ -15,6 +15,13 @@ fn packages_dir() -> PathBuf {
 }
 
 async fn sandbox(workspace: &std::path::Path) -> Option<Sandbox> {
+    sandbox_with(workspace, |b| b).await
+}
+
+async fn sandbox_with(
+    workspace: &std::path::Path,
+    customize: impl FnOnce(SandboxBuilder) -> SandboxBuilder,
+) -> Option<Sandbox> {
     let dir = packages_dir();
     if !dir.join("bash.webc").exists() || !dir.join("coreutils.webc").exists() {
         eprintln!("skipping: bundled packages not found in {}", dir.display());
@@ -38,7 +45,7 @@ async fn sandbox(workspace: &std::path::Path) -> Option<Sandbox> {
             builder = builder.package_named(dir.join(file), id);
         }
     }
-    Some(builder.build().await.expect("sandbox builds"))
+    Some(customize(builder).build().await.expect("sandbox builds"))
 }
 
 fn has_command(sb: &Sandbox, name: &str) -> bool {
@@ -360,4 +367,140 @@ async fn native_tools_reject_paths_outside_mounts() {
             .is_err()
     );
     assert!(sb.write("/bin/evil", "x").await.is_err());
+}
+
+/// Runs each attempt in bash and prints `ALLOWED: <cmd>` for every one that
+/// succeeded.
+const ATTEMPTS_PRELUDE: &str =
+    "attempt() { if eval \"$1\" 2>/dev/null; then echo \"ALLOWED: $1\"; fi; }\n";
+
+async fn allowed_attempts(sb: &Sandbox, attempts: &[&str]) -> String {
+    let mut script = String::from(ATTEMPTS_PRELUDE);
+    for a in attempts {
+        script.push_str(&format!("attempt '{a}'\n"));
+    }
+    let out = sb.bash(&script, ExecOptions::default()).await.unwrap();
+    out.stdout_lossy()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_file_is_read_only() {
+    let ws = tempfile::tempdir().unwrap();
+    let config = ws.path().join("claustrum.toml");
+    std::fs::write(&config, "# marker\n").unwrap();
+    std::fs::write(ws.path().join("notes.txt"), "notes\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("claustrum.toml", ws.path().join("hostlink")).unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.protect(ws.path().join("claustrum.toml"))
+            .mount("/alt", ws.path())
+    })
+    .await
+    else {
+        return;
+    };
+
+    // Reading works everywhere.
+    let out = sb
+        .bash(
+            "cat claustrum.toml && cat /alt/claustrum.toml",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(out.stdout_lossy(), "# marker\n# marker\n");
+    let read = sb
+        .read("/workspace/claustrum.toml", ReadOptions::default())
+        .await
+        .unwrap();
+    assert!(read.content.contains("marker"));
+
+    let allowed = allowed_attempts(
+        &sb,
+        &[
+            "echo x > claustrum.toml",
+            "echo x >> claustrum.toml",
+            "cp notes.txt claustrum.toml",
+            "cat notes.txt > ./sub/../claustrum.toml",
+            "truncate -s 0 claustrum.toml",
+            "rm -f claustrum.toml",
+            "mv claustrum.toml moved.toml",
+            "mv notes.txt claustrum.toml",
+            // WASIX keeps a guest-only alias for hard links on host mounts;
+            // writing through it still hits the protected file.
+            "ln claustrum.toml hard.toml && echo x > hard.toml",
+            "ln -s claustrum.toml link.toml && echo x > link.toml",
+            "echo x > hostlink",
+            "echo x > /alt/claustrum.toml",
+            "mv /alt/notes.txt /alt/claustrum.toml",
+        ],
+    )
+    .await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "# marker\n");
+    // `mv` falls back to copy + unlink when the rename is refused; the copy is
+    // just a read of the protected file, the original stays in place.
+    if let Ok(copy) = std::fs::read_to_string(ws.path().join("moved.toml")) {
+        assert_eq!(copy, "# marker\n");
+    }
+    assert!(!ws.path().join("hard.toml").exists());
+
+    // Native tools refuse with a clear message.
+    let err = sb
+        .write("/workspace/claustrum.toml", "network = \"host\"\n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+    let err = sb
+        .edit("claustrum.toml", "marker", "changed", false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "# marker\n");
+
+    // Ordinary files are unaffected.
+    let out = sb
+        .bash(
+            "echo more >> notes.txt && mkdir -p d && mv notes.txt d/",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("d/notes.txt")).unwrap(),
+        "notes\nmore\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_config_file_cannot_be_created() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("notes.txt"), "network = \"host\"\n").unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.protect(ws.path().join("claustrum.toml"))).await
+    else {
+        return;
+    };
+    let mut attempts = vec![
+        "echo x > claustrum.toml",
+        "mkdir claustrum.toml",
+        "cp notes.txt claustrum.toml",
+        "mv notes.txt claustrum.toml",
+    ];
+    if cfg!(target_os = "macos") {
+        attempts.push("cp notes.txt CLAUSTRUM.TOML");
+    }
+    let allowed = allowed_attempts(&sb, &attempts).await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+    let err = sb
+        .write("claustrum.toml", "network = \"host\"\n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+    let names: Vec<_> = std::fs::read_dir(ws.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["notes.txt"]);
 }

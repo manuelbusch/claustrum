@@ -15,6 +15,7 @@ pub struct WriteOutput {
 
 pub async fn write(fs: &GuestFs, path: &str, cwd: &str, content: &str) -> Result<WriteOutput> {
     let loc = locate(fs, path, cwd)?;
+    super::ensure_writable(&loc)?;
     let existed = match loc.fs.metadata(&loc.inner) {
         Ok(meta) if meta.is_dir() => {
             return Err(Error::invalid_path(&loc.guest, "is a directory"));

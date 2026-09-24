@@ -128,7 +128,9 @@ fn system_prompt(extra: Option<&str>) -> String {
          (bash, coreutils, python, jq and whatever else is installed; the MCP server \
          instructions list them); there is no git, no network, no host \
          toolchain and no access to files outside the sandbox. If a needed command is missing, \
-         say so instead of trying workarounds on the host."
+         say so instead of trying workarounds on the host. The sandbox configuration \
+         ({WORKSPACE}/claustrum.toml) is read-only for you: you can read it but not change, \
+         replace or delete it; if a setting there needs to change, ask the user."
     );
     if let Some(extra) = extra {
         s.push_str("\n\n");

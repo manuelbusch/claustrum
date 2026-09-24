@@ -14,6 +14,7 @@ pub mod native;
 mod packages;
 mod policy;
 mod process;
+mod protect;
 mod runtime;
 mod sandbox;
 
