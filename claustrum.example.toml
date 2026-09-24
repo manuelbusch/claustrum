@@ -8,9 +8,8 @@
 # Host directory mounted read/write at /workspace. Defaults to the current directory.
 # workspace = "."
 
-# Network access for guest processes: "disabled" (default), "host", or a
-# list of Wasmer ruleset entries such as ["dns:allow=*.crates.io:443"].
-network = "disabled"
+# Network access is configured in [network] below. `network = "disabled"`
+# or `network = "host"` here is accepted as a shorthand for its mode.
 
 # Default per-command timeout in seconds (0 = unlimited).
 timeout_secs = 120
@@ -21,6 +20,32 @@ max_output_bytes = 1048576
 # Extra environment variables for guest commands.
 [sandbox.env]
 # RUST_LOG = "info"
+
+# Network access for the guest and for host actions. Every connection passes
+# one gate; refusals are logged and reported in the tool result.
+[network]
+# "disabled" (default): nothing is reachable.
+# "allowlist": only the destinations below.
+# "audit": everything is reachable, and what the allowlist would refuse is
+#          logged; run `claustrum network report` afterwards to build it.
+# "host": unrestricted.
+mode = "disabled"
+
+# Destinations as host[:ports]. Port defaults to 443; ports may be "80,443",
+# "8000-8100" or "*". "*.example.com" matches subdomains only. Loopback and
+# private addresses are only reachable through an explicit IP or CIDR entry,
+# even if an allowed name resolves to them.
+# allow = [
+#   "crates.io",
+#   "*.crates.io",
+#   "github.com:443",
+#   "pypi.org:80,443",
+#   "127.0.0.1:5432",
+# ]
+
+# Every decision is appended here as JSON lines. Defaults to a per-workspace
+# file in the user state directory.
+# log = "~/.local/state/claustrum/network.jsonl"
 
 [packages]
 # Directory holding the .webc files. Defaults to the user data directory.

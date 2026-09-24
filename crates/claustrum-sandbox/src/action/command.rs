@@ -4,7 +4,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use super::{
@@ -12,7 +12,10 @@ use super::{
     run::{ActionOutcome, execute},
     spec::ActionSpec,
 };
-use crate::hostcmd::{Cancel, HostCommand, HostOutput, Invocation};
+use crate::{
+    hostcmd::{Cancel, HostCommand, HostOutput, Invocation},
+    net::ProxyHandle,
+};
 
 /// Exit code of a refused invocation (bad inputs, unknown action).
 const REFUSED: i32 = 2;
@@ -23,6 +26,8 @@ pub(crate) struct ActionSet {
     specs: Vec<ActionSpec>,
     workspace: PathBuf,
     protected: Vec<PathBuf>,
+    /// Network proxy the actions are pointed at; `None` in host mode.
+    proxy: Option<Arc<ProxyHandle>>,
     /// One action at a time per sandbox.
     running: Mutex<()>,
 }
@@ -33,12 +38,14 @@ impl ActionSet {
         specs: Vec<ActionSpec>,
         workspace: PathBuf,
         protected: Vec<PathBuf>,
+        proxy: Option<Arc<ProxyHandle>>,
     ) -> Self {
         Self {
             command,
             specs,
             workspace,
             protected,
+            proxy,
             running: Mutex::new(()),
         }
     }
@@ -110,7 +117,12 @@ impl ActionSet {
         if cancel.is_cancelled() {
             return Err(Refusal(format!("action `{name}`: cancelled before it started")));
         }
-        let outcome = execute(spec, &bound, &self.protected, cancel)
+        let proxy_env = self
+            .proxy
+            .as_ref()
+            .map(|p| proxy_env(&p.url_for(name)))
+            .unwrap_or_default();
+        let outcome = execute(spec, &bound, &self.protected, &proxy_env, cancel)
             .map_err(|e| Refusal(format!("action `{name}`: {e}")))?;
         tracing::info!(
             action = name,
@@ -121,6 +133,35 @@ impl ActionSet {
         );
         Ok(outcome)
     }
+}
+
+/// Environment variables that point common tools at the proxy.
+pub(crate) const PROXY_VARS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "CARGO_HTTP_PROXY",
+    "npm_config_proxy",
+    "npm_config_https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+fn proxy_env(url: &str) -> BTreeMap<String, String> {
+    PROXY_VARS
+        .iter()
+        .map(|k| {
+            let v = if k.eq_ignore_ascii_case("no_proxy") {
+                String::new()
+            } else {
+                url.to_owned()
+            };
+            ((*k).to_owned(), v)
+        })
+        .collect()
 }
 
 impl HostCommand for ActionSet {

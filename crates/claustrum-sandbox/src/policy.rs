@@ -1,18 +1,39 @@
 //! Sandbox policy: what the guest may reach and how much it may consume.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-/// Network access granted to guest processes.
+use crate::net::{AllowEntry, NetMode};
+
+/// Network access for guest processes and host actions. See [`crate::net`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum NetworkPolicy {
-    /// All socket operations fail. This is the default.
-    #[default]
-    Disabled,
-    /// Unrestricted access to the host network.
-    Host,
-    /// Host network filtered by a Wasmer ruleset, e.g.
-    /// `dns:allow=*.example.com:443`. See `virtual_net::ruleset`.
-    Ruleset(Vec<String>),
+pub struct NetworkPolicy {
+    pub mode: NetMode,
+    /// Destinations reachable in `allowlist` mode; the reference for `audit`.
+    pub allow: Vec<AllowEntry>,
+    /// Append every decision to this JSONL file as well.
+    pub log: Option<PathBuf>,
+}
+
+impl NetworkPolicy {
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn host() -> Self {
+        Self {
+            mode: NetMode::Host,
+            ..Self::default()
+        }
+    }
+
+    /// Allowlist mode with entries such as `crates.io:443`.
+    pub fn allowlist<S: AsRef<str>>(allow: &[S]) -> Result<Self, String> {
+        Ok(Self {
+            mode: NetMode::Allowlist,
+            allow: crate::net::NetPolicy::parse_entries(allow)?,
+            log: None,
+        })
+    }
 }
 
 /// Resource limits and capabilities for guest processes.
@@ -30,7 +51,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            network: NetworkPolicy::Disabled,
+            network: NetworkPolicy::disabled(),
             max_output_bytes: 1024 * 1024,
             default_timeout: Some(Duration::from_secs(120)),
             max_threads: Some(64),

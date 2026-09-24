@@ -43,6 +43,7 @@ pub(crate) fn execute(
     spec: &ActionSpec,
     bound: &Bound,
     protected: &[PathBuf],
+    proxy_env: &BTreeMap<String, String>,
     cancel: &Cancel,
 ) -> Result<ActionOutcome, String> {
     let started = Instant::now();
@@ -60,6 +61,8 @@ pub(crate) fn execute(
                 .filter_map(|k| std::env::var_os(k).map(|v| (k.clone(), v))),
         )
         .envs(&bound.env)
+        // Last, so that nothing in the definition can point around the proxy.
+        .envs(proxy_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -270,7 +273,7 @@ mod tests {
 
     fn run(spec: &ActionSpec, ws: &Path, protected: &[PathBuf]) -> ActionOutcome {
         let bound = bind(spec, &[], &BTreeMap::new(), crate::WORKSPACE, ws).unwrap();
-        execute(spec, &bound, protected, &Cancel::new()).unwrap()
+        execute(spec, &bound, protected, &BTreeMap::new(), &Cancel::new()).unwrap()
     }
 
     #[test]
@@ -354,7 +357,7 @@ mod tests {
             flag.cancel();
         });
         let started = Instant::now();
-        let out = execute(&s, &bound, &[], &cancel).unwrap();
+        let out = execute(&s, &bound, &[], &BTreeMap::new(), &cancel).unwrap();
         assert!(out.killed);
         assert!(started.elapsed() < Duration::from_secs(5));
     }

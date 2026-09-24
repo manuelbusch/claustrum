@@ -49,6 +49,9 @@ pub struct ExecOutput {
     pub stderr: Vec<u8>,
     pub stderr_truncated: bool,
     pub duration: Duration,
+    /// Network connections refused (or flagged in audit mode) while the
+    /// command ran, one line each. See [`crate::net::ConnectionLog`].
+    pub network_notes: Vec<String>,
 }
 
 impl ExecOutput {
@@ -213,6 +216,7 @@ pub(crate) async fn run(spawn: Spawn<'_>) -> Result<ExecOutput> {
         stderr,
         stderr_truncated,
         duration: started.elapsed(),
+        network_notes: Vec::new(),
     })
 }
 

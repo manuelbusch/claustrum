@@ -13,6 +13,7 @@ mod error;
 pub mod fs;
 pub mod hostcmd;
 pub mod native;
+pub mod net;
 mod packages;
 mod policy;
 mod process;

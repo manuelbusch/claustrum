@@ -35,6 +35,9 @@ pub fn exec(out: &ExecOutput) -> String {
         }
         ExitReason::Exited => {}
     }
+    for note in &out.network_notes {
+        s.push_str(&format!("[network: {note}]\n"));
+    }
     if s.is_empty() {
         s.push_str("(no output)\n");
     }

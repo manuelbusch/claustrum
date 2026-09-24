@@ -27,7 +27,8 @@ claude (host)                          claustrum (host process, Rust)
                                         │  │  /workspace  ← host dir (rw)       │  │
                                         │  │  /bin, /usr/bin ← .webc packages   │  │
                                         │  │  /tmp, /home/claude ← in-memory    │  │
-                                        │  │  network: disabled by default      │  │
+                                        │  │  network: allowlist gate, off by   │  │
+                                        │  │  default                           │  │
                                         │  └────────────────────────────────────┘  │
                                         └──────────────────────────────────────────┘
 ```
@@ -36,7 +37,8 @@ claude (host)                          claustrum (host process, Rust)
    command. WASIX extends WASI with the POSIX features real tools need (threads, pipes,
    fork/exec), so `bash` and `coreutils` compiled to WebAssembly run unmodified. The guest sees
    an in-memory root with the project directory mounted read/write at `/workspace`. Everything
-   else on the host is invisible, and networking is off unless enabled in the configuration.
+   else on the host is invisible, and networking is off unless the configuration allows
+   specific destinations (see [Network](#network)).
 2. **Tools.** The MCP server offers `Bash`, `Read`, `Write`, `Edit`, `Glob` and `Grep`, named
    and shaped like Claude Code's built-in tools so the model needs no adaptation. `Bash` runs a
    guest process; the file tools are implemented natively in Rust on top of the same virtual
@@ -90,6 +92,7 @@ Use `claustrum run --dry-run` to print the exact `claude` command line.
 | `claustrum pkg add-wasm <name> <file.wasm> [--alias cmd]` | Register a self-built WASIX binary as a package. |
 | `claustrum pkg list` / `pkg commands` | Show installed packages and the commands they provide. |
 | `claustrum pkg precompile` | Compile all packages into the module cache ahead of time. |
+| `claustrum network report [--workspace DIR] [--all]` | Summarise refused and audit-flagged connections and suggest `allow` entries. |
 
 Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (or
 `CLAUSTRUM_PACKAGES_DIR`). Logging goes to stderr and is controlled by `CLAUSTRUM_LOG`
@@ -99,7 +102,7 @@ Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (o
 
 Claustrum looks for `claustrum.toml` in the current directory, then for `config.toml` in the
 user configuration directory. See [`claustrum.example.toml`](claustrum.example.toml) for all
-options: workspace, network policy, timeouts, packages, extra mounts, and which built-in
+options: workspace, network access, timeouts, packages, extra mounts, and which built-in
 Claude tools (if any) to keep.
 
 Inside the sandbox every configuration file Claustrum could load is read-only:
@@ -109,6 +112,64 @@ can read them, but writing, truncating, creating, deleting, renaming or replacin
 refused, as is renaming or removing a directory that contains one. The check runs on the
 host below every tool, resolves symlinks and hard links, and compares names
 case-insensitively on macOS. Change the configuration from outside the sandbox.
+
+### Network
+
+Every connection Claustrum starts, from the guest and from [host actions](#host-actions),
+passes one gate that allows only declared destinations:
+
+```toml
+[network]
+mode = "allowlist"      # disabled (default) | allowlist | audit | host
+allow = [
+  "crates.io",          # port defaults to 443
+  "*.crates.io",        # subdomains only, not crates.io itself
+  "github.com:443",
+  "pypi.org:80,443",
+  "127.0.0.1:5432",     # local and private addresses need an explicit IP entry
+]
+```
+
+How the gate decides:
+
+- **Names are checked when they are resolved.** Only allowed names resolve, and the
+  addresses they resolve to may then be used on the ports of the matching entry. A literal
+  IP that was never resolved from an allowed name is refused, so allowing `github.com`
+  does not open arbitrary addresses.
+- **Local and private addresses need an explicit entry.** Loopback, RFC 1918, link-local
+  (including the cloud metadata address `169.254.169.254`), CGNAT and IPv6 ULA are refused
+  even when an allowed name resolves to them, which defeats DNS rebinding and keeps the
+  guest away from services on your machine.
+- **Only outgoing TCP is supported.** UDP, listening sockets and TCP sockets bound before
+  connecting are refused, because their later destinations would not pass the gate. DNS
+  resolution happens on the host and needs no UDP in the guest.
+- **Guest traffic cannot bypass the gate.** The guest has no sockets of its own; every
+  socket call goes through the WASIX runtime, which Claustrum wraps.
+- **Host actions go through a local proxy.** Actions are started with `HTTP_PROXY`,
+  `HTTPS_PROXY` and the variants cargo and npm read, pointing at a proxy on `127.0.0.1`
+  that applies the same allowlist and checks the host name of every `CONNECT`. It requires
+  a per-session credential, so other local processes cannot use it. This is cooperative:
+  git over SSH, raw sockets and programs that ignore proxy variables are not covered until
+  actions are confined (see the caveats under Host actions).
+
+Refused connections are logged and appended to the tool result as
+`[network: refused tcp example.com:443 (example.com is not in the allowlist)]`, so Claude
+can ask for the destination instead of trying workarounds. `claustrum run` and `serve`
+print the active mode on start.
+
+To build an allowlist, run a session with `mode = "audit"`: everything is reachable, and
+everything the allowlist would refuse is logged. `claustrum network report` then groups
+the log by destination and prints ready-to-paste `allow` entries; review them before
+adding, the report cannot tell a needed download from an unwanted one. The log is JSON
+lines in the user state directory, one file per workspace, or wherever `[network] log`
+points.
+
+Known limit: the guest gate decides on address and port, not on the TLS server name. Two
+names served from the same CDN address share their grant. The action proxy sees the host
+name of each `CONNECT` and checks it.
+
+`[sandbox] network = "disabled"` or `"host"` still works as a shorthand for the mode; the
+former Wasmer ruleset strings are no longer accepted.
 
 ### Packages
 
@@ -204,6 +265,8 @@ privileges and without confinement, so these ways around the sandbox remain:
 - **Path inputs are checked before the program opens them.** Claude Code can run tools in
   parallel, so a file could in principle be replaced by a symlink between the check and
   the open. Do not rely on `path` inputs to keep a program away from host files.
+- **Network access is only cooperative.** Actions are pointed at the network proxy, but a
+  program that ignores `HTTP(S)_PROXY`, or git over SSH, reaches the network directly.
 - **Side effects leave the sandbox.** `git push`, `deploy` or `npm publish` ship whatever
   the workspace contains. Only the Claustrum configuration files are restored afterwards,
   not anything else an action may write on the host.
@@ -245,7 +308,8 @@ and redirections in bash behave as usual.
 ```
 crates/
   claustrum-sandbox/   runtime, mounts, packages, process execution, native tools,
-                       host commands (hostcmd.rs) and host actions (action/)
+                       host commands (hostcmd.rs), host actions (action/) and the
+                       network gate and action proxy (net/)
 shim/                  guest-side WASI shim for host commands (wasm32-wasip1)
   claustrum-mcp/       MCP server (rmcp) exposing the tools
   claustrum-cli/       `claustrum` binary: run, serve, pkg, configuration
@@ -266,7 +330,8 @@ The integration tests skip themselves when the packages are missing.
 - git inside the sandbox (blocked on a WASIX build, see Packages); sed/awk/grep as WASIX builds.
 - Expose the native tools inside the guest as well (so `grep` in a Bash call hits the fast
   path), via Wasmer's builtin-command mechanism.
-- Network allowlists per project.
+- Enforce the network proxy for host actions through confinement; UDP to explicit
+  addresses; TLS server name checks in the guest gate.
 - Confinement of host actions (`confine = "seatbelt"` on macOS, bwrap/Landlock on Linux).
 - Brush (a bash-compatible shell written in Rust) compiled to WASIX as an alternative shell.
 - `.gitignore`-aware Glob/Grep, persistent working directory across `cd` in Bash calls,

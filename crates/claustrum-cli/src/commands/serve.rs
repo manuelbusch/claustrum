@@ -20,6 +20,10 @@ pub async fn run(config: Config, args: Args) -> Result<()> {
         commands = sandbox.commands().len(),
         "sandbox ready"
     );
+    eprintln!(
+        "claustrum: {}",
+        Config::network_notice(&sandbox.policy().network)
+    );
     if let Some(notice) = Config::actions_notice(sandbox.actions()) {
         eprintln!("claustrum: {notice}");
     }

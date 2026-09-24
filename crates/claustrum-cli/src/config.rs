@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use claustrum_sandbox::{
     ActionDef, NetworkPolicy, Policy, RuntimeConfig, Sandbox, SandboxBuilder,
     action::{self, CompileContext},
+    net::{NetMode, NetPolicy},
 };
 use serde::Deserialize;
 
@@ -33,6 +34,23 @@ pub struct FileConfig {
     pub claude: ClaudeSection,
     #[serde(default)]
     pub actions: ActionsSection,
+    #[serde(default)]
+    pub network: NetworkSection,
+}
+
+/// Network access for the guest and for host actions; see
+/// `claustrum_sandbox::net`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSection {
+    /// `"disabled"` (default), `"allowlist"`, `"audit"` or `"host"`.
+    pub mode: Option<String>,
+    /// Destinations such as `crates.io`, `*.github.com:443`, `10.0.0.5:5432`.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// JSONL file for every decision. Defaults to a per-workspace file in
+    /// the user state directory.
+    pub log: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -40,7 +58,7 @@ pub struct FileConfig {
 pub struct SandboxSection {
     /// Host directory mounted at /workspace. Defaults to the current directory.
     pub workspace: Option<PathBuf>,
-    /// `"disabled"` (default), `"host"`, or a list of ruleset entries.
+    /// Shorthand for `[network].mode`: `"disabled"` or `"host"`.
     pub network: Option<Network>,
     /// Default command timeout in seconds. 0 disables the timeout.
     pub timeout_secs: Option<u64>,
@@ -56,7 +74,8 @@ pub struct SandboxSection {
 #[serde(untagged)]
 pub enum Network {
     Mode(String),
-    Rules(Vec<String>),
+    /// Old Wasmer ruleset strings; only recognised to explain the migration.
+    Rules(#[allow(dead_code)] Vec<String>),
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -236,7 +255,7 @@ impl Config {
     /// the sandbox, so that `claustrum run` fails before `claude` starts.
     /// Warnings about risky definitions are logged by `compile_all`.
     pub fn validate_actions(&self, workspace: &Path) -> Result<Vec<claustrum_sandbox::ActionSpec>> {
-        let policy = self.policy()?;
+        let policy = self.policy(workspace)?;
         action::compile_all(
             &self.file.actions.list,
             &CompileContext {
@@ -274,17 +293,104 @@ impl Config {
             .with_context(|| format!("workspace {} does not exist", dir.display()))
     }
 
-    pub fn policy(&self) -> Result<Policy> {
-        let s = &self.file.sandbox;
-        let mut policy = Policy::default();
-        if let Some(network) = &s.network {
-            policy.network = match network {
-                Network::Mode(m) if m == "disabled" || m == "none" => NetworkPolicy::Disabled,
-                Network::Mode(m) if m == "host" => NetworkPolicy::Host,
-                Network::Mode(m) => anyhow::bail!("unknown network mode `{m}`"),
-                Network::Rules(rules) => NetworkPolicy::Ruleset(rules.clone()),
-            };
+    /// The network mode from `[network].mode` or the `[sandbox].network`
+    /// shorthand.
+    pub fn network_mode(&self) -> Result<NetMode> {
+        let section = &self.file.network;
+        match (&self.file.sandbox.network, &section.mode) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "set the network mode either in [network] mode or in [sandbox] network, not both"
+            ),
+            (Some(Network::Rules(_)), None) => anyhow::bail!(
+                "[sandbox] network no longer takes Wasmer ruleset strings; use [network] \
+                 mode = \"allowlist\" with allow = [\"host:port\", ...] instead"
+            ),
+            (Some(Network::Mode(m)), None) => match m.as_str() {
+                "disabled" | "none" => Ok(NetMode::Disabled),
+                "host" => Ok(NetMode::Host),
+                other => anyhow::bail!(
+                    "[sandbox] network = \"{other}\" is not supported; use \"disabled\", \"host\" \
+                     or the [network] section"
+                ),
+            },
+            (None, Some(m)) => m.parse().map_err(anyhow::Error::msg),
+            (None, None) => Ok(NetMode::Disabled),
         }
+    }
+
+    /// Where the network decisions for `workspace` are logged.
+    pub fn network_log_path(&self, workspace: &Path) -> PathBuf {
+        if let Some(p) = &self.file.network.log {
+            let p = expand_home(p);
+            return if p.is_relative() { workspace.join(p) } else { p };
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        workspace.hash(&mut h);
+        let name = workspace
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "root".into());
+        let base = project_dirs()
+            .map(|d| {
+                d.state_dir()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| d.data_dir().to_path_buf())
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("network")
+            .join(format!("{name}-{:016x}.jsonl", h.finish()))
+    }
+
+    pub fn network_policy(&self, workspace: &Path) -> Result<NetworkPolicy> {
+        let mode = self.network_mode()?;
+        let allow = NetPolicy::parse_entries(&self.file.network.allow)
+            .map_err(|e| anyhow::anyhow!("[network] allow: {e}"))?;
+        if !allow.is_empty() && matches!(mode, NetMode::Disabled | NetMode::Host) {
+            tracing::warn!(
+                mode = mode.as_str(),
+                "[network] allow has no effect in this mode; use \"allowlist\" or \"audit\""
+            );
+        }
+        Ok(NetworkPolicy {
+            mode,
+            allow,
+            log: Some(self.network_log_path(workspace)),
+        })
+    }
+
+    /// One line for stderr describing network access.
+    pub fn network_notice(policy: &NetworkPolicy) -> String {
+        let entries: Vec<String> = policy.allow.iter().map(ToString::to_string).collect();
+        let log = policy
+            .log
+            .as_ref()
+            .map(|p| format!("; log: {}", p.display()))
+            .unwrap_or_default();
+        match policy.mode {
+            NetMode::Disabled => format!("network: disabled{log}"),
+            NetMode::Host => format!("network: unrestricted (host mode){log}"),
+            NetMode::Allowlist if entries.is_empty() => {
+                format!("network: allowlist with no entries, nothing is reachable{log}")
+            }
+            NetMode::Allowlist => format!("network: allowlist {}{log}", entries.join(", ")),
+            NetMode::Audit => format!(
+                "network: audit (everything allowed and logged; reference allowlist: {}){log}",
+                if entries.is_empty() {
+                    "empty".to_owned()
+                } else {
+                    entries.join(", ")
+                }
+            ),
+        }
+    }
+
+    pub fn policy(&self, workspace: &Path) -> Result<Policy> {
+        let s = &self.file.sandbox;
+        let mut policy = Policy {
+            network: self.network_policy(workspace)?,
+            ..Policy::default()
+        };
         if let Some(secs) = s.timeout_secs {
             policy.default_timeout = (secs > 0).then(|| Duration::from_secs(secs));
         }
@@ -302,7 +408,7 @@ impl Config {
         let workspace = self.workspace(workspace)?;
         let mut builder: SandboxBuilder = Sandbox::builder()
             .workspace(&workspace)
-            .policy(self.policy()?)
+            .policy(self.policy(&workspace)?)
             .runtime_config(RuntimeConfig {
                 online: self.file.packages.online,
                 ..RuntimeConfig::default()
@@ -398,6 +504,61 @@ pattern = "[a-z]+"
         let err = toml::from_str::<FileConfig>("[[actions.action]]\nname = \"x\"\nshell = true\n")
             .unwrap_err();
         assert!(err.to_string().contains("shell"), "{err}");
+    }
+
+    fn config(text: &str) -> Config {
+        Config {
+            file: toml::from_str(text).unwrap(),
+            path: None,
+            packages_dir: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn network_modes_and_aliases() {
+        let ws = Path::new("/tmp/ws");
+        let p = config("").network_policy(ws).unwrap();
+        assert_eq!(p.mode, NetMode::Disabled);
+        assert!(p.log.unwrap().to_string_lossy().contains("ws-"));
+
+        assert_eq!(
+            config("[sandbox]\nnetwork = \"host\"\n").network_mode().unwrap(),
+            NetMode::Host
+        );
+        assert_eq!(
+            config("[sandbox]\nnetwork = \"disabled\"\n").network_mode().unwrap(),
+            NetMode::Disabled
+        );
+        let p = config(
+            "[network]\nmode = \"allowlist\"\nallow = [\"crates.io\", \"10.0.0.5:5432\"]\nlog = \"net.jsonl\"\n",
+        )
+        .network_policy(ws)
+        .unwrap();
+        assert_eq!(p.mode, NetMode::Allowlist);
+        assert_eq!(p.allow.len(), 2);
+        assert_eq!(p.log.as_deref(), Some(Path::new("/tmp/ws/net.jsonl")));
+        assert!(Config::network_notice(&p).contains("crates.io:443, 10.0.0.5:5432"));
+
+        for (text, expected) in [
+            (
+                "[sandbox]\nnetwork = \"host\"\n[network]\nmode = \"audit\"\n",
+                "not both",
+            ),
+            (
+                "[sandbox]\nnetwork = [\"dns:allow=*.crates.io:443\"]\n",
+                "no longer takes Wasmer ruleset",
+            ),
+            ("[sandbox]\nnetwork = \"allowlist\"\n", "not supported"),
+            ("[network]\nmode = \"open\"\n", "unknown network mode"),
+            (
+                "[network]\nmode = \"allowlist\"\nallow = [\"bad host\"]\n",
+                "invalid network entry",
+            ),
+        ] {
+            let err = config(text).network_policy(ws).unwrap_err();
+            assert!(err.to_string().contains(expected), "{text}: {err}");
+        }
+        assert!(toml::from_str::<FileConfig>("[network]\nallowed = []\n").is_err());
     }
 
     #[test]

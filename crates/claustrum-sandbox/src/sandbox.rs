@@ -8,9 +8,11 @@ use std::{
 
 use wasmer_wasix::{Runtime, runtime::OverriddenRuntime, virtual_net::DynVirtualNetworking};
 
+use crate::net::{self as netgate, ConnectionLog, FilteredNetworking, NetMode, NetPolicy, ProxyHandle};
+
 use crate::{
-    BundledPackage, Error, ExecOptions, ExecOutput, ExitReason, HostCommand, NetworkPolicy,
-    PackageSet, Policy, Result, RuntimeConfig, WORKSPACE,
+    BundledPackage, Error, ExecOptions, ExecOutput, ExitReason, HostCommand, PackageSet, Policy,
+    Result, RuntimeConfig, WORKSPACE,
     action::{self, ActionDef, ActionSet, ActionSpec, CompileContext},
     fs::{self, GuestFs, Mount},
     hostcmd, native, process,
@@ -182,6 +184,18 @@ impl SandboxBuilder {
                 self.runtime.bundled_packages.push(p.clone());
             }
         }
+        // The network log is read-only for the guest as well, so it cannot
+        // rewrite its own record. It is not restored after host actions like
+        // the configuration, since the action proxy appends to it.
+        let mut fs_protected = protected.clone();
+        if let Some(log) = &self.policy.network.log {
+            let abs = cwd.join(log);
+            let resolved = crate::protect::resolve_host_path(&abs)
+                .map_err(|e| Error::Init(format!("cannot resolve {}: {e}", abs.display())))?;
+            if !fs_protected.contains(&resolved) {
+                fs_protected.push(resolved);
+            }
+        }
         let base_runtime = build_runtime(&self.runtime)?;
 
         let mut packages = PackageSet::default();
@@ -192,7 +206,17 @@ impl SandboxBuilder {
             packages.add_dir(dir, &*base_runtime).await?;
         }
 
+        let net_policy = Arc::new(NetPolicy::new(
+            self.policy.network.mode,
+            self.policy.network.allow.clone(),
+        ));
+        let net_log = Arc::new(match &self.policy.network.log {
+            Some(path) => ConnectionLog::with_file(path),
+            None => ConnectionLog::memory(),
+        });
+
         let mut actions = None;
+        let mut proxy = None;
         if !self.actions.is_empty() {
             let name = &self.action_command;
             if !action::is_action_name(name) {
@@ -214,11 +238,21 @@ impl SandboxBuilder {
                 },
             )
             .map_err(Error::Init)?;
+            // Actions reach the network through the proxy, which applies the
+            // same policy. In host mode they are left alone.
+            if self.policy.network.mode != NetMode::Host {
+                let handle =
+                    netgate::ActionProxy::start(Arc::clone(&net_policy), Arc::clone(&net_log))
+                        .await
+                        .map_err(|e| Error::Init(format!("cannot start the action proxy: {e}")))?;
+                proxy = Some(Arc::new(handle));
+            }
             let set = Arc::new(ActionSet::new(
                 name.clone(),
                 specs,
                 workspace_dir.clone(),
                 protected.clone(),
+                proxy.clone(),
             ));
             self.host_commands.push(Arc::clone(&set) as Arc<dyn HostCommand>);
             actions = Some(set);
@@ -240,7 +274,7 @@ impl SandboxBuilder {
         let mut mounts = vec![
             Mount {
                 guest: WORKSPACE.into(),
-                fs: fs::host_dir(handle.clone(), &workspace_dir, &protected)?,
+                fs: fs::host_dir(handle.clone(), &workspace_dir, &fs_protected)?,
             },
             Mount {
                 guest: "/tmp".into(),
@@ -261,11 +295,17 @@ impl SandboxBuilder {
             }
             mounts.push(Mount {
                 guest: guest.clone(),
-                fs: fs::host_dir(handle.clone(), host, &protected)?,
+                fs: fs::host_dir(handle.clone(), host, &fs_protected)?,
             });
         }
 
-        let networking = networking_for(&self.policy.network)?;
+        // Every mode goes through the gate so that refusals are logged and
+        // reported, including in disabled mode.
+        let networking: DynVirtualNetworking = Arc::new(FilteredNetworking::new(
+            Arc::new(virtual_net::host::LocalNetworking::default()),
+            Arc::clone(&net_policy),
+            Arc::clone(&net_log),
+        ));
         let runtime: Arc<dyn Runtime + Send + Sync> =
             Arc::new(OverriddenRuntime::new(base_runtime).with_networking(networking));
 
@@ -282,23 +322,12 @@ impl SandboxBuilder {
                 cwd: Mutex::new(WORKSPACE.to_owned()),
                 host_commands: self.host_commands,
                 actions,
+                net_policy,
+                net_log,
+                _proxy: proxy,
             }),
         })
     }
-}
-
-fn networking_for(policy: &NetworkPolicy) -> Result<DynVirtualNetworking> {
-    Ok(match policy {
-        NetworkPolicy::Disabled => Arc::new(virtual_net::UnsupportedVirtualNetworking::default()),
-        NetworkPolicy::Host => Arc::new(virtual_net::host::LocalNetworking::default()),
-        NetworkPolicy::Ruleset(rules) => {
-            let ruleset: virtual_net::ruleset::Ruleset = rules
-                .join(",")
-                .parse()
-                .map_err(|e| Error::Init(format!("invalid network ruleset: {e}")))?;
-            Arc::new(virtual_net::host::LocalNetworking::with_ruleset(ruleset))
-        }
-    })
 }
 
 /// A persistent sandbox. Cheap to clone; all clones share the same state.
@@ -319,6 +348,10 @@ struct Inner {
     cwd: Mutex<String>,
     host_commands: Vec<Arc<dyn HostCommand>>,
     actions: Option<Arc<ActionSet>>,
+    net_policy: Arc<NetPolicy>,
+    net_log: Arc<ConnectionLog>,
+    /// Keeps the action proxy running as long as the sandbox lives.
+    _proxy: Option<Arc<ProxyHandle>>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -360,6 +393,16 @@ impl Sandbox {
         self.inner.packages.command_names()
     }
 
+    /// The network gate shared by the guest and the host actions.
+    pub fn network(&self) -> &NetPolicy {
+        &self.inner.net_policy
+    }
+
+    /// Every network decision of this sandbox.
+    pub fn network_log(&self) -> &ConnectionLog {
+        &self.inner.net_log
+    }
+
     /// The declared host actions, empty when none are configured.
     pub fn actions(&self) -> &[ActionSpec] {
         self.inner.actions.as_ref().map_or(&[], |a| a.specs())
@@ -389,6 +432,7 @@ impl Sandbox {
             .ok_or_else(|| Error::Action("no host actions are configured".into()))?;
         let name = name.to_owned();
         let cwd = self.cwd();
+        let seq = self.inner.net_log.next_seq();
         let outcome = tokio::task::spawn_blocking(move || {
             set.run(&name, &[], &inputs, &cwd, &hostcmd::Cancel::new())
         })
@@ -407,6 +451,7 @@ impl Sandbox {
             stderr: outcome.stderr,
             stderr_truncated: outcome.stderr_truncated,
             duration: outcome.duration,
+            network_notes: self.inner.net_log.notes_since(seq),
         })
     }
 
@@ -467,7 +512,8 @@ impl Sandbox {
     pub async fn exec(&self, command: &str, options: ExecOptions) -> Result<ExecOutput> {
         let cwd = options.cwd.clone().unwrap_or_else(|| self.cwd());
         let cwd = fs::normalize_guest_path(&cwd, &self.cwd())?;
-        process::run(process::Spawn {
+        let seq = self.inner.net_log.next_seq();
+        let mut out = process::run(process::Spawn {
             runtime: &self.inner.runtime,
             packages: &self.inner.packages,
             mounts: &self.inner.mounts,
@@ -478,7 +524,9 @@ impl Sandbox {
             cwd,
             options,
         })
-        .await
+        .await?;
+        out.network_notes = self.inner.net_log.notes_since(seq);
+        Ok(out)
     }
 
     /// Run `bash -c <script>` in the sandbox.

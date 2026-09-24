@@ -32,6 +32,9 @@ enum Command {
     /// Manage the WASIX packages available inside the sandbox.
     #[command(subcommand)]
     Pkg(commands::pkg::Command),
+    /// Inspect network decisions and build the allowlist.
+    #[command(subcommand)]
+    Network(commands::network::Command),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -58,6 +61,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => commands::run::run(config, args),
         Command::Serve(args) => runtime()?.block_on(commands::serve::run(config, args)),
         Command::Pkg(cmd) => runtime()?.block_on(commands::pkg::run(config, cmd)),
+        Command::Network(cmd) => commands::network::run(config, cmd),
     }
 }
 

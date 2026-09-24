@@ -324,6 +324,16 @@ impl ActionDef {
             }
             env.insert(k.clone(), Template::parse(v).map_err(&err)?);
         }
+        for k in self.env.keys().chain(&self.env_passthrough) {
+            if super::command::PROXY_VARS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(k))
+            {
+                return Err(err(format!(
+                    "`{k}` is set by Claustrum to route the action through the network proxy"
+                )));
+            }
+        }
         for k in &self.env_passthrough {
             if !is_env_name(k) {
                 return Err(err(format!("invalid env_passthrough name `{k}`")));
@@ -949,6 +959,20 @@ mod tests {
                     ..def("x", &["/bin/echo", "{a}"])
                 },
                 "does not apply",
+            ),
+            (
+                ActionDef {
+                    env: [("https_proxy".to_owned(), "x".to_owned())].into(),
+                    ..def("x", &["/bin/echo"])
+                },
+                "network proxy",
+            ),
+            (
+                ActionDef {
+                    env_passthrough: vec!["HTTP_PROXY".into()],
+                    ..def("x", &["/bin/echo"])
+                },
+                "network proxy",
             ),
             (
                 ActionDef {

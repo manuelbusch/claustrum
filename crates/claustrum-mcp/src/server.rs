@@ -144,7 +144,7 @@ impl ClaustrumServer {
 
     #[tool(
         name = "Bash",
-        description = "Run a shell command inside the sandbox with `bash -c`. The project is mounted at /workspace (the working directory). Only the sandbox's own commands are available (bash, coreutils, python, jq, ...; see the server instructions for the full list); there is no git and no network. Output is captured and returned when the command finishes.",
+        description = "Run a shell command inside the sandbox with `bash -c`. The project is mounted at /workspace (the working directory). Only the sandbox's own commands are available (bash, coreutils, python, jq, ...; see the server instructions for the full list); there is no git, and network access is limited as the server instructions describe. Output is captured and returned when the command finishes.",
         annotations(
             title = "Bash (sandboxed)",
             read_only_hint = false,
@@ -373,13 +373,18 @@ impl ServerHandler for ClaustrumServer {
             "Claustrum runs your tools inside a WASIX sandbox. The project directory is mounted \
              read/write at {WORKSPACE}, which is also the working directory; changes there are \
              visible on the host. Nothing outside {WORKSPACE}, /tmp and /home/claude is \
-             accessible, and there is no network access. Use Read/Write/Edit/Glob/Grep for file \
+             accessible. Use Read/Write/Edit/Glob/Grep for file \
              work and Bash for everything else. The Claustrum configuration \
              ({WORKSPACE}/claustrum.toml) is read-only: it can be read, but every attempt to \
              change, replace or delete it is refused; ask the user to change it instead. \
              Available commands in Bash: {}.",
             commands.join(", ")
         );
+        instructions.push(' ');
+        instructions.push_str(&claustrum_sandbox::net::describe_for_model(
+            self.sandbox.network().mode(),
+            self.sandbox.network().entries(),
+        ));
         if let (Some(command), Some(listing)) =
             (self.sandbox.action_command(), self.sandbox.action_listing())
         {

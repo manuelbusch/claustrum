@@ -37,6 +37,8 @@ pub struct Args {
 pub fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
     let actions = config.validate_actions(&workspace)?;
+    let network = config.network_policy(&workspace)?;
+    eprintln!("claustrum: {}", Config::network_notice(&network));
     if let Some(notice) = Config::actions_notice(&actions) {
         eprintln!("claustrum: {notice}");
     }
@@ -105,7 +107,11 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         .arg("--allowedTools")
         .arg(format!("mcp__{SERVER_NAME}__*"))
         .arg("--append-system-prompt")
-        .arg(system_prompt(&config, config.file.claude.system_prompt.as_deref()));
+        .arg(system_prompt(
+            &config,
+            &network,
+            config.file.claude.system_prompt.as_deref(),
+        ));
     if let Some(mode) = &args.permission_mode {
         cmd.arg("--permission-mode").arg(mode);
     }
@@ -122,7 +128,11 @@ pub fn run(config: Config, args: Args) -> Result<()> {
     Err(anyhow::Error::from(err).context(format!("failed to execute {}", claude.display())))
 }
 
-fn system_prompt(config: &Config, extra: Option<&str>) -> String {
+fn system_prompt(
+    config: &Config,
+    network: &claustrum_sandbox::NetworkPolicy,
+    extra: Option<&str>,
+) -> String {
     let mut s = format!(
         "You are running inside Claustrum, a WASIX sandbox. Your only tools are the \
          mcp__{SERVER_NAME}__Bash, Read, Write, Edit, Glob and Grep tools; they replace the \
@@ -130,12 +140,16 @@ fn system_prompt(config: &Config, extra: Option<&str>) -> String {
          mounted at {WORKSPACE}, which is the working directory; refer to files by paths under \
          {WORKSPACE} or relative to it. Only the sandbox's own commands are available in Bash \
          (bash, coreutils, python, jq and whatever else is installed; the MCP server \
-         instructions list them); there is no git, no network, no host \
-         toolchain and no access to files outside the sandbox. If a needed command is missing, \
+         instructions list them); there is no git, no host toolchain and no \
+         access to files outside the sandbox. If a needed command is missing, \
          say so instead of trying workarounds on the host. The sandbox configuration \
          ({WORKSPACE}/claustrum.toml) is read-only for you: you can read it but not change, \
-         replace or delete it; if a setting there needs to change, ask the user."
+         replace or delete it; if a setting there needs to change, ask the user. "
     );
+    s.push_str(&claustrum_sandbox::net::describe_for_model(
+        network.mode,
+        &network.allow,
+    ));
     let actions = &config.file.actions.list;
     if !actions.is_empty() {
         let command = config.action_command();
