@@ -27,6 +27,7 @@ webc = { version = "12", default-features = false, features = ["v3"] }
 wasmer-package = { version = "=0.704.2", default-features = false }
 wasmer-wasix-types = "=0.704.2"
 wasmer-config = "=0.704.2"
+wasmer-types = { version = "=7.4.2", default-features = false }
 
 # MCP
 rmcp = { version = "3", default-features = false, features = ["server", "macros", "transport-io"] }

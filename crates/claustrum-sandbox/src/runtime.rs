@@ -6,11 +6,14 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use wasmer::{Engine, Module};
+use wasmer_types::ModuleHash;
+
 use wasmer_wasix::{
     PluggableRuntime, Runtime,
     os::tty::{TtyBridge, WasiTtyState},
     runtime::{
-        module_cache::{FileSystemCache, ModuleCache, SharedCache},
+        module_cache::{CacheError, FileSystemCache, ModuleCache, SharedCache},
         package_loader::BuiltinPackageLoader,
         resolver::{BackendSource, InMemorySource, MultiSource, PackageSummary},
         task_manager::tokio::TokioTaskManager,
@@ -22,8 +25,15 @@ use crate::{Error, Result};
 /// Options for building the shared runtime.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    /// Root directory for caches (compiled modules, downloaded packages).
+    /// Writable root for caches (compiled modules, downloaded packages, the
+    /// host command shim).
     pub cache_dir: PathBuf,
+    /// A cache of compiled modules that is consulted before `cache_dir` but
+    /// never written. A confined worker gets the user-wide cache here and a
+    /// cache of its own workspace as `cache_dir`: compiled modules are native
+    /// code loaded without further checks, so the worker must not be able
+    /// to plant them for other workspaces or for unconfined processes.
+    pub shared_modules: Option<PathBuf>,
     /// Local `.webc` files registered as package sources. Dependencies between
     /// bundled packages (e.g. bash → coreutils) are resolved offline from here.
     pub bundled_packages: Vec<BundledPackage>,
@@ -43,6 +53,7 @@ impl Default for RuntimeConfig {
             .unwrap_or_else(|| std::env::temp_dir().join("claustrum-cache"));
         Self {
             cache_dir,
+            shared_modules: None,
             bundled_packages: Vec::new(),
             online: false,
         }
@@ -123,6 +134,38 @@ impl TtyBridge for NoTty {
     fn tty_set(&self, _state: WasiTtyState) {}
 }
 
+/// A module cache that is only read; saving is a no-op.
+#[derive(Debug)]
+struct ReadOnlyCache<C>(C);
+
+#[async_trait::async_trait]
+impl<C: ModuleCache + Send + Sync> ModuleCache for ReadOnlyCache<C> {
+    async fn load(
+        &self,
+        key: ModuleHash,
+        engine: &Engine,
+    ) -> std::result::Result<Module, CacheError> {
+        self.0.load(key, engine).await
+    }
+
+    async fn contains(
+        &self,
+        key: ModuleHash,
+        engine: &Engine,
+    ) -> std::result::Result<bool, CacheError> {
+        self.0.contains(key, engine).await
+    }
+
+    async fn save(
+        &self,
+        _key: ModuleHash,
+        _engine: &Engine,
+        _module: &Module,
+    ) -> std::result::Result<(), CacheError> {
+        Ok(())
+    }
+}
+
 /// Build the shared runtime. Must be called from within a tokio runtime.
 pub(crate) fn build_runtime(config: &RuntimeConfig) -> Result<Arc<dyn Runtime + Send + Sync>> {
     let handle = tokio::runtime::Handle::try_current()
@@ -137,8 +180,7 @@ pub(crate) fn build_runtime(config: &RuntimeConfig) -> Result<Arc<dyn Runtime + 
 
     let tasks = Arc::new(TokioTaskManager::new(handle));
 
-    let module_cache =
-        SharedCache::default().with_fallback(FileSystemCache::new(modules_dir, tasks.clone()));
+    let own = FileSystemCache::new(modules_dir, tasks.clone());
 
     let mut source = MultiSource::new();
     let mut bundled = InMemorySource::new();
@@ -159,9 +201,17 @@ pub(crate) fn build_runtime(config: &RuntimeConfig) -> Result<Arc<dyn Runtime + 
         ));
     }
 
+    match &config.shared_modules {
+        // Trusted entries first, so the writable cache can only add modules.
+        Some(shared) => runtime.set_module_cache(
+            SharedCache::default()
+                .with_fallback(ReadOnlyCache(FileSystemCache::new(shared, tasks.clone())))
+                .with_fallback(own),
+        ),
+        None => runtime.set_module_cache(SharedCache::default().with_fallback(own)),
+    };
     runtime
         .set_tty(Arc::new(NoTty))
-        .set_module_cache(module_cache)
         .set_source(source)
         .set_package_loader(BuiltinPackageLoader::new().with_cache_dir(packages_dir))
         // Deny networking by default; sandboxes opt in through their policy.

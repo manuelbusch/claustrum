@@ -45,7 +45,7 @@ pub async fn run(config: Config, args: Args) -> Result<()> {
 
 /// No OS confinement: everything in this process, as a single layer.
 async fn serve_in_process(config: Config, workspace: &Path) -> Result<()> {
-    let sandbox = config.build_sandbox(Some(workspace), None, None).await?;
+    let sandbox = config.build_sandbox(Some(workspace), None).await?;
     tracing::info!(
         workspace = %sandbox.workspace_dir().display(),
         commands = sandbox.commands().len(),
@@ -74,7 +74,7 @@ mod broker {
         plans::PlanStore,
     };
 
-    use crate::config::{Config, default_config_paths};
+    use crate::config::{Config, Remote, default_config_paths};
 
     /// Descriptor number of the broker socket in the worker.
     const BROKER_FD: i32 = 3;
@@ -198,9 +198,10 @@ mod broker {
     }
 
     /// What the Wasmer worker may touch: its binary, the packages, the
-    /// configuration and read-only extra mounts (read), the workspace, writable
-    /// extra mounts, module cache, network log and a private temporary
-    /// directory (read/write), never the
+    /// configuration, read-only extra mounts and the user-wide module cache
+    /// (read), the workspace, writable extra mounts, its workspace's module
+    /// cache and network log and a private temporary directory (read/write),
+    /// never the
     /// configuration (write) or credential stores (read). It may not start any
     /// program; host actions go through the broker.
     fn worker_profile(
@@ -230,17 +231,27 @@ mod broker {
                 p.read.push(host);
             }
         }
-        let cache = RuntimeConfig::default().cache_dir;
+        // The user-wide module cache is read-only for the worker; it writes
+        // a cache of its own workspace (see `Config::worker_cache_dir`).
+        p.read
+            .push(RuntimeConfig::default().cache_dir.join("modules"));
+        let cache = config.worker_cache_dir(workspace);
         // Bind mounts need the directory to exist.
         std::fs::create_dir_all(&cache)
             .with_context(|| format!("cannot create {}", cache.display()))?;
         p.write.push(cache);
+        // Only this workspace's log, created here so that it exists for the
+        // bind mount; the broker appends to the same file.
         if let Some(dir) = log_path.parent() {
-            // The directory, so that the log can be created on first use.
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
-            p.write.push(dir.to_path_buf());
         }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("cannot create {}", log_path.display()))?;
+        p.write.push(log_path.to_path_buf());
         p.write.push(tmp.to_path_buf());
 
         p.deny_write = protected.to_vec();
@@ -299,11 +310,11 @@ mod broker {
         };
         #[cfg(debug_assertions)]
         if std::env::var_os(ESCAPE_PROBE_ENV).is_some() {
-            escape_probe(&args.workspace);
+            escape_probe(&config, &args.workspace);
             return Ok(());
         }
         let sandbox = config
-            .build_sandbox(Some(&args.workspace), executor, plans)
+            .build_sandbox(Some(&args.workspace), Some(Remote { executor, plans }))
             .await?;
         tracing::info!(
             workspace = %sandbox.workspace_dir().display(),
@@ -320,7 +331,7 @@ mod broker {
     pub const ESCAPE_PROBE_ENV: &str = "CLAUSTRUM_ESCAPE_PROBE";
 
     #[cfg(debug_assertions)]
-    fn escape_probe(workspace: &Path) {
+    fn escape_probe(config: &Config, workspace: &Path) {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let report = |what: &str, ok: bool| {
             eprintln!("probe {what}: {}", if ok { "ALLOWED" } else { "denied" });
@@ -340,6 +351,24 @@ mod broker {
         report(
             "claude-settings-write",
             std::fs::write(workspace.join(".claude/settings.json"), "{}").is_ok(),
+        );
+        let cache = RuntimeConfig::default().cache_dir;
+        report(
+            "shared-cache-write",
+            std::fs::write(cache.join("modules/claustrum-probe"), "x").is_ok(),
+        );
+        let own = config.worker_cache_dir(workspace).join("claustrum-probe");
+        report("workspace-cache-write", std::fs::write(&own, "x").is_ok());
+        let _ = std::fs::remove_file(&own);
+        report(
+            "other-log-write",
+            std::fs::write(
+                config
+                    .network_log_path(workspace)
+                    .with_file_name("claustrum-probe.jsonl"),
+                "x",
+            )
+            .is_ok(),
         );
         let plans = crate::config::claude_plans_dir();
         report("claude-plans-read", std::fs::read_dir(&plans).is_ok());

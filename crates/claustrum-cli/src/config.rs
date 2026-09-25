@@ -187,6 +187,12 @@ pub struct Config {
     pub digest: Option<String>,
 }
 
+/// What the confined worker reaches through the broker.
+pub struct Remote {
+    pub executor: Option<Arc<dyn ActionExecutor>>,
+    pub plans: Option<Arc<dyn PlanStore>>,
+}
+
 /// Origin of the configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -539,6 +545,18 @@ impl Config {
             .join(format!("{}.jsonl", workspace_key(workspace)))
     }
 
+    /// The cache the confined worker of `workspace` may write: its compiled
+    /// modules, downloaded packages and the host command shim. The user-wide
+    /// cache is only written by unconfined processes (`claustrum pkg`, `serve`
+    /// without confinement) and read by the worker, so a compromised worker
+    /// cannot plant native code for other workspaces or for those processes.
+    pub fn worker_cache_dir(&self, workspace: &Path) -> PathBuf {
+        RuntimeConfig::default()
+            .cache_dir
+            .join("workspaces")
+            .join(workspace_key(workspace))
+    }
+
     /// Where Claude Code's plans for `workspace` are written, if plan mode
     /// is enabled: Claude Code's own plan directory, with a ledger in the
     /// user state directory of the files this workspace created there.
@@ -620,22 +638,40 @@ impl Config {
     /// host actions are forwarded to it (the broker) instead of being started
     /// from this process.
     ///
-    /// Plan files are written through `plans` (the broker) or, without it,
-    /// directly to [`Config::host_plans`].
+    /// With `remote` the sandbox runs in the confined worker: host actions
+    /// and plan files go through the broker, and compiled modules are cached
+    /// per workspace (see [`Config::worker_cache_dir`]). Without it plan
+    /// files are written directly to [`Config::host_plans`].
     pub async fn build_sandbox(
         &self,
         workspace: Option<&Path>,
-        executor: Option<Arc<dyn ActionExecutor>>,
-        plans: Option<Arc<dyn PlanStore>>,
+        remote: Option<Remote>,
     ) -> Result<Sandbox> {
         let workspace = self.workspace(workspace)?;
+        let (executor, plans, runtime) = match remote {
+            Some(r) => (
+                r.executor,
+                r.plans,
+                RuntimeConfig {
+                    cache_dir: self.worker_cache_dir(&workspace),
+                    shared_modules: Some(RuntimeConfig::default().cache_dir.join("modules")),
+                    online: self.file.packages.online,
+                    ..RuntimeConfig::default()
+                },
+            ),
+            None => (
+                None,
+                None,
+                RuntimeConfig {
+                    online: self.file.packages.online,
+                    ..RuntimeConfig::default()
+                },
+            ),
+        };
         let mut builder: SandboxBuilder = Sandbox::builder()
             .workspace(&workspace)
             .policy(self.policy(&workspace)?)
-            .runtime_config(RuntimeConfig {
-                online: self.file.packages.online,
-                ..RuntimeConfig::default()
-            });
+            .runtime_config(runtime);
 
         let packages = self.packages();
         let missing: Vec<_> = packages.iter().filter(|p| !p.is_installed()).collect();

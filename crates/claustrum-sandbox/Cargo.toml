@@ -16,6 +16,7 @@ webc.workspace = true
 wasmer-package.workspace = true
 wasmer-wasix-types.workspace = true
 wasmer-config.workspace = true
+wasmer-types.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

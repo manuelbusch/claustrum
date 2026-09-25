@@ -29,6 +29,8 @@ fn worker_escape_is_contained() {
     let ws = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let claude = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cache.path().join("modules")).unwrap();
     std::fs::create_dir(claude.path().join("plans")).unwrap();
     std::fs::write(claude.path().join("plans/other.md"), "theirs\n").unwrap();
     std::fs::write(ws.path().join("claustrum.toml"), "# original\n").unwrap();
@@ -44,6 +46,7 @@ fn worker_escape_is_contained() {
         .env("CLAUSTRUM_ESCAPE_PROBE", "1")
         .env("CLAUSTRUM_STATE_DIR", state.path())
         .env("CLAUDE_CONFIG_DIR", claude.path())
+        .env("CLAUSTRUM_CACHE_DIR", cache.path())
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -54,11 +57,15 @@ fn worker_escape_is_contained() {
         stderr.contains(&format!("confinement: {backend} around")),
         "{stderr}"
     );
-    assert!(
-        stderr.contains("probe workspace-write: ALLOWED"),
-        "{stderr}"
-    );
+    for what in ["workspace-write", "workspace-cache-write"] {
+        assert!(
+            stderr.contains(&format!("probe {what}: ALLOWED")),
+            "{what} was denied:\n{stderr}"
+        );
+    }
     let mut denied = vec![
+        "shared-cache-write",
+        "other-log-write",
         "claude-plans-read",
         "claude-plans-write",
         "home-write",
@@ -80,6 +87,7 @@ fn worker_escape_is_contained() {
     assert!(!escape.exists());
     assert!(!ws.path().join(".claude/settings.json").exists());
     assert!(!claude.path().join("plans/claustrum-probe.md").exists());
+    assert!(!cache.path().join("modules/claustrum-probe").exists());
     assert_eq!(
         std::fs::read_to_string(ws.path().join("claustrum.toml")).unwrap(),
         "# original\n"

@@ -168,9 +168,15 @@ unconfined **broker** and a confined **worker**:
 
 | Process | May read | May write | May execute | Network |
 | --- | --- | --- | --- | --- |
-| **worker** | its binary, packages, configuration, read-only extra mounts | workspace, writable extra mounts, module cache, network log, private temp dir | nothing | none, or outbound only if the mode requires it |
+| **worker** | its binary, packages, configuration, read-only extra mounts, the user-wide module cache | workspace, writable extra mounts, its workspace's cache and network log, private temp dir | nothing | none, or outbound only if the mode requires it |
 | **broker** | everything (unconfined) | everything (unconfined); for the worker only this workspace's plan files | actions only, each in its own profile | proxy on `127.0.0.1` |
 | **action** | everything except credential stores and `deny_read` | workspace, fresh `$TMPDIR`, `writable` list | anything | `localhost:<proxy port>` only (`host` mode: unrestricted) |
+
+Compiled modules are native code that Wasmer loads without further checks, so the worker
+never writes the user-wide module cache: it reads it and caches what is missing in a
+directory of its own workspace. That cache is only ever loaded by the worker of the same
+workspace. `claustrum pkg sync` and `pkg precompile`, which run unconfined, fill the
+user-wide cache.
 
 Credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser profiles, `~/.claude`,
 ...) stay unreadable for confined processes even when they lie inside a mount. The
@@ -241,7 +247,7 @@ claustrum run --permission-mode acceptEdits -- -p "Add a README for this project
 | `claustrum pkg add <spec>` | Download one package, e.g. `python/python` |
 | `claustrum pkg add-wasm <name> <file.wasm> [--alias cmd]` | Register a self-built WASIX binary as a package |
 | `claustrum pkg list` / `pkg commands` | Show installed packages and the commands they provide |
-| `claustrum pkg precompile` | Compile all packages into the module cache ahead of time |
+| `claustrum pkg precompile` | Compile all packages into the user-wide module cache ahead of time |
 | `claustrum network report [--workspace DIR] [--all]` | Summarise refused connections and suggest `allow` entries |
 | `claustrum plans [--workspace DIR]` | List the plan files Claude wrote for a workspace |
 | `claustrum trust [--revoke]` | Review the project's `claustrum.toml` and trust it (see below) |

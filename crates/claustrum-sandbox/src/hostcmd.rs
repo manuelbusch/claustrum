@@ -142,7 +142,7 @@ pub(crate) fn write_shim_package(
     ));
     std::fs::create_dir_all(&dir)?;
     let wasm = dir.join("hostcmd.wasm");
-    if !wasm.exists() || std::fs::metadata(&wasm)?.len() != SHIM_WASM.len() as u64 {
+    if std::fs::read(&wasm).ok().as_deref() != Some(SHIM_WASM) {
         std::fs::write(&wasm, SHIM_WASM)?;
     }
     std::fs::write(dir.join("wasmer.toml"), manifest)?;
