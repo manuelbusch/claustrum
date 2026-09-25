@@ -174,6 +174,15 @@ pub(crate) async fn run(spawn: Spawn<'_>) -> Result<ExecOutput> {
         .await
         .map_err(|e| Error::Spawn(format!("{e}")))?;
 
+    // If this future is dropped before the process ended (a cancelled MCP
+    // request), the guard kills the process tree in the background and
+    // cancels the host commands it started.
+    let mut guard = KillOnDrop {
+        process: process.clone(),
+        main_tid,
+        cancel: cancel.clone(),
+        armed: true,
+    };
     let timeout = spawn.options.timeout.or(spawn.policy.default_timeout);
     let wait = task.wait_finished();
     tokio::pin!(wait);
@@ -193,6 +202,7 @@ pub(crate) async fn run(spawn: Spawn<'_>) -> Result<ExecOutput> {
         }
         None => (wait.await, ExitReason::Exited),
     };
+    guard.armed = false;
 
     let exit_code = match result {
         Ok(code) => code.raw(),
@@ -255,6 +265,51 @@ where
     tracing::warn!("process ignored SIGKILL; forcing termination");
     process.terminate(wasmer_wasix_types::wasi::ExitCode::from(137));
     wait.as_mut().await
+}
+
+/// Kills a guest process that is still running when the future driving it
+/// is dropped. See [`run`].
+struct KillOnDrop {
+    process: wasmer_wasix::os::task::process::WasiProcess,
+    main_tid: wasmer_wasix::WasiThreadId,
+    cancel: Cancel,
+    armed: bool,
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.cancel.cancel();
+        let process = self.process.clone();
+        let tid = self.main_tid;
+        tracing::warn!("guest command abandoned by its caller; killing it");
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    const ATTEMPTS: u32 = 40;
+                    const INTERVAL: Duration = Duration::from_millis(25);
+                    for _ in 0..ATTEMPTS {
+                        if process.try_join().is_some() {
+                            return;
+                        }
+                        process.signal_thread(&tid, Signal::Sigkill);
+                        process.signal_process(Signal::Sigkill);
+                        tokio::time::sleep(INTERVAL).await;
+                    }
+                    if process.try_join().is_none() {
+                        process.terminate(wasmer_wasix_types::wasi::ExitCode::from(137));
+                    }
+                });
+            }
+            Err(_) => {
+                process.signal_thread(&tid, Signal::Sigkill);
+                process.signal_process(Signal::Sigkill);
+                process.terminate(wasmer_wasix_types::wasi::ExitCode::from(137));
+            }
+        }
+    }
 }
 
 /// WASI exposes `environ` as an array, so collapse duplicate keys (last wins).

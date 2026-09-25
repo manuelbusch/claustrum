@@ -11,10 +11,14 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
+
+/// How often an action waiting for another one checks its cancel flag.
+const LOCK_POLL: Duration = Duration::from_millis(50);
 
 use claustrum_confine::{Exec, Network, Profile};
 
@@ -172,10 +176,21 @@ impl ActionExecutor for ActionHost {
             confined,
             "running host action"
         );
-        let _guard = self
-            .running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Wait for a running action without losing sight of the cancel
+        // flag: the guest's timeout or a dropped call must still end this
+        // invocation while another action holds the lock.
+        let _guard = loop {
+            if cancel.is_cancelled() {
+                return Err(Refusal(format!(
+                    "action `{name}`: cancelled before it started"
+                )));
+            }
+            match self.running.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL),
+            }
+        };
         if cancel.is_cancelled() {
             return Err(Refusal(format!(
                 "action `{name}`: cancelled before it started"

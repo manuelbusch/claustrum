@@ -982,6 +982,116 @@ async fn killed_bash_call_stops_the_host_action() {
     assert!(!alive, "host process {pid} outlived the guest");
 }
 
+/// Whether the host process whose pid the `sleep` action wrote is alive.
+fn sleeper_alive(ws: &std::path::Path) -> bool {
+    let pid: i32 = std::fs::read_to_string(ws.join("sleeper.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only checks whether the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+async fn wait_for(path: &std::path::Path) {
+    for _ in 0..100 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{} never appeared", path.display());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_bash_call_stops_the_guest_and_its_action() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    // The caller gives up (an MCP cancellation drops the tool future).
+    let call = sb.bash(
+        "echo started > started; host sleep; echo after > after",
+        ExecOptions {
+            timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        },
+    );
+    let pid_file = ws.path().join("sleeper.pid");
+    let give_up = async {
+        wait_for(&pid_file).await;
+    };
+    tokio::select! {
+        _ = call => panic!("the command finished on its own"),
+        _ = give_up => {}
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !sleeper_alive(ws.path()),
+        "host action outlived the dropped call"
+    );
+    assert!(!ws.path().join("after").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_action_call_stops_the_action() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    let call = sb.run_action("sleep", Default::default());
+    let pid_file = ws.path().join("sleeper.pid");
+    tokio::select! {
+        _ = call => panic!("the action finished on its own"),
+        _ = wait_for(&pid_file) => {}
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !sleeper_alive(ws.path()),
+        "host action outlived the dropped call"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_action_honours_its_timeout() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    let first = sb.bash(
+        "host sleep",
+        ExecOptions {
+            timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(first);
+    // Let the first action start and take the lock.
+    let pid_file = ws.path().join("sleeper.pid");
+    tokio::select! {
+        _ = &mut first => panic!("the first action finished on its own"),
+        _ = wait_for(&pid_file) => {}
+    }
+    let started = std::time::Instant::now();
+    let second = sb.bash(
+        "host echo",
+        ExecOptions {
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    let out = tokio::select! {
+        _ = &mut first => panic!("the first action finished on its own"),
+        out = second => out.unwrap(),
+    };
+    assert_eq!(out.reason, ExitReason::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the queued call waited {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn host_actions_cannot_change_the_configuration() {
     let ws = tempfile::tempdir().unwrap();

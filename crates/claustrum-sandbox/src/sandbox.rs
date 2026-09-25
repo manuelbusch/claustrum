@@ -487,12 +487,14 @@ impl Sandbox {
             .ok_or_else(|| Error::Action("no host actions are configured".into()))?;
         let name = name.to_owned();
         let cwd = self.cwd();
-        let outcome = tokio::task::spawn_blocking(move || {
-            set.run(&name, &[], &inputs, &cwd, &hostcmd::Cancel::new())
-        })
-        .await
-        .map_err(|e| Error::Other(format!("action task failed: {e}")))?
-        .map_err(|r| Error::Action(r.to_string()))?;
+        // Dropping this future (a cancelled MCP request) stops the action.
+        let cancel = hostcmd::Cancel::new();
+        let _stop = cancel.on_drop();
+        let outcome =
+            tokio::task::spawn_blocking(move || set.run(&name, &[], &inputs, &cwd, &cancel))
+                .await
+                .map_err(|e| Error::Other(format!("action task failed: {e}")))?
+                .map_err(|r| Error::Action(r.to_string()))?;
         Ok(ExecOutput {
             exit_code: outcome.exit_code,
             reason: if outcome.killed {

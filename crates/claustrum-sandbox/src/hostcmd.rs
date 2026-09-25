@@ -77,6 +77,23 @@ impl Cancel {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+
+    /// A guard that sets the flag when it is dropped: held by a future
+    /// whose caller may drop it early (a cancelled MCP request), so that the
+    /// host work it started stops as well.
+    pub fn on_drop(&self) -> CancelOnDrop {
+        CancelOnDrop(self.clone())
+    }
+}
+
+/// See [`Cancel::on_drop`]. Cancelling after the work finished is harmless.
+#[derive(Debug)]
+pub struct CancelOnDrop(Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// What the guest handed to a host command invocation.

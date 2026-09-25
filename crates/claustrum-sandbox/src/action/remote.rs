@@ -46,6 +46,15 @@ const MAX_REQUEST: u64 = 1024 * 1024;
 const MAX_RESPONSE: u64 = 256 * 1024 * 1024;
 /// How often a waiting worker checks its cancel flag.
 const POLL: Duration = Duration::from_millis(50);
+/// How long the worker waits for the broker's answer after it forwarded a
+/// cancellation. Stopping an action takes well under this (SIGKILL of its
+/// process group, drain, restore).
+const CANCEL_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
+/// How long a plan request may take.
+const PLAN_DEADLINE: Duration = Duration::from_secs(30);
+/// Action requests the broker runs at once (they queue for one lock); more
+/// are refused instead of spawning a thread each.
+const MAX_IN_FLIGHT: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -178,6 +187,7 @@ impl BrokerClient {
         what: &str,
         make: impl FnOnce(u64) -> Request,
         cancel: Option<&Cancel>,
+        deadline: Option<Duration>,
     ) -> Result<Response, Refusal> {
         let gone = || Refusal(format!("{what}: the Claustrum broker is gone"));
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -193,7 +203,8 @@ impl BrokerClient {
                 .remove(&id);
             return Err(gone());
         }
-        let mut cancel_sent = false;
+        let started = std::time::Instant::now();
+        let mut cancel_sent: Option<std::time::Instant> = None;
         loop {
             match rx.recv_timeout(POLL) {
                 Ok(Response::Refused { message, .. }) => return Err(Refusal(message)),
@@ -202,10 +213,22 @@ impl BrokerClient {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(cancel) = cancel
                         && cancel.is_cancelled()
-                        && !cancel_sent
+                        && cancel_sent.is_none()
                     {
-                        cancel_sent = true;
+                        cancel_sent = Some(std::time::Instant::now());
                         let _ = write_line(&self.writer, &Request::Cancel { id });
+                    }
+                    let overdue = cancel_sent.is_some_and(|t| t.elapsed() > CANCEL_GRACE)
+                        || deadline.is_some_and(|d| started.elapsed() > d);
+                    if overdue {
+                        // A late answer finds no waiter and is dropped.
+                        self.pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&id);
+                        return Err(Refusal(format!(
+                            "{what}: the Claustrum broker did not answer in time"
+                        )));
                     }
                 }
             }
@@ -242,7 +265,7 @@ impl ActionExecutor for BrokerClient {
             named: named.clone(),
             cwd: guest_cwd.to_owned(),
         };
-        match self.call(&what, request, Some(cancel))? {
+        match self.call(&what, request, Some(cancel), None)? {
             Response::Done { outcome, .. } => Ok(outcome),
             _ => Err(unexpected(&what)),
         }
@@ -256,7 +279,7 @@ impl PlanStore for BrokerClient {
             name: name.to_owned(),
             content: content.to_owned(),
         };
-        match self.call("plan", request, None) {
+        match self.call("plan", request, None, Some(PLAN_DEADLINE)) {
             Ok(Response::PlanWritten { out, .. }) => Ok(out),
             Ok(_) => Err(unexpected("plan").0),
             Err(r) => Err(r.0),
@@ -277,7 +300,7 @@ impl PlanStore for BrokerClient {
             new_string: new_string.to_owned(),
             replace_all,
         };
-        match self.call("plan", request, None) {
+        match self.call("plan", request, None, Some(PLAN_DEADLINE)) {
             Ok(Response::PlanEdited { out, .. }) => Ok(out),
             Ok(_) => Err(unexpected("plan").0),
             Err(r) => Err(r.0),
@@ -321,10 +344,10 @@ pub fn serve(
             }
             Request::WritePlan { id, name, content } => {
                 let response = match &plans {
-                    Some(plans) => match plans.write(&name, &content) {
+                    Some(plans) => guarded(id, "plan", || match plans.write(&name, &content) {
                         Ok(out) => Response::PlanWritten { id, out },
                         Err(message) => Response::Refused { id, message },
-                    },
+                    }),
                     None => no_plans(id),
                 };
                 answer(&writer, &response);
@@ -337,10 +360,12 @@ pub fn serve(
                 replace_all,
             } => {
                 let response = match &plans {
-                    Some(plans) => match plans.edit(&name, &old_string, &new_string, replace_all) {
-                        Ok(out) => Response::PlanEdited { id, out },
-                        Err(message) => Response::Refused { id, message },
-                    },
+                    Some(plans) => guarded(id, "plan", || {
+                        match plans.edit(&name, &old_string, &new_string, replace_all) {
+                            Ok(out) => Response::PlanEdited { id, out },
+                            Err(message) => Response::Refused { id, message },
+                        }
+                    }),
                     None => no_plans(id),
                 };
                 answer(&writer, &response);
@@ -363,26 +388,58 @@ pub fn serve(
             } => {
                 let executor = executor.clone().expect("checked above");
                 let cancel = Cancel::new();
-                cancels
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(id, cancel.clone());
-                let writer = Arc::clone(&writer);
-                let cancels = Arc::clone(&cancels);
-                std::thread::spawn(move || {
-                    let response = match executor.run(&name, &positional, &named, &cwd, &cancel) {
-                        Ok(outcome) => Response::Done { id, outcome },
-                        Err(r) => Response::Refused {
-                            id,
-                            message: r.to_string(),
-                        },
-                    };
+                {
+                    let mut running = cancels.lock().unwrap_or_else(|p| p.into_inner());
+                    if running.len() >= MAX_IN_FLIGHT {
+                        drop(running);
+                        answer(
+                            &writer,
+                            &Response::Refused {
+                                id,
+                                message: format!(
+                                    "action `{name}`: too many actions are waiting; try again \
+                                     when the running ones have finished"
+                                ),
+                            },
+                        );
+                        continue;
+                    }
+                    running.insert(id, cancel.clone());
+                }
+                let thread_writer = Arc::clone(&writer);
+                let thread_cancels = Arc::clone(&cancels);
+                let what = format!("action `{name}`");
+                let spawned = std::thread::Builder::new()
+                    .name("claustrum-action".into())
+                    .spawn(move || {
+                        let response = guarded(id, &what, || {
+                            match executor.run(&name, &positional, &named, &cwd, &cancel) {
+                                Ok(outcome) => Response::Done { id, outcome },
+                                Err(r) => Response::Refused {
+                                    id,
+                                    message: r.to_string(),
+                                },
+                            }
+                        });
+                        thread_cancels
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&id);
+                        answer(&thread_writer, &response);
+                    });
+                if let Err(e) = spawned {
                     cancels
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(&id);
-                    answer(&writer, &response);
-                });
+                    answer(
+                        &writer,
+                        &Response::Refused {
+                            id,
+                            message: format!("cannot start the action: {e}"),
+                        },
+                    );
+                }
             }
         }
     };
@@ -390,6 +447,18 @@ pub fn serve(
         c.cancel();
     }
     result
+}
+
+/// Run `f`, turning a panic into a refusal so that the worker always gets
+/// an answer and its guest does not wait forever.
+fn guarded(id: u64, what: &str, f: impl FnOnce() -> Response) -> Response {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        tracing::error!(what, "request handler panicked");
+        Response::Refused {
+            id,
+            message: format!("{what}: internal error in Claustrum (see its log)"),
+        }
+    })
 }
 
 fn answer(writer: &Mutex<UnixStream>, response: &Response) {
@@ -432,6 +501,7 @@ mod tests {
                     stdout: format!("{positional:?} {named:?} {guest_cwd}").into_bytes(),
                     ..Default::default()
                 }),
+                "panic" => panic!("boom"),
                 "wait" => {
                     let started = Instant::now();
                     while !cancel.is_cancelled() {
@@ -486,6 +556,67 @@ mod tests {
             .run("wait", &[], &BTreeMap::new(), "/", &cancel)
             .unwrap();
         assert!(out.killed);
+    }
+
+    #[test]
+    fn panics_are_answered() {
+        let remote = pair();
+        let err = remote
+            .run("panic", &[], &BTreeMap::new(), "/", &Cancel::new())
+            .unwrap_err();
+        assert!(err.0.contains("internal error"), "{err}");
+        // The broker keeps serving.
+        assert!(
+            remote
+                .run("echo", &[], &BTreeMap::new(), "/", &Cancel::new())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn in_flight_actions_are_capped() {
+        let remote = pair();
+        let cancel = Cancel::new();
+        let waiters: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| {
+                let remote = Arc::clone(&remote);
+                let cancel = cancel.clone();
+                std::thread::spawn(move || remote.run("wait", &[], &BTreeMap::new(), "/", &cancel))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(300));
+        let err = remote
+            .run("echo", &[], &BTreeMap::new(), "/", &Cancel::new())
+            .unwrap_err();
+        assert!(err.0.contains("too many"), "{err}");
+        cancel.cancel();
+        for w in waiters {
+            assert!(w.join().unwrap().unwrap().killed);
+        }
+        assert!(
+            remote
+                .run("echo", &[], &BTreeMap::new(), "/", &Cancel::new())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_silent_broker_does_not_hang_the_worker() {
+        // A broker that reads requests but never answers.
+        let (worker, broker) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = BufReader::new(broker).read_to_end(&mut sink);
+        });
+        let remote = BrokerClient::new(worker).unwrap();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let started = Instant::now();
+        let err = remote
+            .run("wait", &[], &BTreeMap::new(), "/", &cancel)
+            .unwrap_err();
+        assert!(err.0.contains("did not answer"), "{err}");
+        assert!(started.elapsed() < CANCEL_GRACE + Duration::from_secs(5));
     }
 
     #[test]
