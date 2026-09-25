@@ -2,6 +2,7 @@
 
 mod commands;
 mod config;
+mod trust;
 
 use std::path::PathBuf;
 
@@ -37,6 +38,12 @@ enum Command {
     Network(commands::network::Command),
     /// List the plans Claude wrote for this workspace.
     Plans(commands::plans::Args),
+    /// Review the project's claustrum.toml and trust it (or `--revoke`).
+    Trust {
+        /// Forget that the file was trusted.
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Internal: the confined half of `serve`, started by it.
     #[cfg(unix)]
     #[command(name = "__worker", hide = true)]
@@ -67,6 +74,11 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = config::load(cli.config.as_deref(), cli.packages_dir.as_deref())?;
+    // A project's own claustrum.toml configures the sandbox meant to contain
+    // that project; nothing uses it before the user trusted it.
+    if !matches!(cli.command, Command::Trust { .. }) {
+        trust::ensure(&config)?;
+    }
 
     match cli.command {
         Command::Run(args) => commands::run::run(config, args),
@@ -74,6 +86,7 @@ fn main() -> anyhow::Result<()> {
         Command::Pkg(cmd) => runtime()?.block_on(commands::pkg::run(config, cmd)),
         Command::Network(cmd) => commands::network::run(config, cmd),
         Command::Plans(args) => commands::plans::run(config, args),
+        Command::Trust { revoke } => trust::command(&config, revoke),
         #[cfg(unix)]
         Command::Worker(args) => runtime()?.block_on(commands::serve::worker(config, args)),
     }

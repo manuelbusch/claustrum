@@ -181,20 +181,97 @@ pub struct Config {
     pub file: FileConfig,
     pub path: Option<PathBuf>,
     pub packages_dir: PathBuf,
+    /// Where the file came from; decides whether it needs the user's trust.
+    pub source: Source,
+    /// SHA-256 of the file as it was parsed, hex.
+    pub digest: Option<String>,
+}
+
+/// Origin of the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `--config` or `CLAUSTRUM_CONFIG`: chosen by the user.
+    Explicit,
+    /// `./claustrum.toml`: part of the project, possibly a cloned one, so it
+    /// is only used once the user trusted this exact content (see
+    /// [`crate::trust`]).
+    Workspace,
+    /// The user configuration directory.
+    User,
+    /// No file; built-in defaults.
+    BuiltIn,
+}
+
+/// `[claude] args` that would undo what `claustrum run` sets up: they come
+/// after Claustrum's own arguments and win. Refused in every configuration
+/// file; pass them after `--` on the command line if they are really meant.
+const FORBIDDEN_CLAUDE_ARGS: &[&str] = &[
+    "--tools",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--mcp-config",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--settings",
+    "--setting-sources",
+    "--add-dir",
+    "--plugin-dir",
+    "--plugin-url",
+    "--system-prompt",
+    "--system-prompt-file",
+];
+
+fn check_claude_args(args: &[String]) -> Result<()> {
+    for a in args {
+        let flag = a.split('=').next().unwrap_or(a);
+        if FORBIDDEN_CLAUDE_ARGS.contains(&flag) {
+            anyhow::bail!(
+                "[claude] args: `{flag}` would override the sandbox set up by `claustrum run` and \
+                 is not allowed in a configuration file; use `[claude] tools` for built-in \
+                 tools, `--permission-mode` on the command line, or pass it after `--`"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn load(explicit: Option<&Path>, packages_dir: Option<&Path>) -> Result<Config> {
-    let path = match explicit {
-        Some(p) => Some(p.to_path_buf()),
-        None => default_config_paths().into_iter().find(|p| p.is_file()),
+    let (path, source) = match explicit {
+        Some(p) => (Some(p.to_path_buf()), Source::Explicit),
+        None => {
+            let found = default_config_paths().into_iter().find(|p| p.is_file());
+            let source = match &found {
+                Some(p) if p.is_relative() => Source::Workspace,
+                Some(_) => Source::User,
+                None => Source::BuiltIn,
+            };
+            (found, source)
+        }
     };
-    let file = match &path {
+    let (file, digest) = match &path {
         Some(p) => {
             let text = std::fs::read_to_string(p)
                 .with_context(|| format!("cannot read config {}", p.display()))?;
-            toml::from_str(&text).with_context(|| format!("invalid config {}", p.display()))?
+            let file: FileConfig =
+                toml::from_str(&text).with_context(|| format!("invalid config {}", p.display()))?;
+            check_claude_args(&file.claude.args)
+                .with_context(|| format!("invalid config {}", p.display()))?;
+            (file, Some(sha256_hex(text.as_bytes())))
         }
-        None => FileConfig::default(),
+        None => (FileConfig::default(), None),
     };
     let packages_dir = packages_dir
         .map(Path::to_path_buf)
@@ -210,6 +287,8 @@ pub fn load(explicit: Option<&Path>, packages_dir: Option<&Path>) -> Result<Conf
         file,
         path,
         packages_dir,
+        source,
+        digest,
     })
 }
 
@@ -231,8 +310,9 @@ pub fn default_packages_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("packages"))
 }
 
-/// Per-user directory for logs and plans; `CLAUSTRUM_STATE_DIR` overrides it.
-fn state_dir() -> PathBuf {
+/// Per-user directory for logs, plans and trust records;
+/// `CLAUSTRUM_STATE_DIR` overrides it.
+pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("CLAUSTRUM_STATE_DIR") {
         return PathBuf::from(dir);
     }
@@ -685,6 +765,8 @@ writable = true
             file: toml::from_str(text).unwrap(),
             path: None,
             packages_dir: PathBuf::from("."),
+            source: Source::BuiltIn,
+            digest: None,
         }
     }
 
@@ -754,6 +836,22 @@ writable = true
     }
 
     #[test]
+    fn claude_args_cannot_undo_the_sandbox() {
+        for bad in [
+            "--tools",
+            "--tools=Bash",
+            "--dangerously-skip-permissions",
+            "--settings",
+            "--mcp-config",
+            "--allowedTools",
+        ] {
+            let err = check_claude_args(&[bad.to_owned()]).unwrap_err();
+            assert!(err.to_string().contains("not allowed"), "{bad}: {err}");
+        }
+        check_claude_args(&["--model".into(), "opus".into(), "--verbose".into()]).unwrap();
+    }
+
+    #[test]
     fn claude_settings_are_protected() {
         let ws = Path::new("/tmp/ws");
         let paths = config("").protected_paths(ws);
@@ -773,6 +871,8 @@ writable = true
             file,
             path: None,
             packages_dir: ws.clone(),
+            source: Source::BuiltIn,
+            digest: None,
         };
         let err = config.validate_actions(&ws).unwrap_err();
         assert!(err.to_string().contains("no matching input"), "{err}");

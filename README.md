@@ -244,6 +244,7 @@ claustrum run --permission-mode acceptEdits -- -p "Add a README for this project
 | `claustrum pkg precompile` | Compile all packages into the module cache ahead of time |
 | `claustrum network report [--workspace DIR] [--all]` | Summarise refused connections and suggest `allow` entries |
 | `claustrum plans [--workspace DIR]` | List the plan files Claude wrote for a workspace |
+| `claustrum trust [--revoke]` | Review the project's `claustrum.toml` and trust it (see below) |
 
 Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (or
 `CLAUSTRUM_PACKAGES_DIR`). Logging goes to stderr and is controlled by `CLAUSTRUM_LOG`
@@ -286,6 +287,29 @@ writable = ["~/.cargo/registry"]
 | `[claude]` | `binary`, `tools`, `args`, `system_prompt`, `plans` | how `claude` is launched, [plan mode](#plan-mode) |
 
 [`claustrum.example.toml`](claustrum.example.toml) documents every key.
+
+### A project's configuration needs your trust
+
+A `claustrum.toml` in the current directory usually comes with the project, possibly one you
+just cloned, and it configures the sandbox that is meant to protect you from that project. It
+could turn confinement off, open the network, mount your home directory, declare host
+commands or name the program started as `claude`. So Claustrum does not use it until you have
+accepted its exact content, as `direnv allow` does:
+
+- In a terminal, `claustrum run` lists what the file changes, marks with `!` everything that
+  reaches the host, and asks. Without a terminal (`serve` started by another MCP client, CI)
+  it refuses.
+- `claustrum trust` records the file after showing the same list, and `--revoke` forgets it.
+  The record is the file's SHA-256 in the user state directory, so any change, such as a
+  `git pull`, asks again.
+- A file passed with `--config` (or `CLAUSTRUM_CONFIG`), the user configuration and the
+  built-in defaults need no confirmation.
+
+Independently of trust, `[claude] args` may not contain flags that would override what
+`claustrum run` sets up (`--tools`, `--allowedTools`, `--mcp-config`, `--strict-mcp-config`,
+`--permission-mode`, `--dangerously-skip-permissions`, `--settings`, `--setting-sources`,
+`--add-dir`, `--plugin-dir`, `--system-prompt`, ...), in any configuration file. Use
+`[claude] tools` for built-in tools and the command line for the rest.
 
 ### The configuration is read-only inside the sandbox
 

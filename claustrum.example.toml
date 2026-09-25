@@ -3,6 +3,10 @@
 # Copy to `claustrum.toml` in your project (or to
 # ~/Library/Application Support/de.buschmanuel.claustrum/config.toml on macOS,
 # ~/.config/claustrum/config.toml on Linux). Every setting is optional.
+#
+# A project's claustrum.toml is only used after you trusted its content
+# (`claustrum trust`, or the prompt of `claustrum run`); every change asks
+# again. Files passed with --config and the user configuration need no trust.
 
 [sandbox]
 # Host directory mounted read/write at /workspace. Defaults to the current directory.
@@ -168,7 +172,9 @@ source = "syrusakbary/jq"
 # safe to keep because it runs on the API side.
 tools = []
 
-# Extra arguments always passed to claude.
+# Extra arguments always passed to claude. Flags that would override the
+# sandbox set up by `claustrum run` (--tools, --mcp-config, --settings,
+# --permission-mode, --dangerously-skip-permissions, ...) are refused.
 args = []
 
 # Text appended to the system prompt in addition to the sandbox notice.
