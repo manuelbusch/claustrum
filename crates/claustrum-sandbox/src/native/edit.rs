@@ -23,9 +23,12 @@ pub async fn edit(
     check_strings(old_string, new_string)?;
     let loc = locate(fs, path, cwd)?;
     super::ensure_writable(&loc)?;
-    let bytes = super::read_file(&*loc.fs, &loc.inner)
-        .await
-        .map_err(fs_err(&loc.guest))?;
+    let bytes = super::read_for_tool(
+        &loc,
+        super::MAX_TOOL_FILE_BYTES,
+        "edit it with Bash (`sed -i`, `python`)",
+    )
+    .await?;
     let text = String::from_utf8(bytes)
         .map_err(|_| Error::invalid_path(&loc.guest, "file is not valid UTF-8"))?;
     let (updated, out) = apply(&text, &loc.guest, old_string, new_string, replace_all)?;

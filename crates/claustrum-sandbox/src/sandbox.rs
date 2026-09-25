@@ -242,6 +242,7 @@ impl SandboxBuilder {
                 fs_protected.push(resolved);
             }
         }
+        self.runtime.max_memory_bytes = self.policy.max_memory_bytes;
         let base_runtime = build_runtime(&self.runtime)?;
 
         let mut packages = PackageSet::default();

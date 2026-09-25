@@ -285,7 +285,7 @@ writable = ["~/.cargo/registry"]
 
 | Section | Keys | Purpose |
 | --- | --- | --- |
-| `[sandbox]` | `workspace`, `timeout_secs`, `max_output_bytes`, `max_threads`, `confinement`, `deny_read`, `env` | resource limits, the second layer, guest environment |
+| `[sandbox]` | `workspace`, `timeout_secs`, `max_output_bytes`, `max_threads`, `max_memory_mb`, `confinement`, `deny_read`, `env` | resource limits, the second layer, guest environment |
 | `[network]` | `mode`, `allow`, `log` | what the guest and host actions may reach, see [Network](#network) |
 | `[packages]` | `dir`, `online`, `[[packages.package]]` (`file`, `source`, `id`) | which `.webc` files are loaded, see [Packages](#packages) |
 | `[[mounts]]` | `guest`, `host`, `writable` | additional host directories, read-only by default |

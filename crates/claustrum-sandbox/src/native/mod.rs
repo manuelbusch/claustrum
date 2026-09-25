@@ -98,16 +98,40 @@ pub(crate) fn fs_err(path: &str) -> impl FnOnce(virtual_fs::FsError) -> Error + 
     move |e| Error::fs(path, e)
 }
 
-/// Read a whole file from a virtual file system.
+/// Largest file `Read` and `Edit` load. Beyond it, Bash (`head`, `sed -n`,
+/// `python`) works on the file in pieces.
+pub const MAX_TOOL_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a whole file from a virtual file system, at most `max` bytes (the
+/// reported size is not trusted: special files report 0).
 pub async fn read_file(
     fs: &dyn FileSystem,
     path: &std::path::Path,
-) -> std::result::Result<Vec<u8>, virtual_fs::FsError> {
+    max: u64,
+) -> std::result::Result<Option<Vec<u8>>, virtual_fs::FsError> {
     use tokio::io::AsyncReadExt;
-    let mut f = fs.new_open_options().read(true).open(path)?;
-    let mut buf = Vec::with_capacity(f.size() as usize);
-    f.read_to_end(&mut buf).await?;
-    Ok(buf)
+    let f = fs.new_open_options().read(true).open(path)?;
+    let size = f.size();
+    if size > max {
+        return Ok(None);
+    }
+    let mut buf = Vec::with_capacity(size as usize);
+    f.take(max + 1).read_to_end(&mut buf).await?;
+    Ok((buf.len() as u64 <= max).then_some(buf))
+}
+
+/// [`read_file`] for a tool: a file above `max` is an error that says what
+/// to do instead.
+pub(crate) async fn read_for_tool(loc: &Located, max: u64, instead: &str) -> Result<Vec<u8>> {
+    read_file(&*loc.fs, &loc.inner, max)
+        .await
+        .map_err(fs_err(&loc.guest))?
+        .ok_or_else(|| {
+            Error::invalid_path(
+                &loc.guest,
+                format!("is larger than {} MiB; {instead}", max / (1024 * 1024)),
+            )
+        })
 }
 
 /// Create or truncate a file and write `data` to it.

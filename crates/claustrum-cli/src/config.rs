@@ -71,6 +71,9 @@ pub struct SandboxSection {
     /// Bytes retained per output stream.
     pub max_output_bytes: Option<usize>,
     pub max_threads: Option<u32>,
+    /// Largest memory one guest process may use, in MiB. 0 allows wasm32's
+    /// 4 GiB. Defaults to 1024.
+    pub max_memory_mb: Option<u64>,
     /// Extra environment variables for guest commands.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
@@ -629,6 +632,9 @@ impl Config {
         }
         if let Some(threads) = s.max_threads {
             policy.max_threads = Some(threads);
+        }
+        if let Some(mb) = s.max_memory_mb {
+            policy.max_memory_bytes = (mb > 0).then(|| mb * 1024 * 1024);
         }
         policy.confinement = self.confinement()?;
         Ok(policy)

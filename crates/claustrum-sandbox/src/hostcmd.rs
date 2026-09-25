@@ -127,6 +127,10 @@ pub trait HostCommand: Send + Sync + std::fmt::Debug + 'static {
 
 /// Exit code in a response header that asks the shim for stdin.
 const NEED_STDIN: i32 = -2;
+/// Bytes a guest may write to one host command channel (request plus
+/// stdin). Inputs are at most 64 KiB each; this only stops a guest from
+/// filling the host's memory through the channel.
+const MAX_CHANNEL_BYTES: usize = 16 * 1024 * 1024;
 
 /// Write the directory package (`wasmer.toml` + shim) that registers every
 /// host command as a guest executable. Returns the package directory.
@@ -367,7 +371,12 @@ impl ChannelFile {
                 let stdin = decode_stdin(&self.buf[self.request_len..]);
                 self.run(args, cwd, stdin)
             }
-            Phase::Done => unreachable!("response is set once done"),
+            // The response is set once done; answer rather than panic inside
+            // a WASI syscall if that ever changes.
+            Phase::Done => {
+                let out = HostOutput::fail(70, "host command: no response\n");
+                Arc::new(encode_response(&out))
+            }
         }
     }
 }
@@ -376,7 +385,7 @@ impl ChannelFile {
 fn decode_request(buf: &[u8]) -> Result<(Vec<String>, String, usize), String> {
     let mut pos = 0;
     let u32_at = |pos: &mut usize| -> Result<u32, String> {
-        let end = *pos + 4;
+        let end = pos.checked_add(4).ok_or("truncated")?;
         let b = buf.get(*pos..end).ok_or("truncated")?;
         *pos = end;
         Ok(u32::from_le_bytes(b.try_into().unwrap()))
@@ -388,7 +397,7 @@ fn decode_request(buf: &[u8]) -> Result<(Vec<String>, String, usize), String> {
     let mut args = Vec::with_capacity(argc);
     let string_at = |pos: &mut usize| -> Result<String, String> {
         let len = u32_at(pos)? as usize;
-        let end = *pos + len;
+        let end = pos.checked_add(len).ok_or("truncated")?;
         let b = buf.get(*pos..end).ok_or("truncated")?;
         *pos = end;
         Ok(String::from_utf8_lossy(b).into_owned())
@@ -430,6 +439,12 @@ impl AsyncWrite for ChannelFile {
             // New bytes after the "need stdin" answer start the stdin phase.
             Phase::Stdin => self.response = None,
             Phase::Request => {}
+        }
+        if self.buf.len().saturating_add(buf.len()) > MAX_CHANNEL_BYTES {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("host command request larger than {MAX_CHANNEL_BYTES} bytes"),
+            )));
         }
         self.buf.extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))

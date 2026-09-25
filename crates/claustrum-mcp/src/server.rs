@@ -161,9 +161,16 @@ impl ClaustrumServer {
         Parameters(p): Parameters<BashParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = p
-            .timeout
-            .map(|ms| Duration::from_millis(ms).min(MAX_BASH_TIMEOUT));
+        // Never without a limit, even when the policy has no default
+        // (`timeout_secs = 0`): a runaway command would hold its call and
+        // the guest's memory forever.
+        let timeout = Some(
+            p.timeout
+                .map(Duration::from_millis)
+                .or(self.sandbox.policy().default_timeout)
+                .unwrap_or(MAX_BASH_TIMEOUT)
+                .min(MAX_BASH_TIMEOUT),
+        );
         let options = ExecOptions {
             timeout,
             ..Default::default()

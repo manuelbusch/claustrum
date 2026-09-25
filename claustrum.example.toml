@@ -21,6 +21,14 @@ timeout_secs = 120
 # Bytes retained per output stream of a command.
 max_output_bytes = 1048576
 
+# Guest processes and threads per command, counted together (default 64).
+# max_threads = 64
+
+# Memory one guest process may grow to, in MiB (default 1024; 0 allows
+# wasm32's 4 GiB). Bash calls always end after at most 10 minutes, also
+# with timeout_secs = 0.
+# max_memory_mb = 1024
+
 # OS sandbox around the Wasmer worker and the host actions, the second layer
 # behind WASIX: "best-effort" (default; confine where supported, warn where
 # not), "required" (refuse to start without it) or "off" (single process,

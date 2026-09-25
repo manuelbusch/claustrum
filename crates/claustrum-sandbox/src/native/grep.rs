@@ -132,7 +132,7 @@ pub async fn grep(fs: &GuestFs, pattern: &str, cwd: &str, opts: GrepOptions) -> 
                 continue;
             }
         }
-        let Ok(bytes) = super::read_file(&*loc.fs, &f.inner).await else {
+        let Ok(Some(bytes)) = super::read_file(&*loc.fs, &f.inner, MAX_FILE_BYTES).await else {
             continue;
         };
         let guest = loc.to_guest(&f.inner);

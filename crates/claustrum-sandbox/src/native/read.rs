@@ -37,9 +37,12 @@ pub async fn read(fs: &GuestFs, path: &str, cwd: &str, opts: ReadOptions) -> Res
             "is a directory; use Bash `ls` or Glob",
         ));
     }
-    let bytes = super::read_file(&*loc.fs, &loc.inner)
-        .await
-        .map_err(fs_err(&loc.guest))?;
+    let bytes = super::read_for_tool(
+        &loc,
+        super::MAX_TOOL_FILE_BYTES,
+        "read parts of it with Bash (`sed -n 'A,Bp'`, `head`, `tail`)",
+    )
+    .await?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return Err(Error::invalid_path(
             &loc.guest,
@@ -52,7 +55,7 @@ pub async fn read(fs: &GuestFs, path: &str, cwd: &str, opts: ReadOptions) -> Res
 
     let start = opts.offset.unwrap_or(1).max(1);
     let limit = opts.limit.unwrap_or(DEFAULT_LIMIT).max(1);
-    let end = (start - 1 + limit).min(total_lines);
+    let end = (start - 1).saturating_add(limit).min(total_lines);
 
     let mut content = String::new();
     if start <= total_lines {

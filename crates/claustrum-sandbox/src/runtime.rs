@@ -6,7 +6,16 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use wasmer::{Engine, Module};
+use std::ptr::NonNull;
+
+use wasmer::{
+    Engine, MemoryError, MemoryStyle, MemoryType, Module, Pages, TableStyle, TableType,
+    WASM_PAGE_SIZE,
+    sys::{
+        BaseTunables, NativeEngineExt, Tunables,
+        vm::{VMMemory, VMMemoryDefinition, VMTable, VMTableDefinition},
+    },
+};
 use wasmer_types::ModuleHash;
 
 use wasmer_wasix::{
@@ -40,6 +49,9 @@ pub struct RuntimeConfig {
     /// Whether the Wasmer registry may be contacted to resolve packages that
     /// are not bundled. Off by default.
     pub online: bool,
+    /// Largest linear memory one guest instance may grow to. `None` leaves
+    /// wasm32's 4 GiB; set from [`Policy::max_memory_bytes`](crate::Policy).
+    pub max_memory_bytes: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -56,6 +68,7 @@ impl Default for RuntimeConfig {
             shared_modules: None,
             bundled_packages: Vec::new(),
             online: false,
+            max_memory_bytes: None,
         }
     }
 }
@@ -134,6 +147,83 @@ impl TtyBridge for NoTty {
     fn tty_set(&self, _state: WasiTtyState) {}
 }
 
+/// Caps the maximum of every linear memory the engine creates, so that one
+/// guest instance cannot grow to wasm32's 4 GiB. The memory style (and with
+/// it the compiled code and the module cache) stays that of
+/// [`BaseTunables`]; only the created memories get the lower maximum.
+struct LimitingTunables {
+    base: BaseTunables,
+    max_pages: Pages,
+}
+
+impl LimitingTunables {
+    fn limit(&self, ty: &MemoryType) -> std::result::Result<MemoryType, MemoryError> {
+        if ty.minimum > self.max_pages {
+            return Err(MemoryError::Generic(format!(
+                "the module needs {} MiB of memory at start, above the sandbox limit of {} MiB",
+                ty.minimum.bytes().0 / (1024 * 1024),
+                self.max_pages.bytes().0 / (1024 * 1024)
+            )));
+        }
+        let mut ty = *ty;
+        ty.maximum = Some(match ty.maximum {
+            Some(max) if max < self.max_pages => max,
+            _ => self.max_pages,
+        });
+        Ok(ty)
+    }
+}
+
+impl Tunables for LimitingTunables {
+    fn memory_style(&self, memory: &MemoryType) -> MemoryStyle {
+        self.base.memory_style(memory)
+    }
+
+    fn table_style(&self, table: &TableType) -> TableStyle {
+        self.base.table_style(table)
+    }
+
+    fn create_host_memory(
+        &self,
+        ty: &MemoryType,
+        style: &MemoryStyle,
+    ) -> std::result::Result<VMMemory, MemoryError> {
+        self.base.create_host_memory(&self.limit(ty)?, style)
+    }
+
+    unsafe fn create_vm_memory(
+        &self,
+        ty: &MemoryType,
+        style: &MemoryStyle,
+        vm_definition_location: NonNull<VMMemoryDefinition>,
+    ) -> std::result::Result<VMMemory, MemoryError> {
+        let ty = self.limit(ty)?;
+        // SAFETY: forwarded unchanged from the caller's contract.
+        unsafe {
+            self.base
+                .create_vm_memory(&ty, style, vm_definition_location)
+        }
+    }
+
+    fn create_host_table(
+        &self,
+        ty: &TableType,
+        style: &TableStyle,
+    ) -> std::result::Result<VMTable, String> {
+        self.base.create_host_table(ty, style)
+    }
+
+    unsafe fn create_vm_table(
+        &self,
+        ty: &TableType,
+        style: &TableStyle,
+        vm_definition_location: NonNull<VMTableDefinition>,
+    ) -> std::result::Result<VMTable, String> {
+        // SAFETY: forwarded unchanged from the caller's contract.
+        unsafe { self.base.create_vm_table(ty, style, vm_definition_location) }
+    }
+}
+
 /// A module cache that is only read; saving is a no-op.
 #[derive(Debug)]
 struct ReadOnlyCache<C>(C);
@@ -190,6 +280,14 @@ pub(crate) fn build_runtime(config: &RuntimeConfig) -> Result<Arc<dyn Runtime + 
     source.add_source(bundled);
 
     let mut runtime = PluggableRuntime::new(tasks.clone());
+    if let Some(max) = config.max_memory_bytes {
+        let mut engine = runtime.engine();
+        engine.set_tunables(LimitingTunables {
+            base: BaseTunables::new(),
+            max_pages: Pages((max / WASM_PAGE_SIZE as u64).clamp(1, 65_536) as u32),
+        });
+        runtime.set_engine(engine);
+    }
     if config.online
         && let Some(client) = runtime.http_client().cloned()
     {

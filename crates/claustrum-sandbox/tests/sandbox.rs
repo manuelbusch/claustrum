@@ -457,6 +457,77 @@ async fn native_tools_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn guest_memory_is_limited() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.policy(Policy {
+            default_timeout: Some(Duration::from_secs(60)),
+            max_memory_bytes: Some(256 * 1024 * 1024),
+            ..Policy::default()
+        })
+    })
+    .await
+    else {
+        return;
+    };
+    if !has_command(&sb, "python") {
+        return;
+    }
+    let out = sb
+        .bash(
+            "python -c 'b = bytearray(50 * 1024 * 1024); print(len(b))'",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(out.stdout_lossy().trim(), "52428800");
+    let out = sb
+        .bash(
+            "python -c 'b = bytearray(600 * 1024 * 1024); print(len(b))'",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!out.success(), "600 MiB fit into a 256 MiB limit");
+    assert!(
+        out.stderr_lossy().contains("MemoryError"),
+        "stderr: {}",
+        out.stderr_lossy()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_tools_refuse_huge_files() {
+    let ws = tempfile::tempdir().unwrap();
+    // Sparse, so the test does not write 65 MiB.
+    let big = std::fs::File::create(ws.path().join("big.log")).unwrap();
+    big.set_len(65 * 1024 * 1024).unwrap();
+    std::fs::write(ws.path().join("small.txt"), "a\nb\n").unwrap();
+    let Some(sb) = sandbox(ws.path()).await else {
+        return;
+    };
+    let err = sb
+        .read("big.log", ReadOptions::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("larger than 64 MiB"), "{err}");
+    let err = sb.edit("big.log", "x", "y", false).await.unwrap_err();
+    assert!(err.to_string().contains("larger than 64 MiB"), "{err}");
+    let out = sb
+        .read(
+            "small.txt",
+            ReadOptions {
+                offset: Some(2),
+                limit: Some(usize::MAX),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.content, "     2\tb\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn native_tools_reject_paths_outside_mounts() {
     let ws = tempfile::tempdir().unwrap();
     let Some(sb) = sandbox(ws.path()).await else {
@@ -1090,6 +1161,31 @@ async fn queued_action_honours_its_timeout() {
         "the queued call waited {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_command_channel_is_bounded() {
+    let ws = tempfile::tempdir().unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.actions(test_actions())).await else {
+        return;
+    };
+    // 32 MiB straight into the request channel, past the shim.
+    let out = sb
+        .bash(
+            "head -c 33554432 /dev/zero > /.claustrum/cmd/host; echo \"exit=$?\"",
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    let stdout = out.stdout_lossy();
+    assert!(
+        !stdout.contains("exit=0"),
+        "stdout: {stdout} stderr: {}",
+        out.stderr_lossy()
+    );
+    // The channel still works for well-formed requests.
+    let out = sb.bash("host echo", ExecOptions::default()).await.unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
 }
 
 #[tokio::test(flavor = "multi_thread")]

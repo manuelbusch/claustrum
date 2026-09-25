@@ -106,6 +106,9 @@ impl Confinement {
     }
 }
 
+/// Default for [`Policy::max_memory_bytes`]: 1 GiB per guest process.
+pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Resource limits and capabilities for guest processes.
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -114,8 +117,12 @@ pub struct Policy {
     pub max_output_bytes: usize,
     /// Default wall-clock timeout for a command. `None` means no limit.
     pub default_timeout: Option<Duration>,
-    /// Maximum number of guest threads per process.
+    /// Maximum number of guest tasks per command: WASIX counts processes
+    /// and threads of one command's process tree together.
     pub max_threads: Option<u32>,
+    /// Largest linear memory a guest process may grow to (bytes). `None`
+    /// allows wasm32's 4 GiB.
+    pub max_memory_bytes: Option<u64>,
     /// OS confinement of host actions.
     pub confinement: Confinement,
 }
@@ -127,6 +134,7 @@ impl Default for Policy {
             max_output_bytes: 1024 * 1024,
             default_timeout: Some(Duration::from_secs(120)),
             max_threads: Some(64),
+            max_memory_bytes: Some(DEFAULT_MAX_MEMORY_BYTES),
             confinement: Confinement::default(),
         }
     }
