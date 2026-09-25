@@ -187,8 +187,11 @@ impl FileSystem for ProtectedFs {
 
     fn create_symlink(&self, source: &Path, target: &Path) -> virtual_fs::Result<()> {
         // `target` is the new link. A link *to* a protected file is harmless:
-        // writes through it resolve to the protected path and are refused.
-        self.check_file(target)?;
+        // writes through it resolve to the protected path and are refused. A
+        // link in place of a missing directory above one (`.claude` for
+        // `.claude/settings.json`) would redirect the protected path to a
+        // file the guest can write.
+        self.check_tree(target)?;
         self.inner.create_symlink(source, target)
     }
 

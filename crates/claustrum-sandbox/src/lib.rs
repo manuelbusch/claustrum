@@ -15,6 +15,7 @@ pub mod hostcmd;
 pub mod native;
 pub mod net;
 mod packages;
+pub mod plans;
 mod policy;
 mod process;
 mod protect;

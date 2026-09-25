@@ -1,6 +1,10 @@
 //! `claustrum run`: launch Claude Code against the sandbox.
 
-use std::{os::unix::process::CommandExt, path::PathBuf, process::Command};
+use std::{
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result};
 use claustrum_sandbox::WORKSPACE;
@@ -9,6 +13,9 @@ use crate::config::Config;
 
 /// MCP server name; tools appear as `mcp__claustrum__<Tool>`.
 pub const SERVER_NAME: &str = "claustrum";
+
+/// Built-in tools kept for plan mode.
+const PLAN_TOOLS: &[&str] = &["EnterPlanMode", "ExitPlanMode"];
 
 #[derive(clap::Args, Debug)]
 #[command(trailing_var_arg = true)]
@@ -70,6 +77,14 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         .unwrap_or_else(|| which::which("claude").map_err(anyhow::Error::from))
         .context("cannot find the `claude` binary; pass --claude or set [claude].binary")?;
 
+    let plans = config.host_plans(&workspace).map(|p| p.dir().to_path_buf());
+    if let Some(dir) = &plans {
+        eprintln!(
+            "claustrum: plans: {} (written through WritePlan/EditPlan, this workspace's files only)",
+            dir.display()
+        );
+    }
+
     let this = std::env::current_exe().context("cannot determine own executable path")?;
     let mut serve_args = vec![
         "serve".to_owned(),
@@ -97,12 +112,21 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         }
     });
 
+    // Remove every built-in tool (unless configured otherwise); MCP tools are
+    // unaffected by --tools. The plan mode tools only switch the mode.
+    let mut tools = config.file.claude.tools.clone();
+    if plans.is_some() {
+        for t in PLAN_TOOLS {
+            if !tools.iter().any(|x| x == t) {
+                tools.push((*t).to_owned());
+            }
+        }
+    }
+
     let mut cmd = Command::new(&claude);
     cmd.current_dir(&workspace)
-        // Remove every built-in tool (unless configured otherwise); MCP tools
-        // are unaffected by --tools.
         .arg("--tools")
-        .arg(config.file.claude.tools.join(","))
+        .arg(tools.join(","))
         .arg("--strict-mcp-config")
         .arg("--mcp-config")
         .arg(mcp_config.to_string())
@@ -112,6 +136,7 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         .arg(system_prompt(
             &config,
             &network,
+            plans.as_deref(),
             config.file.claude.system_prompt.as_deref(),
         ));
     if let Some(mode) = &args.permission_mode {
@@ -133,6 +158,7 @@ pub fn run(config: Config, args: Args) -> Result<()> {
 fn system_prompt(
     config: &Config,
     network: &claustrum_sandbox::NetworkPolicy,
+    plans: Option<&Path>,
     extra: Option<&str>,
 ) -> String {
     let mut s = format!(
@@ -145,9 +171,20 @@ fn system_prompt(
          instructions list them); there is no git, no host toolchain and no \
          access to files outside the sandbox. If a needed command is missing, \
          say so instead of trying workarounds on the host. The sandbox configuration \
-         ({WORKSPACE}/claustrum.toml) is read-only for you: you can read it but not change, \
-         replace or delete it; if a setting there needs to change, ask the user. "
+         ({WORKSPACE}/claustrum.toml) and the Claude Code settings \
+         ({WORKSPACE}/.claude/settings.json and settings.local.json) are read-only for you: \
+         you can read them but not change, replace or delete them; if a setting there needs \
+         to change, ask the user. "
     );
+    if let Some(dir) = plans {
+        s.push_str(&format!(
+            "Plan mode names a plan file in {}, which is outside the sandbox. Write and edit \
+             it only with mcp__{SERVER_NAME}__WritePlan and mcp__{SERVER_NAME}__EditPlan, \
+             using the exact path plan mode gives you; plan mode refuses the regular Write, \
+             Edit and Bash tools, and Read cannot open the plan file. ",
+            dir.display()
+        ));
+    }
     s.push_str(&claustrum_sandbox::net::describe_for_model(
         network.mode,
         &network.allow,

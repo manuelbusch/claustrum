@@ -12,8 +12,12 @@ use claustrum_sandbox::{
     SandboxBuilder,
     action::{self, ActionExecutor, CompileContext},
     net::{NetMode, NetPolicy},
+    plans::{HostPlans, PlanStore},
 };
 use serde::Deserialize;
+
+/// Claude Code settings files in a project's `.claude` directory.
+pub const CLAUDE_SETTINGS: &[&str] = &["settings.json", "settings.local.json"];
 
 /// Packages installed by `claustrum pkg sync` when none are configured.
 pub const DEFAULT_PACKAGES: &[(&str, &str)] = &[
@@ -134,7 +138,7 @@ pub struct ActionsSection {
     pub list: Vec<ActionDef>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeSection {
     /// Path to the `claude` binary.
@@ -149,6 +153,26 @@ pub struct ClaudeSection {
     pub args: Vec<String>,
     /// Additional text appended to the system prompt.
     pub system_prompt: Option<String>,
+    /// Plan mode: keep `EnterPlanMode`/`ExitPlanMode` and give Claude a plan
+    /// directory of its own for this workspace. On by default.
+    #[serde(default = "default_true")]
+    pub plans: bool,
+}
+
+impl Default for ClaudeSection {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            tools: Vec::new(),
+            args: Vec::new(),
+            system_prompt: None,
+            plans: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Fully resolved configuration.
@@ -207,6 +231,47 @@ pub fn default_packages_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("packages"))
 }
 
+/// Per-user directory for logs and plans; `CLAUSTRUM_STATE_DIR` overrides it.
+fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CLAUSTRUM_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    project_dirs()
+        .map(|d| {
+            d.state_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| d.data_dir().to_path_buf())
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// File name stem that identifies a workspace in the state directory:
+/// `<directory name>-<hash of the path>`.
+fn workspace_key(workspace: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    workspace.hash(&mut h);
+    let name = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into());
+    format!("{name}-{:016x}", h.finish())
+}
+
+/// Claude Code's default plan directory (`plansDirectory` can only point
+/// inside the project, which the guest controls, so Claustrum keeps the
+/// default).
+pub fn claude_plans_dir() -> PathBuf {
+    claude_config_dir().join("plans")
+}
+
+/// Claude Code's configuration directory: sessions, credentials, plans.
+pub fn claude_config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand_home(Path::new("~/.claude")))
+}
+
 pub fn expand_home(p: &Path) -> PathBuf {
     if let Ok(rest) = p.strip_prefix("~")
         && let Some(home) = std::env::var_os("HOME")
@@ -247,8 +312,17 @@ impl Config {
     /// sandbox for the next run: the file in the workspace (where `claustrum
     /// run` is usually started), the default search paths and the file that
     /// was actually loaded.
+    ///
+    /// The Claude Code settings in the workspace are protected for the same
+    /// reason: Claude Code runs on the host, outside the sandbox, and executes
+    /// the hooks, status line and helper commands configured there.
     pub fn protected_paths(&self, workspace: &Path) -> Vec<PathBuf> {
         let mut paths = vec![workspace.join("claustrum.toml")];
+        paths.extend(
+            CLAUDE_SETTINGS
+                .iter()
+                .map(|f| workspace.join(".claude").join(f)),
+        );
         paths.extend(default_config_paths());
         paths.extend(self.path.clone());
         paths
@@ -380,22 +454,24 @@ impl Config {
                 p
             };
         }
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        workspace.hash(&mut h);
-        let name = workspace
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "root".into());
-        let base = project_dirs()
-            .map(|d| {
-                d.state_dir()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| d.data_dir().to_path_buf())
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("network")
-            .join(format!("{name}-{:016x}.jsonl", h.finish()))
+        state_dir()
+            .join("network")
+            .join(format!("{}.jsonl", workspace_key(workspace)))
+    }
+
+    /// Where Claude Code's plans for `workspace` are written, if plan mode
+    /// is enabled: Claude Code's own plan directory, with a ledger in the
+    /// user state directory of the files this workspace created there.
+    pub fn host_plans(&self, workspace: &Path) -> Option<HostPlans> {
+        if !self.file.claude.plans {
+            return None;
+        }
+        Some(HostPlans::new(
+            claude_plans_dir(),
+            state_dir()
+                .join("plans")
+                .join(format!("{}.list", workspace_key(workspace))),
+        ))
     }
 
     pub fn network_policy(&self, workspace: &Path) -> Result<NetworkPolicy> {
@@ -463,10 +539,14 @@ impl Config {
     /// Build the sandbox described by this configuration. With `executor`,
     /// host actions are forwarded to it (the broker) instead of being started
     /// from this process.
+    ///
+    /// Plan files are written through `plans` (the broker) or, without it,
+    /// directly to [`Config::host_plans`].
     pub async fn build_sandbox(
         &self,
         workspace: Option<&Path>,
         executor: Option<Arc<dyn ActionExecutor>>,
+        plans: Option<Arc<dyn PlanStore>>,
     ) -> Result<Sandbox> {
         let workspace = self.workspace(workspace)?;
         let mut builder: SandboxBuilder = Sandbox::builder()
@@ -509,6 +589,11 @@ impl Config {
             } else {
                 builder.mount(&m.guest, expand_home(&m.host))
             };
+        }
+        if let Some(host) = self.host_plans(&workspace) {
+            let dir = host.dir().to_string_lossy().into_owned();
+            let store = plans.unwrap_or_else(|| Arc::new(host));
+            builder = builder.plans(dir, store);
         }
         for p in self.protected_paths(&workspace) {
             builder = builder.protect(p);
@@ -652,6 +737,28 @@ writable = true
             assert!(err.to_string().contains(expected), "{text}: {err}");
         }
         assert!(toml::from_str::<FileConfig>("[network]\nallowed = []\n").is_err());
+    }
+
+    #[test]
+    fn plan_ledgers_are_per_workspace() {
+        let a = config("").host_plans(Path::new("/tmp/a/ws")).unwrap();
+        let b = config("").host_plans(Path::new("/tmp/b/ws")).unwrap();
+        assert_eq!(a.dir(), b.dir());
+        assert!(a.dir().ends_with("plans"));
+        assert_ne!(format!("{a:?}"), format!("{b:?}"));
+        assert!(
+            config("[claude]\nplans = false\n")
+                .host_plans(Path::new("/tmp/a/ws"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_settings_are_protected() {
+        let ws = Path::new("/tmp/ws");
+        let paths = config("").protected_paths(ws);
+        assert!(paths.contains(&ws.join(".claude/settings.json")));
+        assert!(paths.contains(&ws.join(".claude/settings.local.json")));
     }
 
     #[test]

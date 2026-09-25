@@ -45,7 +45,7 @@ pub async fn run(config: Config, args: Args) -> Result<()> {
 
 /// No OS confinement: everything in this process, as a single layer.
 async fn serve_in_process(config: Config, workspace: &Path) -> Result<()> {
-    let sandbox = config.build_sandbox(Some(workspace), None).await?;
+    let sandbox = config.build_sandbox(Some(workspace), None, None).await?;
     tracing::info!(
         workspace = %sandbox.workspace_dir().display(),
         commands = sandbox.commands().len(),
@@ -71,6 +71,7 @@ mod broker {
         RuntimeConfig,
         action::{ActionExecutor, ActionHost, remote},
         net::{ConnectionLog, NetMode, NetPolicy},
+        plans::PlanStore,
     };
 
     use crate::config::{Config, default_config_paths};
@@ -90,6 +91,9 @@ mod broker {
             .clone()
             .context("the network log path is not set")?;
 
+        let plans: Option<Arc<dyn PlanStore>> = config
+            .host_plans(workspace)
+            .map(|p| Arc::new(p) as Arc<dyn PlanStore>);
         let host: Option<Arc<ActionHost>> = if specs.is_empty() {
             None
         } else {
@@ -157,9 +161,10 @@ mod broker {
         drop(worker_end);
         tracing::info!(pid = child.id(), profile = %profile.name, "worker started");
 
-        let server = host.map(|host| {
+        let server = (host.is_some() || plans.is_some()).then(|| {
+            let executor = host.map(|h| h as Arc<dyn ActionExecutor>);
             std::thread::spawn(move || {
-                if let Err(e) = remote::serve(broker_end, host as Arc<dyn ActionExecutor>) {
+                if let Err(e) = remote::serve(broker_end, executor, plans) {
                     tracing::error!(error = %e, "stopped serving the worker");
                 }
             })
@@ -240,6 +245,9 @@ mod broker {
 
         p.deny_write = protected.to_vec();
         p.deny_read = confinement.deny_read;
+        // Also when CLAUDE_CONFIG_DIR moves it out of the built-in list; plan
+        // files go through the broker.
+        p.deny_read.push(crate::config::claude_config_dir());
         p.network = match config.network_mode()? {
             NetMode::Disabled if !config.file.packages.online => Network::None,
             NetMode::Host => Network::Any,
@@ -267,7 +275,7 @@ mod broker {
     }
 
     pub async fn worker(config: Config, args: WorkerArgs) -> Result<()> {
-        let executor: Option<Arc<dyn ActionExecutor>> = match std::env::var(BROKER_FD_ENV) {
+        let (executor, plans) = match std::env::var(BROKER_FD_ENV) {
             Ok(fd) => {
                 let fd: i32 = fd.parse().context("invalid broker descriptor")?;
                 // SAFETY: the broker opened this descriptor for us (see
@@ -276,11 +284,16 @@ mod broker {
                     use std::os::fd::FromRawFd as _;
                     UnixStream::from_raw_fd(fd)
                 };
-                if config.file.actions.list.is_empty() {
-                    None
-                } else {
-                    Some(remote::RemoteActions::new(stream)? as Arc<dyn ActionExecutor>)
-                }
+                let client = remote::BrokerClient::new(stream)?;
+                let actions = !config.file.actions.list.is_empty();
+                (
+                    actions.then(|| Arc::clone(&client) as Arc<dyn ActionExecutor>),
+                    config
+                        .file
+                        .claude
+                        .plans
+                        .then_some(client as Arc<dyn PlanStore>),
+                )
             }
             Err(_) => anyhow::bail!("__worker is started by `claustrum serve`, not directly"),
         };
@@ -290,7 +303,7 @@ mod broker {
             return Ok(());
         }
         let sandbox = config
-            .build_sandbox(Some(&args.workspace), executor)
+            .build_sandbox(Some(&args.workspace), executor, plans)
             .await?;
         tracing::info!(
             workspace = %sandbox.workspace_dir().display(),
@@ -323,6 +336,16 @@ mod broker {
                 .append(true)
                 .open(workspace.join("claustrum.toml"))
                 .is_ok(),
+        );
+        report(
+            "claude-settings-write",
+            std::fs::write(workspace.join(".claude/settings.json"), "{}").is_ok(),
+        );
+        let plans = crate::config::claude_plans_dir();
+        report("claude-plans-read", std::fs::read_dir(&plans).is_ok());
+        report(
+            "claude-plans-write",
+            std::fs::write(plans.join("claustrum-probe.md"), "x").is_ok(),
         );
         report(
             "home-write",

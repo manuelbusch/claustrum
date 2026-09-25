@@ -132,6 +132,10 @@ impl ClaustrumServer {
         if let Some(route) = action_route(&sandbox) {
             tool_router.add_route(route);
         }
+        if sandbox.plan_dir().is_none() {
+            tool_router.remove_route("WritePlan");
+            tool_router.remove_route("EditPlan");
+        }
         Self {
             sandbox,
             tool_router,
@@ -252,6 +256,57 @@ impl ClaustrumServer {
             match self
                 .sandbox
                 .edit(
+                    &p.file_path,
+                    &p.old_string,
+                    &p.new_string,
+                    p.replace_all.unwrap_or(false),
+                )
+                .await
+            {
+                Ok(out) => text(format::edit(&out)),
+                Err(e) => tool_error(e),
+            },
+        )
+    }
+
+    // Plan mode refuses every tool that is not marked read-only, the regular
+    // Write and Edit included. These two cannot touch the project, only the
+    // plan directory, which is what plan mode allows the built-in tools too.
+    #[tool(
+        name = "WritePlan",
+        description = "Plan mode: create or overwrite the plan file. Takes the same parameters as Write; `file_path` must be the plan file path that plan mode gives you (a Markdown file in the plan directory). Works in every mode but writes nothing else.",
+        annotations(
+            title = "Write plan",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn write_plan(
+        &self,
+        Parameters(p): Parameters<WriteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(
+            match self.sandbox.write_plan(&p.file_path, &p.content).await {
+                Ok(out) => text(format::write(&out)),
+                Err(e) => tool_error(e),
+            },
+        )
+    }
+
+    #[tool(
+        name = "EditPlan",
+        description = "Plan mode: replace an exact string in the plan file. Takes the same parameters as Edit; `file_path` must be the plan file path that plan mode gives you.",
+        annotations(title = "Edit plan", read_only_hint = true, destructive_hint = false)
+    )]
+    async fn edit_plan(
+        &self,
+        Parameters(p): Parameters<EditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(
+            match self
+                .sandbox
+                .edit_plan(
                     &p.file_path,
                     &p.old_string,
                     &p.new_string,

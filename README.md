@@ -107,6 +107,10 @@ Rust on top of the same virtual file system, so they are fast and never spawn a 
 | `Glob` | `pattern`, `path` | native, newest first, skips `.git`, `node_modules`, `target` |
 | `Grep` | `pattern`, `path`, `glob`, `output_mode`, `-i`, `-C`, `head_limit` | native, ripgrep engine |
 | `Action` | `name`, `inputs` | only when [host actions](#host-actions) are configured |
+| `WritePlan`, `EditPlan` | as `Write` and `Edit` | plan files only, see [Plan mode](#plan-mode) |
+
+`EnterPlanMode` and `ExitPlanMode` stay enabled as the only built-in tools; they switch the
+mode and touch nothing.
 
 ### Sandbox layout
 
@@ -114,6 +118,7 @@ Rust on top of the same virtual file system, so they are fast and never spawn a 
 | --- | --- | --- |
 | `/workspace` | host project directory | read/write; the working directory |
 | `/workspace/claustrum.toml` | host file | read-only, see [Configuration](#configuration) |
+| `/workspace/.claude/settings.json`, `settings.local.json` | host files | read-only: Claude Code runs their hooks on the host |
 | `/tmp`, `/home/claude` | in memory | persist for the lifetime of the server |
 | `/bin`, `/usr/bin` | package commands | populated from the loaded `.webc` files |
 | `/etc/claustrum/profile.sh` | in memory | sourced by every bash via `BASH_ENV` |
@@ -164,7 +169,7 @@ unconfined **broker** and a confined **worker**:
 | Process | May read | May write | May execute | Network |
 | --- | --- | --- | --- | --- |
 | **worker** | its binary, packages, configuration, read-only extra mounts | workspace, writable extra mounts, module cache, network log, private temp dir | nothing | none, or outbound only if the mode requires it |
-| **broker** | everything (unconfined) | everything (unconfined) | actions only, each in its own profile | proxy on `127.0.0.1` |
+| **broker** | everything (unconfined) | everything (unconfined); for the worker only this workspace's plan files | actions only, each in its own profile | proxy on `127.0.0.1` |
 | **action** | everything except credential stores and `deny_read` | workspace, fresh `$TMPDIR`, `writable` list | anything | `localhost:<proxy port>` only (`host` mode: unrestricted) |
 
 Credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser profiles, `~/.claude`,
@@ -238,6 +243,7 @@ claustrum run --permission-mode acceptEdits -- -p "Add a README for this project
 | `claustrum pkg list` / `pkg commands` | Show installed packages and the commands they provide |
 | `claustrum pkg precompile` | Compile all packages into the module cache ahead of time |
 | `claustrum network report [--workspace DIR] [--all]` | Summarise refused connections and suggest `allow` entries |
+| `claustrum plans [--workspace DIR]` | List the plan files Claude wrote for a workspace |
 
 Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (or
 `CLAUSTRUM_PACKAGES_DIR`). Logging goes to stderr and is controlled by `CLAUSTRUM_LOG`
@@ -277,7 +283,7 @@ writable = ["~/.cargo/registry"]
 | `[packages]` | `dir`, `online`, `[[packages.package]]` (`file`, `source`, `id`) | which `.webc` files are loaded, see [Packages](#packages) |
 | `[[mounts]]` | `guest`, `host`, `writable` | additional host directories, read-only by default |
 | `[actions]` | `command`, `[[actions.action]]` | fixed host commands Claude may trigger, see [Host actions](#host-actions) |
-| `[claude]` | `binary`, `tools`, `args`, `system_prompt` | how `claude` is launched |
+| `[claude]` | `binary`, `tools`, `args`, `system_prompt`, `plans` | how `claude` is launched, [plan mode](#plan-mode) |
 
 [`claustrum.example.toml`](claustrum.example.toml) documents every key.
 
@@ -290,6 +296,33 @@ truncating, creating, deleting, renaming or replacing them is refused, as is ren
 removing a directory that contains one. The check runs on the host below every tool, follows
 symlinks and hard links, and compares names case-insensitively on macOS. Change the
 configuration from outside the sandbox.
+
+The same holds for Claude Code's own project settings, `.claude/settings.json` and
+`.claude/settings.local.json`. Claude Code runs on the host, outside the sandbox, and executes
+the hooks, status line and helper commands configured there. The guest can neither create
+those files nor turn `.claude` into a link. Other files in `.claude` (agents, commands,
+skills) stay writable. Their shell snippets only run through the built-in Bash tool, which
+Claustrum removes.
+
+### Plan mode
+
+`claustrum run --permission-mode plan` (or Shift+Tab in the session) works as usual. Claude
+Code names a plan file in its own plan directory, `~/.claude/plans/<slug>.md`, and in plan
+mode refuses every tool that is not marked read-only, so Claustrum's `Write`, `Edit` and
+`Bash` too. Claude writes the plan with `WritePlan` and `EditPlan` instead:
+
+- They take the plan file path and nothing else: a `<slug>.md` directly in the plan
+  directory.
+- The broker writes the file, never following a link. It only touches files that this
+  workspace created, recorded in a ledger in the user state directory. Plans of other
+  projects can be neither read nor changed.
+- The plan directory is not mounted in the guest, and the confined worker may not read
+  `~/.claude` at all.
+
+Claude Code accepts a custom `plansDirectory` only inside the project, where the guest could
+tamper with what Claude Code later reads and writes on the host, so Claustrum keeps the
+default. `claustrum plans` lists a workspace's plans; `[claude] plans = false` removes the
+plan tools and the plan mode tools.
 
 ## Network
 

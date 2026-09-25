@@ -3,11 +3,12 @@
 //! Requires `packages/bash.webc` and `packages/coreutils.webc` in the repo
 //! root (see README, "Packages"). Tests are skipped when they are missing.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use claustrum_sandbox::{
     ExecOptions, ExitReason, Policy, Sandbox, SandboxBuilder,
     native::{GrepMode, GrepOptions, ReadOptions},
+    plans::HostPlans,
 };
 
 fn packages_dir() -> PathBuf {
@@ -579,6 +580,120 @@ async fn read_only_mounts_refuse_writes() {
         std::fs::read_to_string(rw.path().join("written.txt")).unwrap(),
         "w\n"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plans_are_written_outside_the_guest() {
+    let ws = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("plans");
+    let store = Arc::new(HostPlans::new(&dir, home.path().join("ws.list")));
+    let guest = dir.to_str().unwrap().to_owned();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.plans(&guest, store)).await else {
+        return;
+    };
+    assert_eq!(sb.plan_dir(), Some(guest.as_str()));
+
+    let out = sb
+        .write_plan(&format!("{guest}/bubbly-plan.md"), "# Plan\none\n")
+        .await
+        .unwrap();
+    assert!(out.created);
+    sb.edit_plan(&format!("{guest}/bubbly-plan.md"), "one", "two", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("bubbly-plan.md")).unwrap(),
+        "# Plan\ntwo\n"
+    );
+
+    for bad in [
+        "/workspace/plan.md".to_owned(),
+        format!("{guest}/../escape.md"),
+        format!("{guest}/sub/plan.md"),
+        format!("{guest}/plan.txt"),
+        "plan.md".to_owned(),
+    ] {
+        let err = sb.write_plan(&bad, "x").await.unwrap_err();
+        assert!(err.to_string().contains("plan file path"), "{bad}: {err}");
+    }
+    assert!(!ws.path().join("plan.md").exists());
+    assert!(!home.path().join("escape.md").exists());
+
+    // The plan directory is not part of the guest file system.
+    assert!(
+        sb.read(&format!("{guest}/bubbly-plan.md"), ReadOptions::default())
+            .await
+            .is_err()
+    );
+    assert!(sb.write(&format!("{guest}/other.md"), "x").await.is_err());
+    let out = sb
+        .bash(
+            &format!("cat '{guest}/bubbly-plan.md'"),
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!out.success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_settings_cannot_be_planted() {
+    let ws = tempfile::tempdir().unwrap();
+    let settings = ws.path().join(".claude/settings.json");
+    let local = ws.path().join(".claude/settings.local.json");
+    std::fs::write(ws.path().join("hooks.json"), "{\"hooks\": {}}\n").unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.protect(&settings).protect(&local)).await else {
+        return;
+    };
+    let allowed = allowed_attempts(
+        &sb,
+        &[
+            "mkdir -p .claude && cp hooks.json .claude/settings.json",
+            "cp hooks.json .claude/settings.local.json",
+            "rm -rf .claude",
+            "mv .claude gone",
+            "ln -s fake .claude.new && mv .claude.new .claude",
+        ],
+    )
+    .await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+    let err = sb
+        .write(".claude/settings.json", "{\"hooks\": {}}\n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+    assert!(!settings.exists() && !local.exists());
+    let meta = std::fs::symlink_metadata(ws.path().join(".claude")).unwrap();
+    assert!(meta.is_dir(), ".claude was replaced");
+
+    // Other files in .claude stay writable.
+    sb.write(".claude/agents/reviewer.md", "---\nname: reviewer\n---\n")
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_directory_cannot_become_a_link() {
+    let ws = tempfile::tempdir().unwrap();
+    let settings = ws.path().join(".claude/settings.json");
+    let Some(sb) = sandbox_with(ws.path(), |b| b.protect(&settings)).await else {
+        return;
+    };
+    let allowed = allowed_attempts(
+        &sb,
+        &[
+            "mkdir fake && echo {} > fake/settings.json && ln -s fake .claude",
+            // `mv` falls back to copying and may leave an empty `.claude`.
+            "mv fake .claude",
+        ],
+    )
+    .await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+    if let Ok(meta) = std::fs::symlink_metadata(ws.path().join(".claude")) {
+        assert!(meta.is_dir(), ".claude is a link");
+    }
+    assert!(!settings.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

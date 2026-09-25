@@ -6,7 +6,7 @@ use crate::{Error, Result, fs::GuestFs};
 
 use super::{fs_err, locate};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WriteOutput {
     pub path: String,
     pub created: bool,

@@ -15,7 +15,9 @@ use crate::{
     Result, RuntimeConfig, WORKSPACE,
     action::{self, ActionDef, ActionExecutor, ActionHost, ActionSet, ActionSpec, CompileContext},
     fs::{self, GuestFs, Mount},
-    hostcmd, native, process,
+    hostcmd, native,
+    plans::PlanStore,
+    process,
     runtime::build_runtime,
 };
 
@@ -51,6 +53,7 @@ pub struct SandboxBuilder {
     runtime: RuntimeConfig,
     env: BTreeMap<String, String>,
     extra_mounts: Vec<ExtraMount>,
+    plans: Option<(String, Arc<dyn PlanStore>)>,
     protected: Vec<PathBuf>,
     host_commands: Vec<Arc<dyn HostCommand>>,
     actions: Vec<ActionDef>,
@@ -75,6 +78,7 @@ impl Default for SandboxBuilder {
             runtime: RuntimeConfig::default(),
             env,
             extra_mounts: Vec::new(),
+            plans: None,
             protected: Vec::new(),
             host_commands: Vec::new(),
             actions: Vec::new(),
@@ -143,6 +147,15 @@ impl SandboxBuilder {
             host: host.into(),
             writable: true,
         });
+        self
+    }
+
+    /// Claude Code's plan directory: `dir` is its host path as Claude Code
+    /// names it, `store` writes the files (see [`crate::plans`]). Nothing is
+    /// mounted; [`Sandbox::write_plan`] and [`Sandbox::edit_plan`] accept
+    /// paths of plan files in `dir`.
+    pub fn plans(mut self, dir: impl Into<String>, store: Arc<dyn PlanStore>) -> Self {
+        self.plans = Some((dir.into(), store));
         self
     }
 
@@ -363,6 +376,7 @@ impl SandboxBuilder {
                 workspace_dir,
                 protected,
                 cwd: Mutex::new(WORKSPACE.to_owned()),
+                plans: self.plans,
                 host_commands: self.host_commands,
                 actions,
                 net_policy,
@@ -388,6 +402,7 @@ struct Inner {
     workspace_dir: PathBuf,
     protected: Vec<PathBuf>,
     cwd: Mutex<String>,
+    plans: Option<(String, Arc<dyn PlanStore>)>,
     host_commands: Vec<Arc<dyn HostCommand>>,
     actions: Option<Arc<ActionSet>>,
     net_policy: Arc<NetPolicy>,
@@ -581,6 +596,57 @@ impl Sandbox {
 impl Sandbox {
     pub async fn read(&self, path: &str, opts: native::ReadOptions) -> Result<native::ReadOutput> {
         native::read(self.guest_fs(), path, &self.cwd(), opts).await
+    }
+
+    /// Claude Code's plan directory, if plan files can be written.
+    pub fn plan_dir(&self) -> Option<&str> {
+        self.inner.plans.as_ref().map(|(dir, _)| dir.as_str())
+    }
+
+    /// Create or overwrite a plan file (`path` in [`plan_dir`](Self::plan_dir)).
+    pub async fn write_plan(&self, path: &str, content: &str) -> Result<native::WriteOutput> {
+        let (name, store) = self.plan_target(path)?;
+        let content = content.to_owned();
+        tokio::task::spawn_blocking(move || store.write(&name, &content))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
+            .map_err(Error::Other)
+    }
+
+    /// Edit a plan file like [`edit`](Self::edit).
+    pub async fn edit_plan(
+        &self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+    ) -> Result<native::EditOutput> {
+        let (name, store) = self.plan_target(path)?;
+        let (old, new) = (old_string.to_owned(), new_string.to_owned());
+        tokio::task::spawn_blocking(move || store.edit(&name, &old, &new, replace_all))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
+            .map_err(Error::Other)
+    }
+
+    /// The file name of the plan at `path`, which must name a file directly
+    /// in the plan directory.
+    fn plan_target(&self, path: &str) -> Result<(String, Arc<dyn PlanStore>)> {
+        let Some((dir, store)) = &self.inner.plans else {
+            return Err(Error::invalid_path(path, "plan mode is not enabled"));
+        };
+        let file = Path::new(path);
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| file.parent() == Some(Path::new(dir)) && crate::plans::is_plan_name(n))
+            .ok_or_else(|| {
+                Error::invalid_path(
+                    path,
+                    format!("use the plan file path plan mode gives you, a Markdown file in {dir}"),
+                )
+            })?;
+        Ok((name.to_owned(), Arc::clone(store)))
     }
 
     pub async fn write(&self, path: &str, content: &str) -> Result<native::WriteOutput> {

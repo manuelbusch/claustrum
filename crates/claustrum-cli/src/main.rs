@@ -35,6 +35,8 @@ enum Command {
     /// Inspect network decisions and build the allowlist.
     #[command(subcommand)]
     Network(commands::network::Command),
+    /// List the plans Claude wrote for this workspace.
+    Plans(commands::plans::Args),
     /// Internal: the confined half of `serve`, started by it.
     #[cfg(unix)]
     #[command(name = "__worker", hide = true)]
@@ -71,6 +73,7 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => runtime()?.block_on(commands::serve::run(config, args)),
         Command::Pkg(cmd) => runtime()?.block_on(commands::pkg::run(config, cmd)),
         Command::Network(cmd) => commands::network::run(config, cmd),
+        Command::Plans(args) => commands::plans::run(config, args),
         #[cfg(unix)]
         Command::Worker(args) => runtime()?.block_on(commands::serve::worker(config, args)),
     }

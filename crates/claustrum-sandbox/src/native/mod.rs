@@ -13,6 +13,7 @@ mod read;
 mod walk;
 mod write;
 
+pub(crate) use edit::apply as apply_edit;
 pub use edit::{EditOutput, edit};
 pub use glob::{GlobOutput, glob};
 pub use grep::{GrepMatch, GrepMode, GrepOptions, GrepOutput, grep};

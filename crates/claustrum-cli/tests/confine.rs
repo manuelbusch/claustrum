@@ -8,7 +8,12 @@ use std::process::{Command, Stdio};
 #[test]
 fn worker_escape_is_contained() {
     let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let claude = tempfile::tempdir().unwrap();
+    std::fs::create_dir(claude.path().join("plans")).unwrap();
+    std::fs::write(claude.path().join("plans/other.md"), "theirs\n").unwrap();
     std::fs::write(ws.path().join("claustrum.toml"), "# original\n").unwrap();
+    std::fs::create_dir(ws.path().join(".claude")).unwrap();
     let home = std::env::var_os("HOME").unwrap();
     let escape = std::path::Path::new(&home).join(".claustrum-escape");
     let _ = std::fs::remove_file(&escape);
@@ -17,6 +22,8 @@ fn worker_escape_is_contained() {
         .arg("serve")
         .current_dir(ws.path())
         .env("CLAUSTRUM_ESCAPE_PROBE", "1")
+        .env("CLAUSTRUM_STATE_DIR", state.path())
+        .env("CLAUDE_CONFIG_DIR", claude.path())
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -31,11 +38,18 @@ fn worker_escape_is_contained() {
         stderr.contains("probe workspace-write: ALLOWED"),
         "{stderr}"
     );
-    let mut denied = vec!["home-write", "ssh-read", "exec", "network"];
+    let mut denied = vec![
+        "claude-plans-read",
+        "claude-plans-write",
+        "home-write",
+        "ssh-read",
+        "exec",
+        "network",
+    ];
     // Landlock alone cannot keep a file read-only inside the writable
     // workspace; that needs bubblewrap (or the WASIX layer's own check).
     if backend != claustrum_confine::Backend::Landlock {
-        denied.push("config-write");
+        denied.extend(["config-write", "claude-settings-write"]);
     }
     for what in denied {
         assert!(
@@ -44,6 +58,8 @@ fn worker_escape_is_contained() {
         );
     }
     assert!(!escape.exists());
+    assert!(!ws.path().join(".claude/settings.json").exists());
+    assert!(!claude.path().join("plans/claustrum-probe.md").exists());
     assert_eq!(
         std::fs::read_to_string(ws.path().join("claustrum.toml")).unwrap(),
         "# original\n"
@@ -62,6 +78,7 @@ fn confinement_off_runs_in_process() {
         .arg("serve")
         .current_dir(ws.path())
         .env("CLAUSTRUM_ESCAPE_PROBE", "1")
+        .env("CLAUSTRUM_STATE_DIR", ws.path().join("state"))
         .stdin(Stdio::null())
         .output()
         .unwrap();

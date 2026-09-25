@@ -173,3 +173,8 @@ args = []
 
 # Text appended to the system prompt in addition to the sandbox notice.
 # system_prompt = "Always run the test suite before finishing."
+
+# Plan mode: keep EnterPlanMode/ExitPlanMode and add the WritePlan/EditPlan
+# tools, which write only this workspace's plan files in ~/.claude/plans
+# (through the broker; the directory is not mounted in the sandbox).
+plans = true
