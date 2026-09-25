@@ -65,9 +65,19 @@ pub(crate) fn locate(fs: &GuestFs, path: &str, cwd: &str) -> Result<Located> {
     })
 }
 
-/// Refuse early, with a clear message, to change a protected file (the
-/// mount would refuse anyway, but only with "permission denied").
+/// Refuse early, with a clear message, to change a file on a read-only mount
+/// or a protected file (the mount would refuse anyway, but only with
+/// "permission denied").
 pub(crate) fn ensure_writable(loc: &Located) -> Result<()> {
+    if crate::fs::is_read_only(&*loc.fs) {
+        return Err(Error::invalid_path(
+            &loc.guest,
+            format!(
+                "the mount {} is read-only; ask the user to make it writable",
+                loc.mount
+            ),
+        ));
+    }
     if crate::fs::is_protected(&*loc.fs, &loc.inner) {
         return Err(Error::invalid_path(
             &loc.guest,

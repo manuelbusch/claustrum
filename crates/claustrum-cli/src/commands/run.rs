@@ -152,6 +152,25 @@ fn system_prompt(
         network.mode,
         &network.allow,
     ));
+    let mounts = &config.file.mounts;
+    if !mounts.is_empty() {
+        s.push_str(&format!(
+            " Additional directories are mounted at: {}.",
+            mounts
+                .iter()
+                .map(|m| format!(
+                    "{} ({})",
+                    m.guest,
+                    if m.writable {
+                        "read/write"
+                    } else {
+                        "read-only"
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let actions = &config.file.actions.list;
     if !actions.is_empty() {
         let command = config.action_command();

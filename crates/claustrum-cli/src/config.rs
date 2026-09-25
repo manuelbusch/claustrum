@@ -119,6 +119,9 @@ pub struct PackageEntry {
 pub struct MountEntry {
     pub guest: String,
     pub host: PathBuf,
+    /// Whether the guest may change the directory. Read-only by default.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// Host actions the guest may trigger; see `claustrum_sandbox::action`.
@@ -501,7 +504,11 @@ impl Config {
             builder = builder.env(k, v);
         }
         for m in &self.file.mounts {
-            builder = builder.mount(&m.guest, expand_home(&m.host));
+            builder = if m.writable {
+                builder.mount_writable(&m.guest, expand_home(&m.host))
+            } else {
+                builder.mount(&m.guest, expand_home(&m.host))
+            };
         }
         for p in self.protected_paths(&workspace) {
             builder = builder.protect(p);
@@ -567,6 +574,25 @@ pattern = "[a-z]+"
         let err = toml::from_str::<FileConfig>("[[actions.action]]\nname = \"x\"\nshell = true\n")
             .unwrap_err();
         assert!(err.to_string().contains("shell"), "{err}");
+    }
+
+    #[test]
+    fn mounts_are_read_only_by_default() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+[[mounts]]
+guest = "/data"
+host = "/srv/data"
+
+[[mounts]]
+guest = "/out"
+host = "/srv/out"
+writable = true
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.mounts[0].writable);
+        assert!(cfg.mounts[1].writable);
     }
 
     fn config(text: &str) -> Config {

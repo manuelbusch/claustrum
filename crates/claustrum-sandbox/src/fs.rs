@@ -1,8 +1,9 @@
 //! Guest file system: mounts and path handling.
 //!
 //! The guest sees a small in-memory root (`/bin`, `/tmp`, ...) with the host
-//! project directory mounted read/write at [`WORKSPACE`]. Native tools
-//! address files by guest path and are routed to the correct mount here.
+//! project directory mounted read/write at [`WORKSPACE`] and any extra host
+//! directories, read-only unless declared writable. Native tools address
+//! files by guest path and are routed to the correct mount here.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -149,6 +150,19 @@ pub(crate) fn is_protected(fs: &(dyn FileSystem + Send + Sync), inner: &Path) ->
     let fs: &dyn FileSystem = fs;
     fs.downcast_ref::<crate::protect::ProtectedFs>()
         .is_some_and(|p| p.is_protected(inner))
+}
+
+/// Make a mount read-only for the guest.
+pub(crate) fn read_only(
+    fs: Arc<dyn FileSystem + Send + Sync>,
+) -> Arc<dyn FileSystem + Send + Sync> {
+    Arc::new(crate::protect::ReadOnlyFs::new(fs))
+}
+
+/// Whether the mount `fs` is read-only as a whole.
+pub(crate) fn is_read_only(fs: &(dyn FileSystem + Send + Sync)) -> bool {
+    let fs: &dyn FileSystem = fs;
+    fs.downcast_ref::<crate::protect::ReadOnlyFs>().is_some()
 }
 
 /// Create an empty in-memory file system.

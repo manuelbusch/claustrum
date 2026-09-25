@@ -33,6 +33,14 @@ jq() { command jq -M "$@"; }
 ls() { command ls --color=never "$@"; }
 "#;
 
+/// An additional host directory mounted into the guest.
+#[derive(Debug)]
+struct ExtraMount {
+    guest: String,
+    host: PathBuf,
+    writable: bool,
+}
+
 /// Builder for a [`Sandbox`].
 #[derive(Debug)]
 pub struct SandboxBuilder {
@@ -42,7 +50,7 @@ pub struct SandboxBuilder {
     policy: Policy,
     runtime: RuntimeConfig,
     env: BTreeMap<String, String>,
-    extra_mounts: Vec<(String, PathBuf)>,
+    extra_mounts: Vec<ExtraMount>,
     protected: Vec<PathBuf>,
     host_commands: Vec<Arc<dyn HostCommand>>,
     actions: Vec<ActionDef>,
@@ -118,9 +126,23 @@ impl SandboxBuilder {
         self
     }
 
-    /// Mount an additional host directory at an absolute guest path.
+    /// Mount an additional host directory read-only at an absolute guest path.
     pub fn mount(mut self, guest: impl Into<String>, host: impl Into<PathBuf>) -> Self {
-        self.extra_mounts.push((guest.into(), host.into()));
+        self.extra_mounts.push(ExtraMount {
+            guest: guest.into(),
+            host: host.into(),
+            writable: false,
+        });
+        self
+    }
+
+    /// Mount an additional host directory read/write at an absolute guest path.
+    pub fn mount_writable(mut self, guest: impl Into<String>, host: impl Into<PathBuf>) -> Self {
+        self.extra_mounts.push(ExtraMount {
+            guest: guest.into(),
+            host: host.into(),
+            writable: true,
+        });
         self
     }
 
@@ -302,13 +324,21 @@ impl SandboxBuilder {
                 fs: etc,
             },
         ];
-        for (guest, host) in &self.extra_mounts {
-            if !guest.starts_with('/') {
-                return Err(Error::invalid_path(guest, "mount paths must be absolute"));
+        for m in &self.extra_mounts {
+            if !m.guest.starts_with('/') {
+                return Err(Error::invalid_path(
+                    &m.guest,
+                    "mount paths must be absolute",
+                ));
             }
+            let host = fs::host_dir(handle.clone(), &m.host, &fs_protected)?;
             mounts.push(Mount {
-                guest: guest.clone(),
-                fs: fs::host_dir(handle.clone(), host, &fs_protected)?,
+                guest: m.guest.clone(),
+                fs: if m.writable {
+                    host
+                } else {
+                    fs::read_only(host)
+                },
             });
         }
 

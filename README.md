@@ -71,8 +71,9 @@ claude ──stdio/MCP──▶ worker: Wasmer + tools            [OS profile: w
 ```
 
 - The **worker** hosts the Wasmer runtime and serves MCP on the inherited stdio. It may
-  read its binary, the packages and the configuration, write the workspace, extra mounts,
-  the module cache, the network log and a private temporary directory, and nothing else.
+  read its binary, the packages, the configuration and read-only extra mounts, write the
+  workspace, writable extra mounts, the module cache, the network log and a private
+  temporary directory, and nothing else.
   It cannot start programs. It has no network access unless the network mode or online
   package loading needs it. The configuration files and their directories stay
   read-only, and credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser
@@ -173,7 +174,8 @@ Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (o
 Claustrum looks for `claustrum.toml` in the current directory, then for `config.toml` in the
 user configuration directory. See [`claustrum.example.toml`](claustrum.example.toml) for all
 options: workspace, network access, timeouts, packages, extra mounts, and which built-in
-Claude tools (if any) to keep.
+Claude tools (if any) to keep. Extra mounts (`[[mounts]]`) are read-only for the guest
+unless they set `writable = true`.
 
 Inside the sandbox every configuration file Claustrum could load is read-only:
 `claustrum.toml` in the workspace (even when it does not exist yet), the default search

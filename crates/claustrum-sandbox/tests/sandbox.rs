@@ -393,7 +393,7 @@ async fn config_file_is_read_only() {
     std::os::unix::fs::symlink("claustrum.toml", ws.path().join("hostlink")).unwrap();
     let Some(sb) = sandbox_with(ws.path(), |b| {
         b.protect(ws.path().join("claustrum.toml"))
-            .mount("/alt", ws.path())
+            .mount_writable("/alt", ws.path())
     })
     .await
     else {
@@ -471,6 +471,113 @@ async fn config_file_is_read_only() {
     assert_eq!(
         std::fs::read_to_string(ws.path().join("d/notes.txt")).unwrap(),
         "notes\nmore\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_mounts_refuse_writes() {
+    let ws = tempfile::tempdir().unwrap();
+    let ro = tempfile::tempdir().unwrap();
+    let rw = tempfile::tempdir().unwrap();
+    for dir in [ro.path(), rw.path()] {
+        std::fs::write(dir.join("data.txt"), "data\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "other\n").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+    }
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.mount("/ro", ro.path()).mount_writable("/rw", rw.path())
+    })
+    .await
+    else {
+        return;
+    };
+
+    // Reading works through Bash and the native tools.
+    let out = sb
+        .bash("cat /ro/data.txt && ls /ro", ExecOptions::default())
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert_eq!(out.stdout_lossy(), "data\ndata.txt\nother.txt\nsub\n");
+    let read = sb
+        .read("/ro/data.txt", ReadOptions::default())
+        .await
+        .unwrap();
+    assert!(read.content.contains("data"));
+    assert_eq!(
+        sb.glob("d*.txt", Some("/ro")).unwrap().paths,
+        vec!["/ro/data.txt"]
+    );
+    let gr = sb
+        .grep(
+            "data",
+            GrepOptions {
+                path: Some("/ro".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(gr.files, vec!["/ro/data.txt"]);
+
+    let attempts = |root: &str| {
+        [
+            "echo x > ROOT/data.txt",
+            "echo x >> ROOT/data.txt",
+            "echo x > ROOT/new.txt",
+            "touch ROOT/touched",
+            "truncate -s 0 ROOT/data.txt",
+            "mkdir ROOT/newdir",
+            "rmdir ROOT/sub",
+            "ln -s data.txt ROOT/link",
+            "mv ROOT/data.txt ROOT/moved.txt",
+            "rm ROOT/other.txt",
+        ]
+        .map(|a| a.replace("ROOT", root))
+    };
+    let ro_attempts = attempts("/ro");
+    let ro_refs: Vec<&str> = ro_attempts.iter().map(String::as_str).collect();
+    let allowed = allowed_attempts(&sb, &ro_refs).await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+    // Copying out of a read-only mount is just a read.
+    let out = sb
+        .bash("cp /ro/data.txt copy.txt", ExecOptions::default())
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+
+    let err = sb.write("/ro/data.txt", "changed\n").await.unwrap_err();
+    assert!(err.to_string().contains("read-only"), "{err}");
+    let err = sb
+        .edit("/ro/data.txt", "data", "changed", false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("read-only"), "{err}");
+
+    assert_eq!(
+        std::fs::read_to_string(ro.path().join("data.txt")).unwrap(),
+        "data\n"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(ro.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data.txt", "other.txt", "sub"]);
+
+    // The same operations succeed on a writable mount.
+    let rw_attempts = attempts("/rw");
+    let rw_refs: Vec<&str> = rw_attempts.iter().map(String::as_str).collect();
+    let allowed = allowed_attempts(&sb, &rw_refs).await;
+    // `rmdir` on extra mounts fails in WASIX with ENOENT independently of
+    // the read-only wrapper, so it is not expected to succeed here.
+    for a in rw_attempts.iter().filter(|a| !a.starts_with("rmdir")) {
+        assert!(allowed.contains(&format!("ALLOWED: {a}\n")), "refused: {a}");
+    }
+    sb.write("/rw/written.txt", "w\n").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(rw.path().join("written.txt")).unwrap(),
+        "w\n"
     );
 }
 

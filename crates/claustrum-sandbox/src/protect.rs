@@ -1,4 +1,5 @@
-//! Read-only protection for individual host files inside writable mounts.
+//! Read-only protection for individual host files inside writable mounts,
+//! and for whole mounts that were not declared writable ([`ReadOnlyFs`]).
 //!
 //! The Claustrum configuration usually lives in the project directory, which
 //! the guest can write. [`ProtectedFs`] wraps a host-backed mount and refuses
@@ -16,6 +17,7 @@
 use std::{
     io,
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use futures::future::BoxFuture;
@@ -247,6 +249,93 @@ impl FileOpener for ProtectedFs {
     }
 }
 
+/// A mount the guest can read but not change at all.
+///
+/// Wraps the host-backed file system of an extra mount that was not declared
+/// writable (possibly a [`ProtectedFs`]).
+#[derive(Debug)]
+pub(crate) struct ReadOnlyFs {
+    inner: Arc<dyn FileSystem + Send + Sync>,
+}
+
+impl ReadOnlyFs {
+    pub(crate) fn new(inner: Arc<dyn FileSystem + Send + Sync>) -> Self {
+        Self { inner }
+    }
+
+    fn deny(&self, path: &Path) -> virtual_fs::Result<()> {
+        tracing::warn!(path = %path.display(), "write to a read-only mount refused");
+        Err(FsError::PermissionDenied)
+    }
+}
+
+impl FileSystem for ReadOnlyFs {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        self.inner.readlink(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> virtual_fs::Result<ReadDir> {
+        self.inner.read_dir(path)
+    }
+
+    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.deny(path)
+    }
+
+    fn create_symlink(&self, _source: &Path, target: &Path) -> virtual_fs::Result<()> {
+        self.deny(target)
+    }
+
+    fn hard_link(&self, _source: &Path, target: &Path) -> virtual_fs::Result<()> {
+        self.deny(target)
+    }
+
+    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.deny(path)
+    }
+
+    fn rename<'a>(
+        &'a self,
+        from: &'a Path,
+        _to: &'a Path,
+    ) -> BoxFuture<'a, virtual_fs::Result<()>> {
+        Box::pin(async move { self.deny(from) })
+    }
+
+    fn metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        self.inner.metadata(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        self.inner.symlink_metadata(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.deny(path)
+    }
+
+    fn new_open_options(&self) -> OpenOptions<'_> {
+        OpenOptions::new(self)
+    }
+}
+
+impl FileOpener for ReadOnlyFs {
+    fn open(
+        &self,
+        path: &Path,
+        conf: &OpenOptionsConfig,
+    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
+        // See `ProtectedFs::open`: WASIX falls back to a read-only handle.
+        if conf.would_mutate() {
+            self.deny(path)?;
+        }
+        self.inner
+            .new_open_options()
+            .options(conf.clone())
+            .open(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +446,58 @@ mod tests {
         fs.remove_file(Path::new("/newdir/n.txt")).unwrap();
         fs.remove_dir(Path::new("/newdir")).unwrap();
         assert!(dir.path().join("sub/other.toml").exists());
+    }
+
+    #[test]
+    fn read_only_mounts_refuse_every_change() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("data.txt"), "data").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let inner = virtual_fs::host_fs::FileSystem::new(rt.handle().clone(), &root).unwrap();
+        let fs = ReadOnlyFs::new(Arc::new(inner));
+
+        assert!(fs.new_open_options().read(true).open("/data.txt").is_ok());
+        assert!(fs.metadata(Path::new("/data.txt")).is_ok());
+        assert!(fs.read_dir(Path::new("/")).is_ok());
+
+        let denied = |r: virtual_fs::Result<()>| matches!(r, Err(FsError::PermissionDenied));
+        let open = |path: &str, append: bool| {
+            fs.new_open_options()
+                .write(!append)
+                .append(append)
+                .create(true)
+                .open(path)
+                .map(|_| ())
+        };
+        assert!(denied(open("/data.txt", false)));
+        assert!(denied(open("/data.txt", true)));
+        assert!(denied(open("/new.txt", false)));
+        assert!(denied(fs.create_dir(Path::new("/newdir"))));
+        assert!(denied(fs.remove_file(Path::new("/data.txt"))));
+        assert!(denied(fs.remove_dir(Path::new("/sub"))));
+        assert!(denied(
+            fs.create_symlink(Path::new("data.txt"), Path::new("/link"))
+        ));
+        assert!(denied(
+            fs.hard_link(Path::new("/data.txt"), Path::new("/hard"))
+        ));
+        assert!(denied(rt.block_on(
+            fs.rename(Path::new("/data.txt"), Path::new("/moved"))
+        )));
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("data.txt")).unwrap(),
+            "data"
+        );
+        let names: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 }

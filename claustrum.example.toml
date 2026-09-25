@@ -89,10 +89,16 @@ source = "syrusakbary/jq"
 # [[packages.package]]
 # file = "jaq"
 
-# Additional host directories, mounted read/write at absolute guest paths.
+# Additional host directories, mounted at absolute guest paths. They are
+# read-only unless `writable = true` is set.
 # [[mounts]]
 # guest = "/data"
 # host = "~/datasets"
+#
+# [[mounts]]
+# guest = "/out"
+# host = "~/results"
+# writable = true
 
 # Host actions: fixed commands on the host that Claude may trigger from the
 # sandbox, with inputs validated against the declaration. This file is

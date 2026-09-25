@@ -192,9 +192,10 @@ mod broker {
         }
     }
 
-    /// What the Wasmer worker may touch: its binary, the packages and the
-    /// configuration (read), the workspace, extra mounts, module cache, network
-    /// log and a private temporary directory (read/write), never the
+    /// What the Wasmer worker may touch: its binary, the packages, the
+    /// configuration and read-only extra mounts (read), the workspace, writable
+    /// extra mounts, module cache, network log and a private temporary
+    /// directory (read/write), never the
     /// configuration (write) or credential stores (read). It may not start any
     /// program; host actions go through the broker.
     fn worker_profile(
@@ -217,7 +218,12 @@ mod broker {
 
         p.write.push(workspace.to_path_buf());
         for m in &config.file.mounts {
-            p.write.push(crate::config::expand_home(&m.host));
+            let host = crate::config::expand_home(&m.host);
+            if m.writable {
+                p.write.push(host);
+            } else {
+                p.read.push(host);
+            }
         }
         let cache = RuntimeConfig::default().cache_dir;
         // Bind mounts need the directory to exist.
