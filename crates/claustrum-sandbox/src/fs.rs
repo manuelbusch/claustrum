@@ -112,7 +112,7 @@ pub fn normalize_guest_path(path: &str, cwd: &str) -> Result<String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-/// Create a host-backed file system rooted at `dir`.
+/// Create a host-backed file system rooted at `dir`, confined to it.
 ///
 /// `protected` lists resolved host paths (see
 /// [`SandboxBuilder::protect`](crate::SandboxBuilder::protect)) that must stay
@@ -135,13 +135,11 @@ pub fn host_dir(
         .filter(|p| crate::protect::key(p).starts_with(crate::protect::key(&canonical)))
         .cloned()
         .collect();
-    if inside.is_empty() {
-        Ok(Arc::new(fs))
-    } else {
-        Ok(Arc::new(crate::protect::ProtectedFs::new(
-            fs, canonical, inside,
-        )))
-    }
+    // Always wrapped, also without protected files: the wrapper keeps links
+    // placed on the host from leading outside `dir`.
+    Ok(Arc::new(crate::protect::ProtectedFs::new(
+        fs, canonical, inside,
+    )))
 }
 
 /// Whether `inner` (a path inside the mount `fs`) is a protected, read-only
@@ -150,6 +148,17 @@ pub(crate) fn is_protected(fs: &(dyn FileSystem + Send + Sync), inner: &Path) ->
     let fs: &dyn FileSystem = fs;
     fs.downcast_ref::<crate::protect::ProtectedFs>()
         .is_some_and(|p| p.is_protected(inner))
+}
+
+/// Whether `inner` (a path inside the mount `fs`) leads outside the mount's
+/// host directory through a symlink.
+pub(crate) fn leaves_mount(fs: &(dyn FileSystem + Send + Sync), inner: &Path) -> bool {
+    let mut fs: &dyn FileSystem = fs;
+    if let Some(ro) = fs.downcast_ref::<crate::protect::ReadOnlyFs>() {
+        fs = ro.inner();
+    }
+    fs.downcast_ref::<crate::protect::ProtectedFs>()
+        .is_some_and(|p| p.leaves_mount(inner))
 }
 
 /// Make a mount read-only for the guest.

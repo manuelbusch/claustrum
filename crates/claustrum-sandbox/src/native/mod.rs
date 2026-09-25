@@ -58,6 +58,12 @@ impl Located {
 pub(crate) fn locate(fs: &GuestFs, path: &str, cwd: &str) -> Result<Located> {
     let guest = normalize_guest_path(path, cwd)?;
     let (mount, inner) = fs.resolve(&guest)?;
+    if crate::fs::leaves_mount(&*mount.fs, &inner) {
+        return Err(Error::invalid_path(
+            &guest,
+            "a symbolic link on the host leads outside the sandbox mounts",
+        ));
+    }
     Ok(Located {
         guest,
         mount: mount.guest.clone(),

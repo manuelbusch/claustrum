@@ -193,6 +193,111 @@ async fn host_files_outside_workspace_are_invisible() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn host_links_cannot_leave_the_mount() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "SECRET\n").unwrap();
+    std::fs::write(ws.path().join("inside.txt"), "inside\n").unwrap();
+    // As a cloned repository or a host action could place them.
+    let link = |target: &std::path::Path, name: &str| {
+        std::os::unix::fs::symlink(target, ws.path().join(name)).unwrap()
+    };
+    link(&secret, "abs");
+    link(outside.path(), "absdir");
+    let depth = ws.path().canonicalize().unwrap().components().count();
+    let up = "../".repeat(depth);
+    link(
+        std::path::Path::new(&format!("{up}{}", secret.canonicalize().unwrap().display())),
+        "rel",
+    );
+    link(std::path::Path::new("inside.txt"), "ok");
+    link(&outside.path().join("new.txt"), "dangling");
+    let Some(sb) = sandbox(ws.path()).await else {
+        return;
+    };
+
+    for path in ["abs", "absdir/secret.txt", "rel"] {
+        let err = sb.read(path, ReadOptions::default()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("outside the sandbox"),
+            "{path}: {err}"
+        );
+        let err = sb.edit(path, "SECRET", "x", false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("outside the sandbox"),
+            "{path}: {err}"
+        );
+    }
+    for path in ["absdir/planted.txt", "dangling", "abs"] {
+        let err = sb.write(path, "x\n").await.unwrap_err();
+        assert!(
+            err.to_string().contains("outside the sandbox"),
+            "{path}: {err}"
+        );
+    }
+    let err = sb
+        .grep(
+            "SECRET",
+            GrepOptions {
+                path: Some("absdir".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("outside the sandbox"), "{err}");
+    assert!(sb.glob("*", Some("absdir")).is_err());
+    let gr = sb.grep("SECRET", GrepOptions::default()).await.unwrap();
+    assert!(gr.files.is_empty(), "{:?}", gr.files);
+
+    let allowed = allowed_attempts(
+        &sb,
+        &[
+            "grep -q SECRET abs",
+            "grep -q SECRET rel",
+            "grep -q SECRET absdir/secret.txt",
+            "echo x > absdir/bash.txt",
+            "echo x > dangling",
+            "ls absdir/secret.txt",
+        ],
+    )
+    .await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET\n");
+    let mut names: Vec<_> = std::fs::read_dir(outside.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["secret.txt"]);
+
+    // Links inside the mount keep working, and outward links can be removed.
+    assert!(
+        sb.read("ok", ReadOptions::default())
+            .await
+            .unwrap()
+            .content
+            .contains("inside")
+    );
+    sb.write("ok", "changed\n").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("inside.txt")).unwrap(),
+        "changed\n"
+    );
+    let out = sb
+        .bash("rm abs absdir", ExecOptions::default())
+        .await
+        .unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    assert!(std::fs::symlink_metadata(ws.path().join("abs")).is_err());
+    assert!(std::fs::symlink_metadata(ws.path().join("absdir")).is_err());
+    assert!(secret.exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exit_codes_and_stderr_are_reported() {
     let ws = tempfile::tempdir().unwrap();
@@ -671,6 +776,27 @@ async fn claude_settings_cannot_be_planted() {
     sb.write(".claude/agents/reviewer.md", "---\nname: reviewer\n---\n")
         .await
         .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn protected_names_hold_behind_host_links() {
+    let ws = tempfile::tempdir().unwrap();
+    let settings = ws.path().join(".claude/settings.json");
+    std::fs::create_dir(ws.path().join("fake")).unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.protect(&settings)).await else {
+        return;
+    };
+    // A host program redirects `.claude` after the sandbox started.
+    std::os::unix::fs::symlink("fake", ws.path().join(".claude")).unwrap();
+    let err = sb
+        .write(".claude/settings.json", "{\"hooks\": {}}\n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("protected"), "{err}");
+    let allowed = allowed_attempts(&sb, &["echo x > .claude/settings.json"]).await;
+    assert_eq!(allowed, "", "these attempts were not refused");
+    assert!(!ws.path().join("fake/settings.json").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

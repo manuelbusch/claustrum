@@ -1,5 +1,11 @@
-//! Read-only protection for individual host files inside writable mounts,
-//! and for whole mounts that were not declared writable ([`ReadOnlyFs`]).
+//! Containment and read-only protection for host-backed mounts.
+//!
+//! Every host-backed mount is a [`ProtectedFs`]. It keeps each access inside
+//! the mount's host directory: a symlink placed on the host (checked into a
+//! cloned repository, or created by a host action) must not lead the native
+//! tools, which open host paths directly, to files outside the mount. It also
+//! makes individual files read-only, and [`ReadOnlyFs`] whole mounts that were
+//! not declared writable.
 //!
 //! The Claustrum configuration usually lives in the project directory, which
 //! the guest can write. [`ProtectedFs`] wraps a host-backed mount and refuses
@@ -97,7 +103,7 @@ fn file_id(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// A host-backed mount with some files made read-only.
+/// A host-backed mount, confined to its root, with some files made read-only.
 #[derive(Debug)]
 pub(crate) struct ProtectedFs {
     inner: virtual_fs::host_fs::FileSystem,
@@ -120,6 +126,11 @@ impl ProtectedFs {
         }
     }
 
+    /// Whether `path` (inside the mount) leads outside it through a link.
+    pub(crate) fn leaves_mount(&self, path: &Path) -> bool {
+        self.contain(path).is_err()
+    }
+
     /// Whether writing the file at `path` (inside the mount) is refused.
     pub(crate) fn is_protected(&self, path: &Path) -> bool {
         self.check_file(path).is_err()
@@ -132,6 +143,24 @@ impl ProtectedFs {
         resolve_host_path(&self.root.join(rel)).ok()
     }
 
+    /// The protected paths as resolved at start and as they resolve now. A
+    /// host program may redirect a directory above one (`.claude` → `fake`)
+    /// while the sandbox runs; WASIX follows such a link itself and asks for
+    /// `fake/settings.json`, which is then the file Claude Code would read.
+    fn current(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.protected.iter().flat_map(|p| {
+            let now = resolve_host_path(p).ok().filter(|r| r != p);
+            std::iter::once(p.clone()).chain(now)
+        })
+    }
+
+    /// Host path of a mount-relative path without resolving any link: the
+    /// name a host program such as Claude Code opens.
+    fn lexical(&self, path: &Path) -> PathBuf {
+        let inside = lexical_normalize(&Path::new("/").join(path));
+        self.root.join(inside.strip_prefix("/").unwrap_or(&inside))
+    }
+
     /// Deny writing, creating or removing the file at `path`.
     fn check_file(&self, path: &Path) -> virtual_fs::Result<()> {
         // Unresolvable paths (symlink loops, unreadable directories) are
@@ -140,7 +169,11 @@ impl ProtectedFs {
             return self.deny(path);
         };
         let k = key(&host);
-        if self.protected.iter().any(|p| key(p) == k) {
+        // Also by name: after a host program replaced `.claude` with a link,
+        // `.claude/settings.json` resolves elsewhere but is still the file
+        // Claude Code reads.
+        let lexical = key(&self.lexical(path));
+        if self.current().any(|p| key(&p) == k || key(&p) == lexical) {
             return self.deny(path);
         }
         if let Some(id) = file_id(&host)
@@ -159,7 +192,11 @@ impl ProtectedFs {
             return self.deny(path);
         };
         let k = key(&host);
-        if self.protected.iter().any(|p| key(p).starts_with(&k)) {
+        let lexical = key(&self.lexical(path));
+        if self
+            .current()
+            .any(|p| key(&p).starts_with(&k) || key(&p).starts_with(&lexical))
+        {
             return self.deny(path);
         }
         Ok(())
@@ -169,18 +206,47 @@ impl ProtectedFs {
         tracing::warn!(path = %path.display(), root = %self.root.display(), "write to a protected file refused");
         Err(FsError::PermissionDenied)
     }
+
+    /// Deny an operation that follows `path` to its target unless that
+    /// target, with every symlink resolved, lies inside the mount.
+    fn contain(&self, path: &Path) -> virtual_fs::Result<()> {
+        match self.host(path) {
+            Some(host) if key(&host).starts_with(key(&self.root)) => Ok(()),
+            _ => self.escape(path),
+        }
+    }
+
+    /// Like [`contain`](Self::contain) for operations on the directory entry
+    /// itself (remove, rename, lstat): only the parent is resolved, so a link
+    /// that points outside can still be inspected, renamed or removed.
+    fn contain_entry(&self, path: &Path) -> virtual_fs::Result<()> {
+        let inside = lexical_normalize(&Path::new("/").join(path));
+        match inside.parent() {
+            Some(parent) => self.contain(parent),
+            // The mount root itself.
+            None => Ok(()),
+        }
+    }
+
+    fn escape(&self, path: &Path) -> virtual_fs::Result<()> {
+        tracing::warn!(path = %path.display(), root = %self.root.display(), "access through a link that leaves the mount refused");
+        Err(FsError::PermissionDenied)
+    }
 }
 
 impl FileSystem for ProtectedFs {
     fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        self.contain_entry(path)?;
         self.inner.readlink(path)
     }
 
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<ReadDir> {
+        self.contain(path)?;
         self.inner.read_dir(path)
     }
 
     fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.contain(path)?;
         self.check_file(path)?;
         self.inner.create_dir(path)
     }
@@ -191,24 +257,30 @@ impl FileSystem for ProtectedFs {
         // link in place of a missing directory above one (`.claude` for
         // `.claude/settings.json`) would redirect the protected path to a
         // file the guest can write.
+        self.contain_entry(target)?;
         self.check_tree(target)?;
         self.inner.create_symlink(source, target)
     }
 
     fn hard_link(&self, source: &Path, target: &Path) -> virtual_fs::Result<()> {
         // A second name for a protected file would be a writable alias.
+        self.contain(source)?;
+        self.contain_entry(target)?;
         self.check_file(source)?;
         self.check_file(target)?;
         self.inner.hard_link(source, target)
     }
 
     fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.contain_entry(path)?;
         self.check_tree(path)?;
         self.inner.remove_dir(path)
     }
 
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, virtual_fs::Result<()>> {
         Box::pin(async move {
+            self.contain_entry(from)?;
+            self.contain_entry(to)?;
             self.check_tree(from)?;
             self.check_tree(to)?;
             self.inner.rename(from, to).await
@@ -216,14 +288,17 @@ impl FileSystem for ProtectedFs {
     }
 
     fn metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        self.contain(path)?;
         self.inner.metadata(path)
     }
 
     fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        self.contain_entry(path)?;
         self.inner.symlink_metadata(path)
     }
 
     fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
+        self.contain_entry(path)?;
         self.check_file(path)?;
         self.inner.remove_file(path)
     }
@@ -242,6 +317,7 @@ impl FileOpener for ProtectedFs {
         // WASIX first tries a read/write handle for every regular file and
         // falls back to the requested mode on PermissionDenied, so refusing
         // here keeps plain reads working.
+        self.contain(path)?;
         if conf.would_mutate() {
             self.check_file(path)?;
         }
@@ -264,6 +340,10 @@ pub(crate) struct ReadOnlyFs {
 impl ReadOnlyFs {
     pub(crate) fn new(inner: Arc<dyn FileSystem + Send + Sync>) -> Self {
         Self { inner }
+    }
+
+    pub(crate) fn inner(&self) -> &dyn FileSystem {
+        &*self.inner
     }
 
     fn deny(&self, path: &Path) -> virtual_fs::Result<()> {

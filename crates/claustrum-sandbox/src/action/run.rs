@@ -240,27 +240,108 @@ fn drain(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
     (buf, truncated)
 }
 
-/// Contents (or absence) of each protected file before the action.
-fn snapshot(protected: &[PathBuf]) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+/// State of a protected path, observed without following links.
+#[derive(Debug, PartialEq)]
+enum Entry {
+    Absent,
+    /// A regular file: contents, permissions and identity.
+    File {
+        bytes: Vec<u8>,
+        mode: Option<u32>,
+        id: Option<(u64, u64)>,
+    },
+    /// A link, directory or anything else; never read or written through.
+    Other,
+}
+
+impl Entry {
+    fn observe(path: &Path) -> Entry {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Entry::Absent,
+            Err(_) => return Entry::Other,
+        };
+        if !meta.is_file() {
+            return Entry::Other;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+        let mut bytes = Vec::new();
+        match opts.open(path).and_then(|mut f| f.read_to_end(&mut bytes)) {
+            Ok(_) => Entry::File {
+                bytes,
+                mode: mode(&meta),
+                id: file_id(&meta),
+            },
+            Err(_) => Entry::Other,
+        }
+    }
+
+    /// Same contents in the same file (a hard link to another file with
+    /// equal bytes still counts as changed).
+    fn unchanged(&self, before: &Entry) -> bool {
+        match (self, before) {
+            (Entry::Absent, Entry::Absent) => true,
+            (
+                Entry::File {
+                    bytes: a, id: ia, ..
+                },
+                Entry::File {
+                    bytes: b, id: ib, ..
+                },
+            ) => a == b && ia == ib,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn mode(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(meta.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn mode(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// State of each protected file before the action. The paths are resolved
+/// (see `protect::resolve_host_path`), so neither they nor their parents are
+/// links at this point.
+fn snapshot(protected: &[PathBuf]) -> Vec<(PathBuf, Entry)> {
     protected
         .iter()
-        .map(|p| (p.clone(), std::fs::read(p).ok()))
+        .map(|p| (p.clone(), Entry::observe(p)))
         .collect()
 }
 
-/// Put back every protected file whose contents changed; returns those paths.
-fn restore(snapshot: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<PathBuf> {
+/// Put back every protected file the action changed; returns those paths.
+///
+/// This runs outside any OS sandbox, so it never writes through what the
+/// action left behind: links in place of the file or of a parent directory
+/// are removed, directories are moved aside instead of deleted, and the
+/// original contents go to a new file that is renamed into place.
+fn restore(snapshot: &[(PathBuf, Entry)]) -> Vec<PathBuf> {
     let mut restored = Vec::new();
     for (path, before) in snapshot {
-        let after = std::fs::read(path).ok();
-        if &after == before {
+        if ancestors_intact(path) && Entry::observe(path).unchanged(before) {
             continue;
         }
-        let result = match before {
-            Some(bytes) => std::fs::write(path, bytes),
-            None => remove(path),
-        };
-        if let Err(e) = result {
+        if let Err(e) = restore_one(path, before) {
             tracing::error!(path = %path.display(), error = %e, "cannot restore protected file");
         }
         restored.push(path.clone());
@@ -268,13 +349,108 @@ fn restore(snapshot: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<PathBuf> {
     restored
 }
 
-fn remove(path: &Path) -> std::io::Result<()> {
+fn restore_one(path: &Path, before: &Entry) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("protected path has no parent"))?;
+    unlink_ancestors(parent)?;
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
-        Ok(_) => std::fs::remove_file(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => move_aside(path)?,
+        Ok(_) if !matches!(before, Entry::File { .. }) => std::fs::remove_file(path)?,
+        Ok(_) | Err(_) => {}
     }
+    let Entry::File { bytes, mode, .. } = before else {
+        return Ok(());
+    };
+    if !parent.is_dir() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = parent.join(format!(".{name}.claustrum-restore-{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(mode.unwrap_or(0o644));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let written = opts.open(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    // rename replaces a file or link at `path` without following it.
+    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Replace every ancestor of `dir` that the action turned into a link with a
+/// plain directory again (at snapshot time none was a link).
+fn unlink_ancestors(dir: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for c in dir.components() {
+        current.push(c);
+        match std::fs::symlink_metadata(&current) {
+            Ok(m) if m.file_type().is_symlink() => {
+                tracing::warn!(path = %current.display(), "action replaced a directory above a protected file with a link; removing the link");
+                std::fs::remove_file(&current)?;
+                std::fs::create_dir(&current)?;
+            }
+            Ok(m) if !m.is_dir() => {
+                move_aside(&current).and_then(|()| std::fs::create_dir(&current))?
+            }
+            Ok(_) => {}
+            // Nothing below can exist; the file is recreated with its
+            // parents only if it existed before.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Whether every existing ancestor of `path` is still a plain directory.
+fn ancestors_intact(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    for c in parent.components() {
+        current.push(c);
+        match std::fs::symlink_metadata(&current) {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Rename `path` to a free `<name>.claustrum-moved[-N]` next to it, so that
+/// nothing the action placed there is deleted (or recursed into).
+fn move_aside(path: &Path) -> std::io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0..100 {
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!("-{n}")
+        };
+        let target = path.with_file_name(format!("{name}.claustrum-moved{suffix}"));
+        if std::fs::symlink_metadata(&target).is_err() {
+            tracing::warn!(from = %path.display(), to = %target.display(), "moved aside what an action put in place of a protected file");
+            return std::fs::rename(path, target);
+        }
+    }
+    Err(std::io::Error::other(
+        "no free name to move the entry aside",
+    ))
 }
 
 #[cfg(test)]
@@ -427,5 +603,69 @@ mod tests {
         assert_eq!(out.exit_code, 1);
         assert!(String::from_utf8_lossy(&out.stderr).contains("restored"));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    /// Runs `script` as an action in a fresh workspace with a protected
+    /// `claustrum.toml` and a missing protected `.claude/settings.json`,
+    /// next to an outside file `victim`. Returns the workspace, the victim
+    /// and the outcome.
+    fn attack(script: &str) -> (tempfile::TempDir, PathBuf, PathBuf, ActionOutcome) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, "victim\n").unwrap();
+        std::fs::write(ws.join("claustrum.toml"), "# original\n").unwrap();
+        let script = script.replace("VICTIM", &victim.display().to_string());
+        let s = spec(&ws, &["/bin/sh", "-c", &script], None);
+        let protected = [ws.join("claustrum.toml"), ws.join(".claude/settings.json")];
+        let out = run(&s, &ws, &protected);
+        (tmp, ws, victim, out)
+    }
+
+    fn assert_intact(ws: &Path, victim: &Path) {
+        let config = ws.join("claustrum.toml");
+        assert!(std::fs::symlink_metadata(&config).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "# original\n");
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "victim\n");
+        assert!(!ws.join(".claude/settings.json").exists());
+        if let Ok(m) = std::fs::symlink_metadata(ws.join(".claude")) {
+            assert!(m.is_dir(), ".claude is not a directory");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_never_writes_through_links() {
+        for script in [
+            // The file itself replaced by a link to an outside file.
+            "rm claustrum.toml && ln -s VICTIM claustrum.toml",
+            // A hard link: the same bytes in place are not enough.
+            "rm claustrum.toml && ln VICTIM claustrum.toml",
+            // A directory with contents in place of the file.
+            "rm claustrum.toml && mkdir -p claustrum.toml/keep && echo x > claustrum.toml/keep/f",
+            // The parent of the missing settings file redirected, with and
+            // without a file behind it.
+            "mkdir fake && echo hooks > fake/settings.json && ln -s fake .claude",
+            "mkdir empty && ln -s empty .claude",
+            "ln -s \"$(dirname VICTIM)\" .claude",
+        ] {
+            let (_tmp, ws, victim, out) = attack(script);
+            assert_intact(&ws, &victim);
+            assert!(!out.restored.is_empty(), "{script}: nothing restored");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_moves_directories_aside() {
+        let (_tmp, ws, _victim, _out) = attack(
+            "rm claustrum.toml && mkdir -p claustrum.toml/keep && echo x > claustrum.toml/keep/f",
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("claustrum.toml.claustrum-moved/keep/f")).unwrap(),
+            "x\n"
+        );
     }
 }

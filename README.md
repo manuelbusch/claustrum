@@ -297,6 +297,12 @@ removing a directory that contains one. The check runs on the host below every t
 symlinks and hard links, and compares names case-insensitively on macOS. Change the
 configuration from outside the sandbox.
 
+Every host-backed mount is also confined to its directory. A symlink that points outside,
+checked into a repository or created by a host action, is refused by every tool; links
+inside the mount keep working. When a host action changes a protected file, Claustrum puts
+it back without following anything the action left in its place: links are removed,
+directories are moved aside as `<name>.claustrum-moved`.
+
 The same holds for Claude Code's own project settings, `.claude/settings.json` and
 `.claude/settings.local.json`. Claude Code runs on the host, outside the sandbox, and executes
 the hooks, status line and helper commands configured there. The guest can neither create
