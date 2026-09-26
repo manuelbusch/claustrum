@@ -24,10 +24,36 @@ pub(crate) fn available() -> Result<(), Unavailable> {
     }
 }
 
-pub(crate) fn command(profile: &Profile, program: &Path) -> Command {
+pub(crate) fn command(profile: &Profile, program: &Path) -> Result<Command, Unavailable> {
+    check_paths(profile)?;
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p").arg(render(profile)).arg(program);
-    cmd
+    Ok(cmd)
+}
+
+/// SBPL paths are strings. A non-UTF-8 path would be rendered lossily and
+/// never match: harmless for an allow rule, but a deny rule would fail open.
+/// Refuse such profiles instead.
+fn check_paths(profile: &Profile) -> Result<(), Unavailable> {
+    let programs = match &profile.exec {
+        Exec::Only(p) => p.as_slice(),
+        Exec::Any => &[],
+    };
+    for p in programs
+        .iter()
+        .chain(&profile.read)
+        .chain(&profile.write)
+        .chain(&profile.deny_read)
+        .chain(&profile.deny_write)
+    {
+        if resolve(p).to_str().is_none() {
+            return Err(Unavailable(format!(
+                "{} is not valid UTF-8 and cannot be expressed in a Seatbelt profile",
+                p.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The SBPL text for `profile`. Later rules take precedence over earlier
@@ -158,6 +184,7 @@ mod tests {
         let mut p = profile.clone();
         p.exec = Exec::Any;
         let out = command(&p, Path::new("/bin/sh"))
+            .unwrap()
             .arg("-c")
             .arg(script)
             .stdin(Stdio::null())
@@ -184,6 +211,18 @@ mod tests {
         p.write = vec![ws.to_path_buf()];
         p.deny_write = vec![ws.join("claustrum.toml")];
         p
+    }
+
+    #[test]
+    fn refuses_paths_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let ws = std::path::Path::new("/tmp");
+        let mut p = profile(ws);
+        p.deny_read = vec![PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))];
+        let err = command(&p, std::path::Path::new("/bin/sh")).unwrap_err();
+        assert!(err.0.contains("UTF-8"), "{err}");
+        p.deny_read.clear();
+        assert!(command(&p, std::path::Path::new("/bin/sh")).is_ok());
     }
 
     #[test]
@@ -252,6 +291,7 @@ mod tests {
     fn exec_is_limited_to_the_listed_programs() {
         let p = Profile::new("test", "/bin/sh");
         let out = command(&p, Path::new("/bin/sh"))
+            .unwrap()
             .arg("-c")
             .arg("/bin/echo hi")
             .output()

@@ -440,6 +440,9 @@ groups the log by destination and prints ready-to-paste `allow` entries. Review 
 adding, the report cannot tell a needed download from an unwanted one. The log is JSON lines
 in the user state directory, one file per workspace, or wherever `[network] log` points.
 
+A grant lasts 15 minutes after the name last resolved to the address (longer than a Bash call
+may run), so an address a name no longer points to stops being reachable.
+
 Known limit: the guest gate decides on address and port, not on the TLS server name. Two
 names served from the same CDN address share their grant. The action proxy sees the host name
 of each `CONNECT` and checks it.

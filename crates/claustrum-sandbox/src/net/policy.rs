@@ -298,7 +298,14 @@ fn is_special_v6(ip: Ipv6Addr) -> bool {
         || (s[0] & 0xfe00) == 0xfc00 // unique local
         || (s[0] & 0xffc0) == 0xfe80 // link local
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-        || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64 can reach private IPv4
+        || (s[0] & 0xffc0) == 0xfec0 // deprecated site local
+        || (s[0] == 0x0100 && s[1..4] == [0, 0, 0]) // discard-only
+        // Transition ranges embed an IPv4 address and can reach private IPv4
+        // space through a relay or translator.
+        || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64 (also 64:ff9b:1::/48)
+        || s[0] == 0x2002 // 6to4
+        || (s[0] == 0x2001 && s[1] == 0x0000) // Teredo
+        || s[..6] == [0; 6] // IPv4-compatible (deprecated), ::/96
 }
 
 /// Why something was refused, for logs and for the model.
@@ -319,12 +326,21 @@ impl Verdict {
     }
 }
 
+/// How long an address stays granted after a name resolved to it: longer
+/// than one Bash call may run (10 minutes), so a program that resolved once
+/// can still connect later in the same call. Resolving again renews it.
+const GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Ports granted on an address, the name it was resolved from, and when.
+type Grant = (Ports, String, std::time::Instant);
+
 /// The allowlist plus the grants learned from resolved names.
 #[derive(Debug)]
 pub struct NetPolicy {
     mode: NetMode,
     entries: Vec<AllowEntry>,
-    grants: RwLock<HashMap<IpAddr, Vec<(Ports, String)>>>,
+    grants: RwLock<HashMap<IpAddr, Vec<Grant>>>,
+    grant_ttl: std::time::Duration,
 }
 
 impl NetPolicy {
@@ -333,7 +349,22 @@ impl NetPolicy {
             mode,
             entries,
             grants: RwLock::new(HashMap::new()),
+            grant_ttl: GRANT_TTL,
         }
+    }
+
+    #[cfg(test)]
+    fn with_grant_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.grant_ttl = ttl;
+        self
+    }
+
+    /// The grants for `ip` that have not expired.
+    fn live_grants<'a>(
+        list: &'a [Grant],
+        ttl: std::time::Duration,
+    ) -> impl Iterator<Item = &'a Grant> + 'a {
+        list.iter().filter(move |(_, _, at)| at.elapsed() <= ttl)
     }
 
     /// Parse `allow` strings; the first invalid one is the error.
@@ -390,13 +421,21 @@ impl NetPolicy {
         if ports.is_empty() {
             return;
         }
+        let now = std::time::Instant::now();
+        let ttl = self.grant_ttl;
         let mut grants = self.grants.write().unwrap_or_else(|p| p.into_inner());
+        // Names move; an address is granted only as long as a recent
+        // resolution returned it.
+        grants.retain(|_, list| {
+            list.retain(|(_, _, at)| at.elapsed() <= ttl);
+            !list.is_empty()
+        });
         for ip in addrs {
             let list = grants.entry(canonical_ip(*ip)).or_default();
             for p in &ports {
-                let item = (p.clone(), name.clone());
-                if !list.contains(&item) {
-                    list.push(item);
+                match list.iter_mut().find(|(lp, ln, _)| lp == p && *ln == name) {
+                    Some(existing) => existing.2 = now,
+                    None => list.push((p.clone(), name.clone(), now)),
                 }
             }
         }
@@ -407,8 +446,8 @@ impl NetPolicy {
         let grants = self.grants.read().unwrap_or_else(|p| p.into_inner());
         grants
             .get(&canonical_ip(ip))
-            .and_then(|l| l.first())
-            .map(|(_, n)| n.clone())
+            .and_then(|l| Self::live_grants(l, self.grant_ttl).next())
+            .map(|(_, n, _)| n.clone())
     }
 
     /// May a TCP connection to `ip:port` be opened?
@@ -422,14 +461,16 @@ impl NetPolicy {
             ))
         } else {
             let grants = self.grants.read().unwrap_or_else(|p| p.into_inner());
-            match grants.get(&canonical_ip(ip)) {
-                Some(list) if list.iter().any(|(p, _)| p.contains(port)) => Ok(()),
-                Some(list) => Err(format!(
-                    "port {port} of {} is not in the allowlist",
-                    list[0].1
-                )),
+            let live: Vec<&Grant> = grants
+                .get(&canonical_ip(ip))
+                .map(|l| Self::live_grants(l, self.grant_ttl).collect())
+                .unwrap_or_default();
+            match live.first() {
+                _ if live.iter().any(|(p, _, _)| p.contains(port)) => Ok(()),
+                Some((_, name, _)) => Err(format!("port {port} of {name} is not in the allowlist")),
                 None => Err(format!(
-                    "{} was not resolved from an allowed name and is not in the allowlist",
+                    "{} was not resolved from an allowed name recently and is not in the \
+                     allowlist",
                     canonical_ip(ip)
                 )),
             }
@@ -555,6 +596,13 @@ mod tests {
             "fd12::1",
             "::ffff:127.0.0.1",
             "64:ff9b::a00:1",
+            "64:ff9b:1::a00:1",
+            "2002:a00:1::1",
+            "2001:0:4136:e378::1",
+            "::10.0.0.1",
+            "::8.8.8.8",
+            "fec0::1",
+            "100::1",
         ] {
             assert!(is_special(ip(s)), "{s} should be special");
         }
@@ -563,9 +611,26 @@ mod tests {
             "140.82.112.3",
             "2606:4700::1111",
             "::ffff:8.8.8.8",
+            "2001:4860:4860::8888",
+            "2a00:1450::1",
         ] {
             assert!(!is_special(ip(s)), "{s} should not be special");
         }
+    }
+
+    #[test]
+    fn grants_expire_and_renew() {
+        let p = policy(NetMode::Allowlist, &["github.com:443"])
+            .with_grant_ttl(std::time::Duration::from_millis(200));
+        p.grant("github.com", &[ip("140.82.112.3")]);
+        assert!(p.check_connect(ip("140.82.112.3"), 443).allowed());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let v = p.check_connect(ip("140.82.112.3"), 443);
+        assert!(!v.allowed(), "{v:?}");
+        assert_eq!(p.name_of(ip("140.82.112.3")), None);
+        // Resolving again renews the grant.
+        p.grant("github.com", &[ip("140.82.112.3")]);
+        assert!(p.check_connect(ip("140.82.112.3"), 443).allowed());
     }
 
     #[test]

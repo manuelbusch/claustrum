@@ -142,7 +142,8 @@ pub async fn download(spec: &str, dest_dir: &Path) -> Result<Downloaded> {
         .query(&package)
         .await
         .map_err(|e| Error::Other(format!("registry lookup for `{spec}` failed: {e}")))?;
-    // Prefer the highest version when several match.
+    // Prefer the highest version when several match (`PackageId` orders
+    // named packages by name, then by semantic version).
     summaries.sort_by(|a, b| a.pkg.id.cmp(&b.pkg.id));
     let summary = summaries
         .pop()
@@ -170,6 +171,13 @@ pub async fn download(spec: &str, dest_dir: &Path) -> Result<Downloaded> {
         )));
     }
     let body = response.body.unwrap_or_default();
+    // These files are what runs in the sandbox: take them only as the
+    // registry described them.
+    if wasmer_wasix::runtime::resolver::WebcHash::sha256(&body) != summary.dist.webc_sha256 {
+        return Err(Error::Other(format!(
+            "download of `{id}` does not match the registry's SHA-256; not installed"
+        )));
+    }
 
     let name = summary
         .pkg
@@ -185,6 +193,13 @@ pub async fn download(spec: &str, dest_dir: &Path) -> Result<Downloaded> {
         .unwrap_or_else(|| "package".to_owned());
     std::fs::create_dir_all(dest_dir)?;
     let path = dest_dir.join(format!("{name}.webc"));
-    std::fs::write(&path, body)?;
+    // Write next to the target and rename, so an interrupted download never
+    // leaves a partial file that looks installed.
+    let tmp = dest_dir.join(format!(".{name}.webc.{}.part", std::process::id()));
+    let written = std::fs::write(&tmp, &body).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(Downloaded { path, id })
 }

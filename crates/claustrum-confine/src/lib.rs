@@ -175,7 +175,7 @@ pub fn command(profile: &Profile, program: impl AsRef<OsStr>) -> Result<Command,
     tracing::debug!(profile = %profile.name, %backend, program = %program.display(), "confining");
     match backend {
         #[cfg(target_os = "macos")]
-        Backend::Seatbelt => Ok(seatbelt::command(profile, program)),
+        Backend::Seatbelt => seatbelt::command(profile, program),
         #[cfg(target_os = "linux")]
         Backend::Bubblewrap | Backend::Landlock => linux::command(backend, profile, program),
         #[allow(unreachable_patterns)]

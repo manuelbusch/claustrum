@@ -32,6 +32,7 @@ pub struct Args {
 
 pub async fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
+    config.migrate_state(&workspace);
     let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;
     let network = config.network_policy(&workspace)?;
     eprintln!("claustrum: {}", Config::network_notice(&network));
@@ -172,11 +173,16 @@ mod broker {
             })
         });
 
+        let pid = child.id();
+        let wait = tokio::task::spawn_blocking(move || child.wait());
+        tokio::pin!(wait);
         let status = tokio::select! {
-            status = tokio::task::spawn_blocking(move || child.wait()) => status??,
+            status = &mut wait => status??,
             _ = shutdown_signal() => {
                 tracing::info!("shutting down");
-                // The worker ends by itself when its stdin closes; make sure.
+                stop_worker(pid, &mut wait).await;
+                drop(server);
+                drop(tmp);
                 std::process::exit(143);
             }
         };
@@ -186,6 +192,27 @@ mod broker {
             Ok(())
         } else {
             std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    /// End the worker: SIGTERM, then SIGKILL if it is still there after a
+    /// grace period. `wait` is the task reaping it. Without this the worker
+    /// could outlive the broker on macOS, where nothing ties it to its parent.
+    async fn stop_worker<F>(pid: u32, wait: &mut std::pin::Pin<&mut F>)
+    where
+        F: std::future::Future,
+    {
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        // SAFETY: signalling our own child, which `wait` has not reaped yet.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        if tokio::time::timeout(GRACE, wait.as_mut()).await.is_err() {
+            tracing::warn!(pid, "worker ignored SIGTERM; killing it");
+            // SAFETY: as above.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = tokio::time::timeout(GRACE, wait.as_mut()).await;
         }
     }
 

@@ -398,12 +398,15 @@ fn apply_landlock(spec: &Spec) -> Result<(), String> {
             .chain(p.read.iter().cloned())
             .collect()
     };
-    // Inside bubblewrap the denied paths are already hidden by empty mounts.
-    let deny: &[PathBuf] = if spec.bwrap { &[] } else { &p.deny_read };
+    // Also inside bubblewrap: its empty mounts only hide denied paths that
+    // existed at start. Landlock grants reads per existing inode, so a
+    // carved-out path created later (a new `~/.aws`) is covered by no rule
+    // and stays unreadable.
+    let deny: &[PathBuf] = &p.deny_read;
     for root in readable_roots {
         grant(carve(&root, deny), read_access);
     }
-    if p.read_everything && !spec.bwrap {
+    if p.read_everything {
         // Listing directories on the way to a carved-out path.
         grant(vec![PathBuf::from("/")], AccessFs::ReadDir.into());
     }
@@ -411,8 +414,9 @@ fn apply_landlock(spec: &Spec) -> Result<(), String> {
         grant(carve(w, &p.deny_read), write_access);
     }
     if spec.bwrap {
-        // The private /tmp of the namespace.
-        grant(vec![PathBuf::from("/tmp")], write_access);
+        // The private /tmp of the namespace, which may also hold bound
+        // directories: carved like every other grant.
+        grant(carve(Path::new("/tmp"), &p.deny_read), write_access);
     }
     if let Exec::Only(programs) = &p.exec {
         grant(programs.clone(), AccessFs::Execute | AccessFs::ReadFile);

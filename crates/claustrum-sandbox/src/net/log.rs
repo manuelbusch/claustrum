@@ -181,9 +181,14 @@ impl ConnectionLog {
                 tracing::debug!(source = entry.source, "network: {}", entry.summary());
             }
         }
+        // One write per line: broker and worker append to the same file
+        // (O_APPEND), and a single write cannot interleave with theirs.
         if let Some(file) = &mut inner.file
-            && let Ok(line) = serde_json::to_string(&entry)
-            && let Err(e) = writeln!(file, "{line}")
+            && let Ok(mut line) = serde_json::to_string(&entry)
+            && let Err(e) = {
+                line.push('\n');
+                file.write_all(line.as_bytes())
+            }
         {
             tracing::warn!(error = %e, "cannot write the network log");
         }

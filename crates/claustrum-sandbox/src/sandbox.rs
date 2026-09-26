@@ -338,6 +338,7 @@ impl SandboxBuilder {
                 fs: etc,
             },
         ];
+        let mut seen: Vec<String> = Vec::new();
         for m in &self.extra_mounts {
             if !m.guest.starts_with('/') {
                 return Err(Error::invalid_path(
@@ -345,6 +346,9 @@ impl SandboxBuilder {
                     "mount paths must be absolute",
                 ));
             }
+            let guest = fs::normalize_guest_path(&m.guest, "/")?;
+            check_mount_path(&guest, &seen)?;
+            seen.push(guest);
             let host = fs::host_dir(handle.clone(), &m.host, &fs_protected)?;
             mounts.push(Mount {
                 guest: m.guest.clone(),
@@ -385,6 +389,44 @@ impl SandboxBuilder {
             }),
         })
     }
+}
+
+/// Guest paths Claustrum itself provides. An extra mount may not be one of
+/// them, lie inside the ones marked `true` (their content is Claustrum's),
+/// or contain any of them.
+const RESERVED_MOUNTS: &[(&str, bool)] = &[
+    (WORKSPACE, false),
+    ("/tmp", false),
+    ("/home/claude", false),
+    (ETC_DIR, true),
+    (hostcmd::MOUNT, true),
+    ("/bin", true),
+    ("/usr/bin", true),
+];
+
+/// Refuse an extra mount at `guest` (normalized) that would shadow a
+/// reserved path or repeat an earlier mount.
+fn check_mount_path(guest: &str, seen: &[String]) -> Result<()> {
+    let inside =
+        |path: &str, dir: &str| dir == "/" || path == dir || path.starts_with(&format!("{dir}/"));
+    if guest == "/" {
+        return Err(Error::invalid_path(
+            guest,
+            "cannot mount over the guest root",
+        ));
+    }
+    for (reserved, sealed) in RESERVED_MOUNTS {
+        if guest == *reserved || inside(reserved, guest) || (*sealed && inside(guest, reserved)) {
+            return Err(Error::invalid_path(
+                guest,
+                format!("{reserved} is provided by Claustrum; choose another mount path"),
+            ));
+        }
+    }
+    if seen.iter().any(|s| s == guest) {
+        return Err(Error::invalid_path(guest, "mounted twice"));
+    }
+    Ok(())
 }
 
 /// A persistent sandbox. Cheap to clone; all clones share the same state.
@@ -684,5 +726,42 @@ impl Sandbox {
         opts: native::GrepOptions,
     ) -> Result<native::GrepOutput> {
         native::grep(self.guest_fs(), pattern, &self.cwd(), opts).await
+    }
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::check_mount_path;
+
+    #[test]
+    fn reserved_mount_paths_are_refused() {
+        for bad in [
+            "/",
+            "/workspace",
+            "/tmp",
+            "/home/claude",
+            "/home",
+            "/etc",
+            "/etc/claustrum",
+            "/etc/claustrum/x",
+            "/.claustrum",
+            "/.claustrum/cmd",
+            "/bin",
+            "/usr",
+            "/usr/bin",
+            "/usr/bin/x",
+        ] {
+            assert!(check_mount_path(bad, &[]).is_err(), "{bad}");
+        }
+        for ok in [
+            "/data",
+            "/workspace/data",
+            "/tmp/cache",
+            "/usr/local/lib/x",
+            "/etc/other",
+        ] {
+            check_mount_path(ok, &[]).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        assert!(check_mount_path("/data", &["/data".into()]).is_err());
     }
 }

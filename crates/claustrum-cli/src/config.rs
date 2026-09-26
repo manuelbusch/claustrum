@@ -337,14 +337,25 @@ pub fn state_dir() -> PathBuf {
 /// File name stem that identifies a workspace in the state directory:
 /// `<directory name>-<hash of the path>`.
 fn workspace_key(workspace: &Path) -> String {
+    // SHA-256 rather than `DefaultHasher`, whose output may change with the
+    // Rust release and would orphan logs, plan ledgers and caches.
+    let hash = sha256_hex(workspace.as_os_str().as_encoded_bytes());
+    format!("{}-{}", workspace_name(workspace), &hash[..16])
+}
+
+fn workspace_name(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into())
+}
+
+/// The key of earlier versions, only used to find their files.
+fn legacy_workspace_key(workspace: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     workspace.hash(&mut h);
-    let name = workspace
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "root".into());
-    format!("{name}-{:016x}", h.finish())
+    format!("{}-{:016x}", workspace_name(workspace), h.finish())
 }
 
 /// Claude Code's default plan directory (`plansDirectory` can only point
@@ -548,6 +559,39 @@ impl Config {
             .join(format!("{}.jsonl", workspace_key(workspace)))
     }
 
+    /// Rename the network log and plan ledger of `workspace` from the file
+    /// names of earlier versions (see [`workspace_key`]). Best effort, run by
+    /// the unconfined commands before they use them.
+    pub fn migrate_state(&self, workspace: &Path) {
+        let (new, old) = (workspace_key(workspace), legacy_workspace_key(workspace));
+        if new == old {
+            return;
+        }
+        let dir = state_dir();
+        let mut moves = vec![(
+            dir.join("plans").join(format!("{old}.list")),
+            dir.join("plans").join(format!("{new}.list")),
+        )];
+        if self.file.network.log.is_none() {
+            moves.push((
+                dir.join("network").join(format!("{old}.jsonl")),
+                dir.join("network").join(format!("{new}.jsonl")),
+            ));
+        }
+        for (from, to) in moves {
+            if from.is_file() && !to.exists() {
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => {
+                        tracing::info!(from = %from.display(), to = %to.display(), "renamed state file")
+                    }
+                    Err(e) => {
+                        tracing::warn!(from = %from.display(), error = %e, "cannot rename state file")
+                    }
+                }
+            }
+        }
+    }
+
     /// The cache the confined worker of `workspace` may write: its compiled
     /// modules, downloaded packages and the host command shim. The user-wide
     /// cache is only written by unconfined processes (`claustrum pkg`, `serve`
@@ -640,9 +684,7 @@ impl Config {
         Ok(policy)
     }
 
-    /// Build the sandbox described by this configuration. With `executor`,
-    /// host actions are forwarded to it (the broker) instead of being started
-    /// from this process.
+    /// Build the sandbox described by this configuration.
     ///
     /// With `remote` the sandbox runs in the confined worker: host actions
     /// and plan files go through the broker, and compiled modules are cached
@@ -652,6 +694,22 @@ impl Config {
         &self,
         workspace: Option<&Path>,
         remote: Option<Remote>,
+    ) -> Result<Sandbox> {
+        self.build(workspace, remote, true).await
+    }
+
+    /// A sandbox with the packages only, for `claustrum pkg`: no host
+    /// actions, so a configuration written for a machine with `cargo` can
+    /// still sync packages on one without it.
+    pub async fn build_package_sandbox(&self) -> Result<Sandbox> {
+        self.build(Some(&std::env::temp_dir()), None, false).await
+    }
+
+    async fn build(
+        &self,
+        workspace: Option<&Path>,
+        remote: Option<Remote>,
+        with_actions: bool,
     ) -> Result<Sandbox> {
         let workspace = self.workspace(workspace)?;
         let (executor, plans, runtime) = match remote {
@@ -720,9 +778,11 @@ impl Config {
         for p in self.protected_paths(&workspace) {
             builder = builder.protect(p);
         }
-        builder = builder
-            .action_command(self.action_command())
-            .actions(self.file.actions.list.iter().cloned());
+        if with_actions {
+            builder = builder
+                .action_command(self.action_command())
+                .actions(self.file.actions.list.iter().cloned());
+        }
         if let Some(executor) = executor {
             builder = builder.action_executor(executor);
         }
@@ -891,6 +951,19 @@ writable = true
             assert!(err.to_string().contains("not allowed"), "{bad}: {err}");
         }
         check_claude_args(&["--model".into(), "opus".into(), "--verbose".into()]).unwrap();
+    }
+
+    #[test]
+    fn workspace_keys_are_stable() {
+        // Pinned: a changed key would orphan logs, ledgers and caches.
+        assert_eq!(
+            workspace_key(Path::new("/home/u/proj")),
+            format!("proj-{}", &sha256_hex(b"/home/u/proj")[..16])
+        );
+        assert_eq!(
+            workspace_key(Path::new("/")),
+            format!("root-{}", &sha256_hex(b"/")[..16])
+        );
     }
 
     #[test]

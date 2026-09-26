@@ -144,6 +144,15 @@ pub(crate) fn write_shim_package(
          [[module]]\nname = \"hostcmd\"\nsource = \"./hostcmd.wasm\"\nabi = \"wasi\"\n",
     );
     for c in commands {
+        // Interpolated into TOML; host command names are validated where
+        // they are declared (`action::is_action_name`).
+        debug_assert!(
+            c.name()
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || "-_".contains(ch)),
+            "host command name {:?}",
+            c.name()
+        );
         write!(
             manifest,
             "\n[[command]]\nname = \"{0}\"\nmodule = \"hostcmd\"\nrunner = \"https://webc.org/runner/wasi\"\n\n\

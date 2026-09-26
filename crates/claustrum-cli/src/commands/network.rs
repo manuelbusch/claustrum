@@ -28,6 +28,7 @@ pub fn run(config: Config, cmd: Command) -> Result<()> {
     match cmd {
         Command::Report { workspace, all } => {
             let workspace = config.workspace(workspace.as_deref())?;
+            config.migrate_state(&workspace);
             let path = config.network_log_path(&workspace);
             let entries = match read_log(&path) {
                 Ok(e) => e,

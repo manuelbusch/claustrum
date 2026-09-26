@@ -15,9 +15,10 @@ pub(crate) struct Found {
     pub len: u64,
 }
 
-/// Walk `root` depth-first and return all regular files, sorted by path.
-/// Symlinks are not followed. Stops after `max` entries.
-pub(crate) fn walk_files(fs: &dyn FileSystem, root: &Path, max: usize) -> Vec<Found> {
+/// Walk `root` depth-first and return all regular files, sorted by path,
+/// and whether the walk stopped early. Symlinks are not followed. Stops
+/// after `max` entries.
+pub(crate) fn walk_files(fs: &dyn FileSystem, root: &Path, max: usize) -> (Vec<Found>, bool) {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -45,10 +46,29 @@ pub(crate) fn walk_files(fs: &dyn FileSystem, root: &Path, max: usize) -> Vec<Fo
                     len: meta.len(),
                 });
                 if out.len() >= max {
-                    return out;
+                    return (out, true);
                 }
             }
         }
     }
-    out
+    (out, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reports_an_incomplete_walk() {
+        let fs = crate::fs::mem_dir();
+        for name in ["a", "b", "c", "d"] {
+            crate::native::write_file(&*fs, Path::new(&format!("/{name}.txt")), b"x")
+                .await
+                .unwrap();
+        }
+        let (all, incomplete) = walk_files(&*fs, Path::new("/"), 10);
+        assert_eq!((all.len(), incomplete), (4, false));
+        let (some, incomplete) = walk_files(&*fs, Path::new("/"), 3);
+        assert_eq!((some.len(), incomplete), (3, true));
+    }
 }

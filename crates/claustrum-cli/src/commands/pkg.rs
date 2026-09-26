@@ -78,9 +78,7 @@ pub async fn run(config: Config, cmd: Command) -> Result<()> {
             Ok(())
         }
         Command::Commands => {
-            let sandbox = config
-                .build_sandbox(Some(&std::env::temp_dir()), None)
-                .await?;
+            let sandbox = config.build_package_sandbox().await?;
             for c in sandbox.commands() {
                 println!("{c}");
             }
@@ -91,9 +89,7 @@ pub async fn run(config: Config, cmd: Command) -> Result<()> {
 }
 
 async fn precompile(config: &Config) -> Result<()> {
-    let sandbox = config
-        .build_sandbox(Some(&std::env::temp_dir()), None)
-        .await?;
+    let sandbox = config.build_package_sandbox().await?;
     let started = std::time::Instant::now();
     let n = sandbox.precompile().await?;
     println!("{n} module(s) ready in {:.1?}", started.elapsed());
@@ -101,12 +97,19 @@ async fn precompile(config: &Config) -> Result<()> {
 }
 
 fn add_wasm(config: &Config, name: &str, wasm: &std::path::Path, aliases: &[String]) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
-    {
-        anyhow::bail!("package name must consist of letters, digits, `-` or `_`");
+    // Both end up quoted in a TOML manifest and as guest command names.
+    let valid = |n: &str| {
+        !n.is_empty()
+            && n.len() <= 64
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            && !n.starts_with(['-', '.'])
+    };
+    if !valid(name) {
+        anyhow::bail!("package name must consist of letters, digits, `-`, `_` or `.`");
+    }
+    if let Some(bad) = aliases.iter().find(|a| !valid(a)) {
+        anyhow::bail!("alias `{bad}` must consist of letters, digits, `-`, `_` or `.`");
     }
     let bytes = std::fs::read(wasm).with_context(|| format!("cannot read {}", wasm.display()))?;
     if !bytes.starts_with(b"\0asm") {

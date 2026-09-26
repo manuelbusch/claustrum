@@ -43,6 +43,7 @@ pub struct Args {
 
 pub fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
+    config.migrate_state(&workspace);
     let actions = config.validate_actions(&workspace)?;
     let network = config.network_policy(&workspace)?;
     let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;

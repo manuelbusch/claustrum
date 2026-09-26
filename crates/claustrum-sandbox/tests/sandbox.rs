@@ -1193,9 +1193,19 @@ async fn host_actions_cannot_change_the_configuration() {
     let ws = tempfile::tempdir().unwrap();
     let config = ws.path().join("claustrum.toml");
     std::fs::write(&config, "# original\n").unwrap();
+    // Without the OS sandbox the action can write the file; the restore
+    // afterwards is what protects it.
     let Some(sb) = sandbox_with(ws.path(), |b| {
         b.protect(ws.path().join("claustrum.toml"))
             .actions(test_actions())
+            .policy(Policy {
+                default_timeout: Some(Duration::from_secs(60)),
+                confinement: claustrum_sandbox::Confinement {
+                    mode: claustrum_sandbox::ConfinementMode::Off,
+                    ..Default::default()
+                },
+                ..Policy::default()
+            })
     })
     .await
     else {
@@ -1209,6 +1219,40 @@ async fn host_actions_cannot_change_the_configuration() {
     assert_eq!(out.stdout_lossy(), "done\n");
     assert!(
         out.stderr_lossy().contains("restored"),
+        "{}",
+        out.stderr_lossy()
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "# original\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confined_actions_cannot_even_write_the_configuration() {
+    let ws = tempfile::tempdir().unwrap();
+    let config = ws.path().join("claustrum.toml");
+    std::fs::write(&config, "# original\n").unwrap();
+    // The library default confines where the platform can.
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.protect(ws.path().join("claustrum.toml"))
+            .actions(test_actions())
+    })
+    .await
+    else {
+        return;
+    };
+    if !claustrum_sandbox::Confinement::default()
+        .active()
+        .unwrap_or(false)
+    {
+        eprintln!("skipping: no confinement backend");
+        return;
+    }
+    let out = sb
+        .bash("host tamper", ExecOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(out.stdout_lossy(), "done\n");
+    assert!(
+        !out.stderr_lossy().contains("restored"),
         "{}",
         out.stderr_lossy()
     );

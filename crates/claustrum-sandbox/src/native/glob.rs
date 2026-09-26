@@ -27,7 +27,7 @@ pub fn glob(fs: &GuestFs, pattern: &str, root: Option<&str>, cwd: &str) -> Resul
     let matcher = build_glob(pattern)?.compile_matcher();
     let absolute = pattern.starts_with('/');
 
-    let mut found = walk_files(&*loc.fs, &loc.inner, WALK_LIMIT);
+    let (mut found, incomplete) = walk_files(&*loc.fs, &loc.inner, WALK_LIMIT);
     found.sort_by(|a, b| {
         b.modified
             .cmp(&a.modified)
@@ -35,7 +35,8 @@ pub fn glob(fs: &GuestFs, pattern: &str, root: Option<&str>, cwd: &str) -> Resul
     });
 
     let mut paths = Vec::new();
-    let mut truncated = false;
+    // Stopping the walk early also leaves the list incomplete.
+    let mut truncated = incomplete;
     for f in found {
         let guest = loc.to_guest(&f.inner);
         let candidate: &str = if absolute {

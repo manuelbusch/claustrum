@@ -273,3 +273,38 @@ fn name_service_lookups_work_without_unix_sockets() {
         assert!(ok, "{out}");
     }
 }
+
+#[test]
+fn denied_paths_created_later_stay_unreadable() {
+    setup();
+    let (_d, ws) = workspace();
+    // Inside the workspace, which bubblewrap binds (its /tmp is private).
+    let secret = ws.join(".aws");
+    let mut p = profile(&ws);
+    p.deny_read = vec![secret.clone()];
+    p.exec = Exec::Any;
+    // The credential store appears only after the process started.
+    let child = command(&p, Path::new("/bin/sh"))
+        .unwrap()
+        .arg("-c")
+        .arg(format!(
+            "i=0; while [ ! -e {s}/ready ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done; \
+             cat {s}/credentials",
+            s = secret.display()
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::create_dir(&secret).unwrap();
+    std::fs::write(secret.join("credentials"), "KEY").unwrap();
+    std::fs::write(secret.join("ready"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("KEY"),
+        "read a credential created later: {stdout}"
+    );
+}

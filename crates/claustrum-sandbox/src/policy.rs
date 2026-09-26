@@ -42,10 +42,11 @@ impl NetworkPolicy {
 pub enum ConfinementMode {
     /// Refuse to start when the platform has no confinement backend.
     Required,
-    /// Confine where possible, warn loudly where not.
+    /// Confine where possible, warn loudly where not. The default, for the
+    /// library as for the CLI: no second layer must be an explicit choice.
+    #[default]
     BestEffort,
     /// Never confine. Host actions run with the user's full rights.
-    #[default]
     Off,
 }
 

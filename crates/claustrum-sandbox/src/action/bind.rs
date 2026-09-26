@@ -1,11 +1,11 @@
 //! Binding guest-supplied inputs to an action: the only place where data from
 //! the sandbox is turned into host argv.
 //!
-//! Every value passes the global checks (length, control characters, leading
-//! `-`) and then its declared kind. Placeholders are substituted into single
-//! argv elements which are handed to the program as they are, so the program
-//! never sees more or fewer arguments than the definition names, and no shell
-//! ever interprets them.
+//! Every value passes the global checks (length, control and invisible
+//! formatting characters, leading `-`) and then its declared kind.
+//! Placeholders are substituted into single argv elements which are handed
+//! to the program as they are, so the program never sees more or fewer
+//! arguments than the definition names, and no shell ever interprets them.
 
 use std::{
     collections::BTreeMap,
@@ -127,8 +127,8 @@ fn check(
             input.max_len
         ));
     }
-    if raw.chars().any(char::is_control) {
-        return Err("contains control characters".into());
+    if raw.chars().any(|c| c.is_control() || is_format(c)) {
+        return Err("contains control or invisible formatting characters".into());
     }
     if raw.starts_with('-') && !input.allow_leading_dash {
         return Err("must not start with `-`".into());
@@ -199,6 +199,34 @@ fn workspace_path(raw: &str, guest_cwd: &str, workspace: &Path) -> Result<PathBu
         return Err("leaves the workspace through a symlink".into());
     }
     Ok(resolved)
+}
+
+/// Unicode format characters (category Cf) and the line and paragraph
+/// separators (Zl, Zp): invisible, but they reorder (bidi overrides such as
+/// U+202E), hide or break what a log or the user sees.
+fn is_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD
+        | 0x0600..=0x0605
+        | 0x061C
+        | 0x06DD
+        | 0x070F
+        | 0x0890..=0x0891
+        | 0x08E2
+        | 0x180E
+        | 0x200B..=0x200F
+        | 0x2028..=0x202E
+        | 0x2060..=0x2064
+        | 0x2066..=0x206F
+        | 0xFEFF
+        | 0xFFF9..=0xFFFB
+        | 0x110BD
+        | 0x110CD
+        | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A
+        | 0xE0001
+        | 0xE0020..=0xE007F)
 }
 
 #[cfg(test)]
@@ -322,6 +350,19 @@ mod tests {
         }
         // The pattern is the whole-value check: no substring matches.
         assert_eq!(run(&s, &["ok.txt"], &ws).unwrap(), ["ok.txt"]);
+
+        // Invisible characters even where the pattern would accept them.
+        let loose = spec(&ws, &["/bin/echo", "{v}"], vec![pattern("v", "[^ ]+")]);
+        for bad in [
+            "txt.\u{202E}exe",
+            "a\u{200B}b",
+            "a\u{2028}b",
+            "a\u{FEFF}",
+            "a\u{E0041}",
+        ] {
+            assert!(run(&loose, &[bad], &ws).is_err(), "{bad:?} was accepted");
+        }
+        assert_eq!(run(&loose, &["grüße"], &ws).unwrap(), ["grüße"]);
 
         let dash = spec(
             &ws,

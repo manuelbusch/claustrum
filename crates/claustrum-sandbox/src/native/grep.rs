@@ -81,6 +81,7 @@ pub async fn grep(fs: &GuestFs, pattern: &str, cwd: &str, opts: GrepOptions) -> 
         .fs
         .metadata(&loc.inner)
         .map_err(super::fs_err(&loc.guest))?;
+    let mut walk_incomplete = false;
     let files = if meta.is_file() {
         vec![super::walk::Found {
             inner: loc.inner.clone(),
@@ -88,7 +89,8 @@ pub async fn grep(fs: &GuestFs, pattern: &str, cwd: &str, opts: GrepOptions) -> 
             len: meta.len(),
         }]
     } else {
-        let mut f = walk_files(&*loc.fs, &loc.inner, WALK_LIMIT);
+        let (mut f, incomplete) = walk_files(&*loc.fs, &loc.inner, WALK_LIMIT);
+        walk_incomplete = incomplete;
         f.sort_by(|a, b| {
             b.modified
                 .cmp(&a.modified)
@@ -165,6 +167,8 @@ pub async fn grep(fs: &GuestFs, pattern: &str, cwd: &str, opts: GrepOptions) -> 
             break;
         }
     }
+    // Files the walk never reached were not searched.
+    out.truncated |= walk_incomplete;
     Ok(out)
 }
 

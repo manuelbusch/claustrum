@@ -15,15 +15,12 @@ pub struct Args {
 
 pub fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
+    config.migrate_state(&workspace);
     let Some(plans) = config.host_plans(&workspace) else {
         println!("Plans are disabled ([claude] plans = false).");
         return Ok(());
     };
     let names = plans.names().context("cannot read the plan ledger")?;
-    if names.is_empty() {
-        println!("No plans for {} yet.", workspace.display());
-        return Ok(());
-    }
     let mut rows: Vec<(SystemTime, PathBuf)> = names
         .into_iter()
         .map(|n| plans.dir().join(n))
@@ -34,6 +31,10 @@ pub fn run(config: Config, args: Args) -> Result<()> {
                 .then(|| (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), p))
         })
         .collect();
+    if rows.is_empty() {
+        println!("No plans for {} yet.", workspace.display());
+        return Ok(());
+    }
     rows.sort_by(|a, b| b.cmp(a));
     for (modified, path) in rows {
         println!("{}  {}", age(modified), path.display());
