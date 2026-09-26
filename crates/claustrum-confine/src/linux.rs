@@ -559,9 +559,12 @@ fn apply_seccomp(spec: &Spec) -> Result<(), String> {
                     .map_err(|e| e.to_string())?,
             );
         } else if !matches!(spec.profile.network, Network::Any | Network::Outbound) {
-            // Loopback: TCP to the proxy only; Landlock filters TCP ports but
-            // not UDP or raw sockets.
-            for ty in [libc::SOCK_DGRAM, libc::SOCK_RAW] {
+            // Loopback: TCP to the proxy only. Landlock filters TCP ports and
+            // nothing else, so every other socket type (UDP, raw, SEQPACKET,
+            // ...) and every other stream protocol (SCTP, MPTCP) is refused.
+            // The low four bits of the type argument are the type; the rest
+            // are flags such as SOCK_CLOEXEC.
+            for ty in (0..=0xf).filter(|t| *t != libc::SOCK_STREAM) {
                 socket_rules.push(
                     SeccompRule::new(vec![
                         cond(0, Len::Dword, Op::Eq, domain as u64)?,
@@ -570,6 +573,14 @@ fn apply_seccomp(spec: &Spec) -> Result<(), String> {
                     .map_err(|e| e.to_string())?,
                 );
             }
+            socket_rules.push(
+                SeccompRule::new(vec![
+                    cond(0, Len::Dword, Op::Eq, domain as u64)?,
+                    cond(2, Len::Dword, Op::Ne, 0)?,
+                    cond(2, Len::Dword, Op::Ne, libc::IPPROTO_TCP as u64)?,
+                ])
+                .map_err(|e| e.to_string())?,
+            );
         }
     }
     rules.insert(libc::SYS_socket, socket_rules);

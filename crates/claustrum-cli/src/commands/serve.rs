@@ -123,8 +123,10 @@ mod broker {
         let exe = std::env::current_exe()
             .and_then(|p| p.canonicalize())
             .context("cannot locate the claustrum binary")?;
+        // Private to the user (tempfile's default is 0755).
         let tmp = tempfile::Builder::new()
             .prefix("claustrum-worker-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir()
             .context("cannot create the worker's temporary directory")?;
         let profile = worker_profile(&config, workspace, &exe, &protected, &log_path, tmp.path())?;

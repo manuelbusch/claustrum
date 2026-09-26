@@ -299,16 +299,20 @@ impl ActionDef {
         let Some((program, rest)) = self.command.split_first() else {
             return Err(err("`command` must not be empty".into()));
         };
-        let program = if ctx.resolve_programs {
-            resolve_program(program).map_err(&err)?
-        } else {
-            PathBuf::from(program)
-        };
         let argv = rest
             .iter()
             .map(|a| Template::parse(a))
             .collect::<Result<Vec<_>, _>>()
             .map_err(&err)?;
+        // By the declared name first, so that the refusal does not depend on
+        // what is installed here, then by the resolved program (`sh` may be
+        // a link to `dash`).
+        refuse_reparsed_inputs(Path::new(program), &argv).map_err(&err)?;
+        let program = if ctx.resolve_programs {
+            resolve_program(program).map_err(&err)?
+        } else {
+            PathBuf::from(program)
+        };
         refuse_reparsed_inputs(&program, &argv).map_err(&err)?;
 
         let cwd = match &self.cwd {

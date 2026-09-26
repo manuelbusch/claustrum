@@ -10,10 +10,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, TryLockError,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, TryLockError},
     time::Duration,
 };
 
@@ -233,29 +230,46 @@ impl ActionExecutor for ActionHost {
 }
 
 /// A fresh temporary directory for one confined action, removed afterwards.
-struct PrivateTmp(PathBuf);
+/// The action's `$TMPDIR`: a fresh directory with a random name, created
+/// exclusively and readable by the user only, so that other local users can
+/// neither pre-create it nor read what the action leaves there. Removed when
+/// the action is done.
+struct PrivateTmp(tempfile::TempDir);
 
 impl PrivateTmp {
     fn create(action: &str) -> std::io::Result<Self> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Canonical, so that OS profiles match it (macOS: /var → /private/var).
         let base = std::env::temp_dir().canonicalize()?;
-        let dir = base.join(format!(
-            "claustrum-{}-{}-{action}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&dir)?;
+        let prefix = format!("claustrum-{action}-");
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix);
+        // Set at creation, not afterwards: nobody else can open it between.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        let dir = builder.tempdir_in(base)?;
         Ok(Self(dir))
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
 }
 
-impl Drop for PrivateTmp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+#[cfg(all(test, unix))]
+mod tmp_tests {
+    use super::PrivateTmp;
+
+    #[test]
+    fn private_tmp_is_random_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = PrivateTmp::create("build").unwrap();
+        let b = PrivateTmp::create("build").unwrap();
+        assert_ne!(a.path(), b.path());
+        let mode = std::fs::metadata(a.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
     }
 }
 

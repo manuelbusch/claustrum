@@ -43,6 +43,14 @@ const MAX_HEAD: usize = 16 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time allowed to connect upstream.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connections served at once; more wait in the listen backlog. Keeps an
+/// action from exhausting the broker's file descriptors.
+const MAX_CONNECTIONS: usize = 256;
+/// A relayed connection without traffic in either direction for this long
+/// is closed, so half-open connections do not hold descriptors forever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Pause after a failed `accept` (e.g. `EMFILE`), instead of spinning.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(200);
 
 pub struct ActionProxy;
 
@@ -99,22 +107,7 @@ impl ActionProxy {
         } else {
             None
         };
-        let expected = secret.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let policy = Arc::clone(&policy);
-                let log = Arc::clone(&log);
-                let expected = expected.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = serve(stream, &policy, &log, &expected).await {
-                        tracing::debug!(error = %e, "proxy connection ended");
-                    }
-                });
-            }
-        });
+        let task = accept_loop(listener, policy, log, secret.clone());
         Ok(ProxyHandle {
             addr,
             secret,
@@ -139,23 +132,117 @@ fn start_unix(
     ));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let listener = tokio::net::UnixListener::bind(dir.join(UNIX_SOCKET))?;
-    let (policy, log, expected) = (Arc::clone(policy), Arc::clone(log), secret.to_owned());
-    let task = tokio::spawn(async move {
+    let task = accept_loop(
+        listener,
+        Arc::clone(policy),
+        Arc::clone(log),
+        secret.to_owned(),
+    );
+    Ok((dir, task))
+}
+
+/// A listener the proxy serves.
+trait Listener: Send + 'static {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    fn accept_one(&self)
+    -> impl std::future::Future<Output = std::io::Result<Self::Stream>> + Send;
+}
+
+impl Listener for TcpListener {
+    type Stream = TcpStream;
+    async fn accept_one(&self) -> std::io::Result<TcpStream> {
+        self.accept().await.map(|(s, _)| s)
+    }
+}
+
+#[cfg(unix)]
+impl Listener for tokio::net::UnixListener {
+    type Stream = tokio::net::UnixStream;
+    async fn accept_one(&self) -> std::io::Result<tokio::net::UnixStream> {
+        self.accept().await.map(|(s, _)| s)
+    }
+}
+
+/// Serve `listener` until the task is aborted: at most [`MAX_CONNECTIONS`]
+/// at once, pausing after a failed `accept` instead of retrying at once.
+fn accept_loop<L: Listener>(
+    listener: L,
+    policy: Arc<NetPolicy>,
+    log: Arc<ConnectionLog>,
+    secret: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
+            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                return;
             };
-            let policy = Arc::clone(&policy);
-            let log = Arc::clone(&log);
-            let expected = expected.clone();
+            let stream = match listener.accept_one().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "proxy cannot accept a connection");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            };
+            let (policy, log, secret) = (Arc::clone(&policy), Arc::clone(&log), secret.clone());
             tokio::spawn(async move {
-                if let Err(e) = serve(stream, &policy, &log, &expected).await {
+                let _slot = slot;
+                if let Err(e) = serve(stream, &policy, &log, &secret).await {
                     tracing::debug!(error = %e, "proxy connection ended");
                 }
             });
         }
-    });
-    Ok((dir, task))
+    })
+}
+
+/// Copy between `a` and `b` in both directions until both are done, like
+/// `copy_bidirectional`, but give up after [`IDLE_TIMEOUT`] without any
+/// traffic.
+async fn relay(
+    a: impl AsyncRead + AsyncWrite + Unpin + Send,
+    b: impl AsyncRead + AsyncWrite + Unpin + Send,
+    idle: Duration,
+) -> std::io::Result<()> {
+    let last = std::sync::Mutex::new(tokio::time::Instant::now());
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+    let both = async {
+        tokio::try_join!(pump(&mut ar, &mut bw, &last), pump(&mut br, &mut aw, &last)).map(|_| ())
+    };
+    let watchdog = async {
+        loop {
+            tokio::time::sleep(idle / 4).await;
+            let since = last.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
+            if since > idle {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connection idle",
+                ));
+            }
+        }
+    };
+    tokio::select! {
+        r = both => r,
+        e = watchdog => e,
+    }
+}
+
+/// One direction of [`relay`]; records the time of the last traffic.
+async fn pump(
+    r: &mut (impl AsyncRead + Unpin),
+    w: &mut (impl AsyncWrite + Unpin),
+    last: &std::sync::Mutex<tokio::time::Instant>,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            return w.shutdown().await;
+        }
+        w.write_all(&buf[..n]).await?;
+        *last.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
+    }
 }
 
 #[cfg(not(unix))]
@@ -319,7 +406,7 @@ async fn open_upstream(
 }
 
 async fn serve(
-    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
     policy: &NetPolicy,
     log: &ConnectionLog,
     secret: &str,
@@ -365,8 +452,7 @@ async fn serve(
         if !rest.is_empty() {
             upstream.write_all(&rest).await?;
         }
-        tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
-        return Ok(());
+        return relay(stream, upstream, IDLE_TIMEOUT).await;
     }
 
     // Absolute-form plain HTTP.
@@ -418,14 +504,59 @@ async fn serve(
     if !rest.is_empty() {
         upstream.write_all(&rest).await?;
     }
-    tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
-    Ok(())
+    relay(stream, upstream, IDLE_TIMEOUT).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::net::policy::NetMode;
+
+    #[tokio::test]
+    async fn relay_copies_both_ways_and_drops_idle_connections() {
+        let idle = Duration::from_millis(300);
+        let (mut client, a) = tokio::io::duplex(1024);
+        let (b, mut server) = tokio::io::duplex(1024);
+        let relayed = tokio::spawn(relay(a, b, idle));
+
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        // Traffic in one direction only keeps the connection open.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            server.write_all(b"pong").await.unwrap();
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"pong");
+        }
+        assert!(!relayed.is_finished());
+
+        // Silence: closed after the idle timeout.
+        let started = std::time::Instant::now();
+        let err = relayed.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn relay_ends_when_both_sides_close() {
+        let (mut client, a) = tokio::io::duplex(1024);
+        let (b, mut server) = tokio::io::duplex(1024);
+        let relayed = tokio::spawn(relay(a, b, Duration::from_secs(60)));
+        client.write_all(b"bye").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"bye");
+        server.shutdown().await.unwrap();
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(2), relayed)
+            .await
+            .expect("relay ended")
+            .unwrap()
+            .unwrap();
+    }
 
     async fn echo_server() -> SocketAddr {
         let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

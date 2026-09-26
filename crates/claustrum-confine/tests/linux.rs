@@ -211,3 +211,65 @@ fn loopback_reaches_only_the_proxy() {
     let (ok, out) = run(&p, "curl -sS -m 3 -o /dev/null https://1.1.1.1");
     assert!(!ok, "direct network should be denied: {out}");
 }
+
+#[test]
+fn loopback_refuses_other_socket_types() {
+    let (_d, ws) = workspace();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut p = profile(&ws);
+    p.network = Network::Loopback(tcp.local_addr().unwrap().port());
+    // Prints `<name> <errno>` for each attempt, 0 when the socket was created.
+    let script = r#"python3 - <<'PY'
+import socket
+tries = [
+    ("tcp", socket.SOCK_STREAM, 0),
+    ("tcp-explicit", socket.SOCK_STREAM, socket.IPPROTO_TCP),
+    ("udp", socket.SOCK_DGRAM, 0),
+    ("raw", socket.SOCK_RAW, socket.IPPROTO_ICMP),
+    ("seqpacket", socket.SOCK_SEQPACKET, 0),
+    ("sctp-stream", socket.SOCK_STREAM, 132),
+    ("mptcp", socket.SOCK_STREAM, 262),
+    ("udp-cloexec", socket.SOCK_DGRAM | socket.SOCK_CLOEXEC, 0),
+]
+for name, ty, proto in tries:
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.socket(family, ty, proto).close()
+            print(name, family, 0)
+        except OSError as e:
+            print(name, family, e.errno)
+PY"#;
+    let (ok, out) = run(&p, script);
+    assert!(ok, "{out}");
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(_family), Some(errno)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let errno: i32 = errno.parse().unwrap_or(-1);
+        if name.starts_with("tcp") {
+            assert_eq!(errno, 0, "{line}\n{out}");
+        } else {
+            assert_eq!(
+                errno,
+                libc::EPERM,
+                "{name} was not refused by seccomp: {line}\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn name_service_lookups_work_without_unix_sockets() {
+    // glibc's NSS modules for systemd (nss-resolve, nss-systemd) talk over
+    // Unix sockets, which seccomp refuses; they must report UNAVAIL so that
+    // the lookup falls through to files and DNS.
+    let (_d, ws) = workspace();
+    for net in [Network::None, Network::Outbound] {
+        let mut p = profile(&ws);
+        p.network = net;
+        let (ok, out) = run(&p, "getent passwd \"$(id -u)\" && getent hosts localhost");
+        assert!(ok, "{out}");
+    }
+}
