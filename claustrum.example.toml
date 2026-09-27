@@ -179,7 +179,8 @@ source = "syrusakbary/jq@=0.1.0"
 
 # Built-in Claude Code tools to keep. Empty removes all of them except
 # AskUserQuestion, which only prompts the user; WebSearch is safe to keep
-# because it runs on the API side.
+# because it runs on the API side. Agent enables subagents, which only get
+# the Claustrum tools (see "Subagents" in the README).
 tools = []
 
 # Extra arguments always passed to claude. Flags that would override the

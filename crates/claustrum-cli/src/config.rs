@@ -151,7 +151,8 @@ pub struct ClaudeSection {
     /// Built-in Claude Code tools to keep enabled (passed to `--tools`).
     /// Empty by default, which removes every built-in tool except
     /// `AskUserQuestion`, which only prompts the user. `WebSearch` is a
-    /// reasonable addition since it runs on the API side, not on the host.
+    /// reasonable addition since it runs on the API side, not on the host;
+    /// `Agent` enables subagents, which only get the session's tools.
     #[serde(default)]
     pub tools: Vec<String>,
     /// Extra arguments always passed to `claude`.

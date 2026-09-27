@@ -112,6 +112,26 @@ Rust on top of the same virtual file system, so they are fast and never spawn a 
 `AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` stay enabled as the only built-in
 tools; they ask the user or switch the mode and touch nothing.
 
+### Subagents
+
+The `Agent` tool is off by default and can be enabled with `[claude] tools = ["Agent"]`.
+Subagents only get tools the session already has, so they work through the same
+`mcp__claustrum__*` tools and stay in the sandbox. Probed with Claude Code 2.1.284:
+
+- Explore and general-purpose get the Claustrum tools only, no built-in `Bash`, `Read`,
+  `Write`, ...
+- `tools: Bash, Read, Write` in an agent's frontmatter does not bring the built-ins back;
+  Claude Code refuses to start an agent whose tool list resolves to nothing.
+- `hooks` and `mcpServers` in an agent's frontmatter take no effect: no hook command runs on
+  the host, and `--strict-mcp-config` keeps the extra server out.
+
+Explore also gets `mcp__claustrum__Write` and `Edit`, so unlike in plain Claude Code it
+is not read-only. The guarantees above are Claude Code's behavior, not Claustrum's:
+`.claude/agents/` stays writable from the sandbox, and a later Claude Code release that
+honors frontmatter hooks there would run them on the host. Run
+[`scripts/probe-subagents.sh`](scripts/probe-subagents.sh) on the host after upgrading
+Claude Code; every file it lists under "host side effects" is an escape.
+
 ### Sandbox layout
 
 | Guest path | Backing | Notes |
