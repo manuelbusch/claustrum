@@ -165,7 +165,7 @@ pub(crate) fn command(
     let mut cmd = if bwrap {
         let path = bwrap_path().ok_or_else(|| Unavailable("bwrap disappeared".into()))?;
         let mut cmd = Command::new(path);
-        cmd.args(bwrap_args(&profile, &helper, program));
+        cmd.args(bwrap_args(&profile, &helper, program)?);
         cmd.arg("--").arg(&helper);
         cmd
     } else {
@@ -175,7 +175,7 @@ pub(crate) fn command(
     Ok(cmd)
 }
 
-fn bwrap_args(p: &Profile, helper: &Path, program: &Path) -> Vec<OsString> {
+fn bwrap_args(p: &Profile, helper: &Path, program: &Path) -> Result<Vec<OsString>, Unavailable> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |parts: &[&std::ffi::OsStr]| a.extend(parts.iter().map(|s| s.to_os_string()));
     push(&[
@@ -195,7 +195,9 @@ fn bwrap_args(p: &Profile, helper: &Path, program: &Path) -> Vec<OsString> {
         for dir in SYSTEM_DIRS {
             push(&["--ro-bind-try".as_ref(), dir.as_ref(), dir.as_ref()]);
         }
-        for r in p.read.iter().map(PathBuf::as_path).chain([helper, program]) {
+        // Resolved like the profile: bwrap cannot mount on a link (`/bin/sh`).
+        let own = [resolve(helper), resolve(program)];
+        for r in p.read.iter().chain(&own) {
             push(&["--ro-bind-try".as_ref(), r.as_os_str(), r.as_os_str()]);
         }
         if let Exec::Only(programs) = &p.exec {
@@ -222,6 +224,13 @@ fn bwrap_args(p: &Profile, helper: &Path, program: &Path) -> Vec<OsString> {
     if let Some(sock) = &p.proxy_socket {
         push(&["--bind".as_ref(), sock.as_os_str(), sock.as_os_str()]);
     }
+    // Before the hidden paths: a new bind of an ancestor would uncover them.
+    for (dir, open) in guarded_dirs(p)? {
+        push(&["--ro-bind".as_ref(), dir.as_os_str(), dir.as_os_str()]);
+        for c in open {
+            push(&["--bind".as_ref(), c.as_os_str(), c.as_os_str()]);
+        }
+    }
     for d in &p.deny_read {
         match std::fs::metadata(d) {
             Ok(m) if m.is_dir() => push(&[
@@ -234,12 +243,79 @@ fn bwrap_args(p: &Profile, helper: &Path, program: &Path) -> Vec<OsString> {
             Err(_) => {}
         }
     }
+    // Last, so that no later bind covers them.
     for f in &p.deny_write {
         if f.exists() {
             push(&["--ro-bind".as_ref(), f.as_os_str(), f.as_os_str()]);
         }
     }
-    a
+    Ok(a)
+}
+
+/// Directories to bind read-only because a protected file in them does not
+/// exist yet (`.claude/settings.json`): a bind mount needs a file, and
+/// creating one would change the user's project. Each comes with its
+/// children, which stay writable, so only new entries directly in the
+/// directory are refused. Outer directories come first.
+///
+/// A missing file directly in a writable tree cannot be protected this way
+/// without making the whole tree read-only, so the profile is refused.
+fn guarded_dirs(p: &Profile) -> Result<Vec<(PathBuf, Vec<PathBuf>)>, Unavailable> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for f in &p.deny_write {
+        if f.exists() {
+            continue;
+        }
+        // The innermost writable tree; outside all of them nothing can be
+        // created anyway.
+        let Some(root) = p
+            .write
+            .iter()
+            .filter(|w| f.starts_with(w) && w.exists())
+            .max_by_key(|w| w.components().count())
+        else {
+            continue;
+        };
+        let dir = f.ancestors().skip(1).find(|a| a.exists()).unwrap_or(root);
+        if dir == root {
+            return Err(Unavailable(format!(
+                "{}: cannot keep {} from being created in the writable {}",
+                p.name,
+                f.display(),
+                root.display()
+            )));
+        }
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs.sort_by_key(|d| d.components().count());
+    let guarded = |c: &Path| {
+        p.deny_write
+            .iter()
+            .chain(&p.deny_read)
+            .chain(&dirs)
+            .any(|g| g.starts_with(c))
+    };
+    let mut out = Vec::new();
+    for dir in &dirs {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| Unavailable(format!("{}: cannot list {}: {e}", p.name, dir.display())))?;
+        let mut open = Vec::new();
+        for e in entries {
+            let e = e.map_err(|e| {
+                Unavailable(format!("{}: cannot list {}: {e}", p.name, dir.display()))
+            })?;
+            let c = e.path();
+            // A bind follows links, possibly out of the writable tree.
+            let is_link = e.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if !is_link && !guarded(&c) {
+                open.push(c);
+            }
+        }
+        out.push((dir.clone(), open));
+    }
+    Ok(out)
 }
 
 /// The helper stage: bridge, Landlock, seccomp, exec. Runs as a fresh,

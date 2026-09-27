@@ -210,6 +210,9 @@ AppArmor), Claustrum falls back to Landlock and seccomp and says so on start. La
 only grant, not deny, so two guarantees get weaker there: a file inside a writable tree cannot
 be made read-only (the configuration is then protected by the WASIX layer and restored after
 each action only), and the proxy port is reachable on every address, not only on `localhost`.
+A process that escapes the WASIX layer could then also create `.claude/settings.json` or
+`settings.local.json` in the workspace and so plant Claude Code hooks, which run on the host.
+Enable unprivileged user namespaces where you can, so that bubblewrap is used.
 
 `claustrum run` and `serve` print the active confinement, network mode and enabled actions on
 every start.
@@ -340,6 +343,12 @@ those files nor turn `.claude` into a link. Other files in `.claude` (agents, co
 skills) stay writable. Their shell snippets only run through the built-in Bash tool, which
 Claustrum removes.
 
+`claustrum serve` creates `.claude` in the workspace if it is missing. Under bubblewrap, a
+settings file that does not exist yet cannot be protected by a bind mount of its own, so
+`.claude` itself is bound read-only and its existing entries read/write again: a new entry
+directly in `.claude` (a new `agents` directory, say) has to be created outside the sandbox,
+while everything below existing entries stays writable.
+
 ### Plan mode
 
 `claustrum run --permission-mode plan` (or Shift+Tab in the session) works as usual. Claude
@@ -454,6 +463,12 @@ stores them in the user data directory and records each package's identity in a 
 file next to it, which is how dependencies between packages (bash depends on coreutils)
 resolve offline. Files obtained some other way can be given an explicit `id` in the
 configuration.
+
+The default packages are pinned to the versions below (`wasmer/coreutils@=1.0.25`, ...), so a
+new release in the registry does not change the sandbox. In your own `[[packages.package]]`
+entries, pin with `@=<version>`: a bare `@<version>` is a semver requirement and takes the
+newest compatible release. To upgrade, change the version and run `claustrum pkg sync --force`;
+without `--force`, packages already present are kept.
 
 | Package | Provides | Notes |
 | --- | --- | --- |

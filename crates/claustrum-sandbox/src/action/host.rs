@@ -134,6 +134,17 @@ impl ActionHost {
             p.write.push(dir.clone());
         }
         p.deny_write = self.protected.clone();
+        // Bubblewrap cannot keep a missing file directly in a writable tree
+        // from being created and refuses such a profile. The run restores
+        // protected paths afterwards and moves aside what was created.
+        #[cfg(target_os = "linux")]
+        p.deny_write.retain(|f| {
+            f.exists()
+                || !p
+                    .write
+                    .iter()
+                    .any(|w| f.parent() == Some(claustrum_confine::resolve(w).as_path()))
+        });
         p.network = match &self.proxy {
             Some(proxy) => Network::Loopback(proxy.addr().port()),
             None => Network::Any,

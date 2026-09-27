@@ -85,6 +85,11 @@ mod broker {
     pub(super) async fn broker(config: Config, workspace: &Path) -> Result<()> {
         let policy = config.policy(workspace)?;
         let specs = config.validate_actions(workspace)?;
+        // So that the missing Claude Code settings have a directory that
+        // bubblewrap can bind read-only (see `claustrum_confine::linux`).
+        let claude_dir = workspace.join(".claude");
+        std::fs::create_dir_all(&claude_dir)
+            .with_context(|| format!("cannot create {}", claude_dir.display()))?;
         let protected = resolve_all(&config.protected_paths(workspace));
         let log_path = policy
             .network
@@ -284,6 +289,18 @@ mod broker {
         p.write.push(tmp.to_path_buf());
 
         p.deny_write = protected.to_vec();
+        // Bubblewrap cannot keep a missing file directly in a writable tree
+        // from being created and refuses such a profile. Only a project
+        // `claustrum.toml` lies there; a new one is not used before the user
+        // trusts its content, and the WASIX layer refuses to create it.
+        #[cfg(target_os = "linux")]
+        p.deny_write.retain(|f| {
+            f.exists()
+                || !p
+                    .write
+                    .iter()
+                    .any(|w| f.parent() == Some(claustrum_confine::resolve(w).as_path()))
+        });
         p.deny_read = confinement.deny_read;
         // Also when CLAUDE_CONFIG_DIR moves it out of the built-in list; plan
         // files go through the broker.
