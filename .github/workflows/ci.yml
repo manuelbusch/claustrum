@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # bubblewrap + Landlock + seccomp
+          - name: linux (bubblewrap)
+            os: ubuntu-24.04
+            bwrap: true
+          # Fallback without user namespaces: Landlock + seccomp only
+          - name: linux (landlock only)
+            os: ubuntu-24.04
+            bwrap: false
+          # Seatbelt
+          - name: macos
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Both Linux entries build the same thing.
+          shared-key: ${{ runner.os }}
+
+      - name: Install bubblewrap
+        if: runner.os == 'Linux' && matrix.bwrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor,
+          # which would make Claustrum fall back to Landlock silently.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --unshare-all /usr/bin/true
+
+      - name: Disable bubblewrap
+        if: runner.os == 'Linux' && !matrix.bwrap
+        run: echo "CLAUSTRUM_NO_BWRAP=1" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      # The integration tests skip themselves without packages, so fetch them.
+      - name: Restore packages
+        id: packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            packages/*.webc
+            packages/*.sha256
+          key: wasmer-packages-${{ hashFiles('packages/*.id') }}
+          enableCrossOsArchive: true
+
+      - name: Download packages
+        if: steps.packages.outputs.cache-hit != 'true'
+        run: cargo run --locked -p claustrum-cli -- --packages-dir packages pkg sync
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  shim:
+    name: hostcmd shim
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shim
+
+      - name: Build
+        working-directory: shim
+        run: cargo build --release --locked --target wasm32-wasip1
