@@ -295,7 +295,10 @@ writable = ["~/.cargo/registry"]
 | `[actions]` | `command`, `[[actions.action]]` | fixed host commands Claude may trigger, see [Host actions](#host-actions) |
 | `[claude]` | `binary`, `tools`, `args`, `system_prompt`, `plans` | how `claude` is launched, [plan mode](#plan-mode) |
 
-[`claustrum.example.toml`](claustrum.example.toml) documents every key.
+[`claustrum.example.toml`](claustrum.example.toml) documents every key;
+[`examples/rust.claustrum.toml`](examples/rust.claustrum.toml) is a complete setup for a Rust
+project (check, build, test, clippy, fmt, doc, add-dep, update and the local git workflow as confined
+actions; dependency sources mounted read-only).
 
 ### A project's configuration needs your trust
 
