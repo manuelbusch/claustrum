@@ -46,7 +46,9 @@ through the host actions (`host` lists them): `host check`, `host test`,
 `host test-crate <crate> [filter]`, `host clippy`, `host fmt`. git is not
 available either; use `host status`, `host diff`, `host add <path>`,
 `host commit <message>`, `host switch <branch>`, `host merge <branch>` and
-the other git actions. Dependency sources are mounted read-only under
+the other git actions. For a multi-line commit message, write it to
+target/commit-msg.txt, run `host commit-file target/commit-msg.txt` and delete
+the file afterwards. Dependency sources are mounted read-only under
 /cargo/registry."""
 
 # Host actions. Everything runs confined: writes are limited to the workspace
@@ -248,6 +250,19 @@ name = "message"
 description = "Commit message, a single line"
 pattern = ".{1,1000}"
 max_len = 1000
+
+# Inputs cannot contain line breaks, so a message with a body or trailers is
+# read from a file. A `path` input stays inside the workspace, also through
+# links. `--cleanup=whitespace` keeps lines starting with `#`.
+[[actions.action]]
+name = "commit-file"
+description = "Commit the staged changes with the message read from a file in the workspace (multi-line, e.g. target/commit-msg.txt)"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "commit", "--no-verify", "--cleanup=whitespace", "-F", "{file}"]
+
+[[actions.action.input]]
+name = "file"
+kind = "path"
+must_exist = true
 
 [[actions.action]]
 name = "switch"
