@@ -65,7 +65,6 @@ jobs:
 
       # The integration tests skip themselves without packages, so fetch them.
       - name: Restore packages
-        id: packages
         uses: actions/cache@v4
         with:
           path: |
@@ -76,8 +75,9 @@ jobs:
           key: wasmer-packages-${{ hashFiles('crates/claustrum-cli/src/config.rs') }}
           enableCrossOsArchive: true
 
-      - name: Download packages
-        if: steps.packages.outputs.cache-hit != 'true'
+      # Also on a cache hit: pkg sync skips present packages but precompiles
+      # them, and the tests' time limits assume a warm module cache.
+      - name: Download and precompile packages
         run: cargo run --locked -p claustrum-cli -- --packages-dir packages pkg sync
 
       - name: Test

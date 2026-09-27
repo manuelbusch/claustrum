@@ -15,6 +15,33 @@ fn packages_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages")
 }
 
+/// Confined host actions run through the confinement helper, which is the
+/// running executable unless `CLAUSTRUM_CONFINE_HELPER` says otherwise. Here
+/// that would be this test binary, so point it at the helper that
+/// `claustrum-confine` builds into the same profile directory.
+#[cfg(target_os = "linux")]
+fn confine_helper() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("CLAUSTRUM_CONFINE_HELPER").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let helper = exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .unwrap()
+            .join("claustrum-confine-helper");
+        assert!(
+            helper.exists(),
+            "{} is missing; build it with `cargo build -p claustrum-confine`",
+            helper.display()
+        );
+        // SAFETY: set once, before this test binary starts a confined action.
+        unsafe { std::env::set_var("CLAUSTRUM_CONFINE_HELPER", helper) };
+    });
+}
+
 async fn sandbox(workspace: &std::path::Path) -> Option<Sandbox> {
     sandbox_with(workspace, |b| b).await
 }
@@ -23,6 +50,8 @@ async fn sandbox_with(
     workspace: &std::path::Path,
     customize: impl FnOnce(SandboxBuilder) -> SandboxBuilder,
 ) -> Option<Sandbox> {
+    #[cfg(target_os = "linux")]
+    confine_helper();
     let dir = packages_dir();
     if !dir.join("bash.webc").exists() || !dir.join("coreutils.webc").exists() {
         eprintln!("skipping: bundled packages not found in {}", dir.display());
@@ -339,6 +368,9 @@ async fn commands_time_out() {
     let Some(sb) = sandbox(ws.path()).await else {
         return;
     };
+    // Compile `sleep` first: with a cold module cache that alone can take
+    // longer than the time limit below.
+    sb.bash("sleep 0", ExecOptions::default()).await.unwrap();
 
     let out = sb
         .bash(
@@ -780,7 +812,9 @@ async fn read_only_mounts_refuse_writes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn plans_are_written_outside_the_guest() {
     let ws = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    // Not under /tmp, which is a guest path of its own (in memory): writes
+    // there would succeed without reaching the plan directory.
+    let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let dir = home.path().join("plans");
     let store = Arc::new(HostPlans::new(&dir, home.path().join("ws.list")));
     let guest = dir.to_str().unwrap().to_owned();
@@ -1270,11 +1304,15 @@ async fn confined_actions_cannot_even_write_the_configuration() {
         .await
         .unwrap();
     assert_eq!(out.stdout_lossy(), "done\n");
-    assert!(
-        !out.stderr_lossy().contains("restored"),
-        "{}",
-        out.stderr_lossy()
-    );
+    // Landlock alone cannot keep a file read-only inside the writable
+    // workspace; there only the restore after the action applies.
+    if claustrum_confine::backend().ok() != Some(claustrum_confine::Backend::Landlock) {
+        assert!(
+            !out.stderr_lossy().contains("restored"),
+            "{}",
+            out.stderr_lossy()
+        );
+    }
     assert_eq!(std::fs::read_to_string(&config).unwrap(), "# original\n");
 }
 
@@ -1304,6 +1342,8 @@ async fn run_action_serves_the_mcp_tool() {
 #[tokio::test(flavor = "multi_thread")]
 async fn action_command_must_not_shadow_a_package_command() {
     let ws = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "linux")]
+    confine_helper();
     let dir = packages_dir();
     if !dir.join("bash.webc").exists() || !dir.join("coreutils.webc").exists() {
         return;
