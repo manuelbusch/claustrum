@@ -20,11 +20,13 @@ use serde::Deserialize;
 pub const CLAUDE_SETTINGS: &[&str] = &["settings.json", "settings.local.json"];
 
 /// Packages installed by `claustrum pkg sync` when none are configured.
+/// Pinned with `=`: a bare `@1.0.25` is a semver requirement (`^1.0.25`), and
+/// the registry lookup takes the highest match.
 pub const DEFAULT_PACKAGES: &[(&str, &str)] = &[
-    ("wasmer/bash", "bash.webc"),
-    ("wasmer/coreutils", "coreutils.webc"),
-    ("python/python", "python.webc"),
-    ("syrusakbary/jq", "jq.webc"),
+    ("wasmer/bash@=1.0.25", "bash.webc"),
+    ("wasmer/coreutils@=1.0.25", "coreutils.webc"),
+    ("python/python@=3.13.20", "python.webc"),
+    ("syrusakbary/jq@=0.1.0", "jq.webc"),
 ];
 
 #[derive(Debug, Deserialize, Default)]
@@ -813,6 +815,20 @@ pub fn read_stamp(webc: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bundled `packages/*.id` (used by the tests) name the pinned defaults.
+    #[test]
+    fn default_packages_match_the_bundled_ids() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages");
+        for (source, file) in DEFAULT_PACKAGES {
+            let id = read_stamp(&dir.join(file));
+            assert_eq!(
+                id.as_deref(),
+                Some(source.replace("@=", "@").as_str()),
+                "{file}"
+            );
+        }
+    }
 
     #[test]
     fn parses_actions() {

@@ -131,6 +131,25 @@ async fn profile_disables_pagers_and_colours() {
     );
 }
 
+/// `ls` must not guess a terminal from the character-device stdio; options
+/// given by the caller still win.
+#[tokio::test(flavor = "multi_thread")]
+async fn ls_prints_one_entry_per_line() {
+    let ws = tempfile::tempdir().unwrap();
+    for f in ["a", "b", "c"] {
+        std::fs::write(ws.path().join(f), "").unwrap();
+    }
+    let Some(sb) = sandbox(ws.path()).await else {
+        return;
+    };
+    let out = sb.bash("ls; ls -C", ExecOptions::default()).await.unwrap();
+    assert!(out.success(), "stderr: {}", out.stderr_lossy());
+    let stdout = out.stdout_lossy();
+    let (lines, columns) = stdout.split_at(6);
+    assert_eq!(lines, "a\nb\nc\n");
+    assert_eq!(columns.lines().count(), 1, "{stdout}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bash_runs_pipelines_and_sees_workspace() {
     let ws = tempfile::tempdir().unwrap();

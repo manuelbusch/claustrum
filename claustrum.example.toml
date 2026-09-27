@@ -79,23 +79,24 @@ online = false
 
 # Packages loaded into the sandbox. When this list is empty, bash, coreutils,
 # python and jq are used. `source` is what `claustrum pkg sync` downloads;
+# pin it with `@=<version>` (a bare `@<version>` also accepts newer releases);
 # `id` is only needed for files obtained elsewhere that other packages depend
 # on. `file` may also name a directory package created by `pkg add-wasm`.
 [[packages.package]]
 file = "bash.webc"
-source = "wasmer/bash"
+source = "wasmer/bash@=1.0.25"
 
 [[packages.package]]
 file = "coreutils.webc"
-source = "wasmer/coreutils"
+source = "wasmer/coreutils@=1.0.25"
 
 [[packages.package]]
 file = "python.webc"
-source = "python/python"
+source = "python/python@=3.13.20"
 
 [[packages.package]]
 file = "jq.webc"
-source = "syrusakbary/jq"
+source = "syrusakbary/jq@=0.1.0"
 
 # A self-built WASIX binary, e.g. from scripts/build-jaq.sh:
 # [[packages.package]]

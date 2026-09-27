@@ -32,7 +32,7 @@ const PROFILE: &str = r#"# Claustrum sandbox profile. Output is captured for a l
 # on a terminal: no colours, no pagers, no interactive prompts.
 export PAGER=cat GIT_PAGER=cat NO_COLOR=1 CLICOLOR=0 PYTHONUNBUFFERED=1
 jq() { command jq -M "$@"; }
-ls() { command ls --color=never "$@"; }
+ls() { command ls -1 --color=never "$@"; }
 "#;
 
 /// An additional host directory mounted into the guest.
