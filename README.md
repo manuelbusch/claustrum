@@ -132,6 +132,17 @@ honors frontmatter hooks there would run them on the host. Run
 [`scripts/probe-subagents.sh`](scripts/probe-subagents.sh) on the host after upgrading
 Claude Code; every file it lists under "host side effects" is an escape.
 
+Workflows (multi-agent orchestration, "ultracode") need the `Workflow` tool as well:
+`[claude] tools = ["Agent", "Workflow"]`. The script runs in the `claude` process, but every
+agent it starts gets the Claustrum tools only, like a subagent, and cannot start agents of
+its own. [`scripts/probe-workflow.js`](scripts/probe-workflow.js) checks this: ask Claude to
+run it as a workflow and look at `leakedBuiltins` in the result, which must be empty. Claude
+has to pass the script inline, because the `Workflow` tool reads script files on the host
+and does not accept paths it has not seen itself.
+
+Subagents and workflow agents can trigger [host actions](#host-actions) through
+`mcp__claustrum__Action` like the main session.
+
 ### Sandbox layout
 
 | Guest path | Backing | Notes |

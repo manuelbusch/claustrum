@@ -152,7 +152,8 @@ pub struct ClaudeSection {
     /// Empty by default, which removes every built-in tool except
     /// `AskUserQuestion`, which only prompts the user. `WebSearch` is a
     /// reasonable addition since it runs on the API side, not on the host;
-    /// `Agent` enables subagents, which only get the session's tools.
+    /// `Agent` enables subagents and `Workflow` multi-agent workflows, whose
+    /// agents only get the session's tools.
     #[serde(default)]
     pub tools: Vec<String>,
     /// Extra arguments always passed to `claude`.
