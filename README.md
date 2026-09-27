@@ -109,8 +109,8 @@ Rust on top of the same virtual file system, so they are fast and never spawn a 
 | `Action` | `name`, `inputs` | only when [host actions](#host-actions) are configured |
 | `WritePlan`, `EditPlan` | as `Write` and `Edit` | plan files only, see [Plan mode](#plan-mode) |
 
-`EnterPlanMode` and `ExitPlanMode` stay enabled as the only built-in tools; they switch the
-mode and touch nothing.
+`AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` stay enabled as the only built-in
+tools; they ask the user or switch the mode and touch nothing.
 
 ### Sandbox layout
 

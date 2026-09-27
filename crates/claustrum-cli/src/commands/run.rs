@@ -14,8 +14,28 @@ use crate::config::Config;
 /// MCP server name; tools appear as `mcp__claustrum__<Tool>`.
 pub const SERVER_NAME: &str = "claustrum";
 
+/// Built-in tools that are always kept: they only talk to the user and touch
+/// nothing on the host. Without `AskUserQuestion` Claude cannot ask for
+/// clarification at all.
+const ALWAYS_TOOLS: &[&str] = &["AskUserQuestion"];
+
 /// Built-in tools kept for plan mode.
 const PLAN_TOOLS: &[&str] = &["EnterPlanMode", "ExitPlanMode"];
+
+/// The `--tools` list: the configured built-ins plus the harmless ones that
+/// are always kept, without duplicates.
+fn builtin_tools(configured: &[String], plans: bool) -> Vec<String> {
+    let mut tools = configured.to_vec();
+    let extra = ALWAYS_TOOLS
+        .iter()
+        .chain(if plans { PLAN_TOOLS } else { &[][..] });
+    for t in extra {
+        if !tools.iter().any(|x| x == t) {
+            tools.push((*t).to_owned());
+        }
+    }
+    tools
+}
 
 #[derive(clap::Args, Debug)]
 #[command(trailing_var_arg = true)]
@@ -114,15 +134,9 @@ pub fn run(config: Config, args: Args) -> Result<()> {
     });
 
     // Remove every built-in tool (unless configured otherwise); MCP tools are
-    // unaffected by --tools. The plan mode tools only switch the mode.
-    let mut tools = config.file.claude.tools.clone();
-    if plans.is_some() {
-        for t in PLAN_TOOLS {
-            if !tools.iter().any(|x| x == t) {
-                tools.push((*t).to_owned());
-            }
-        }
-    }
+    // unaffected by --tools. AskUserQuestion only prompts the user and the
+    // plan mode tools only switch the mode.
+    let tools = builtin_tools(&config.file.claude.tools, plans.is_some());
 
     let mut cmd = Command::new(&claude);
     cmd.current_dir(&workspace)
@@ -248,4 +262,32 @@ fn shell_words(cmd: &Command) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ask_user_question_is_always_kept() {
+        assert_eq!(builtin_tools(&[], false), ["AskUserQuestion"]);
+        assert_eq!(
+            builtin_tools(&[], true),
+            ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]
+        );
+    }
+
+    #[test]
+    fn configured_tools_come_first_without_duplicates() {
+        let configured = ["WebSearch".to_owned(), "AskUserQuestion".to_owned()];
+        assert_eq!(
+            builtin_tools(&configured, true),
+            [
+                "WebSearch",
+                "AskUserQuestion",
+                "EnterPlanMode",
+                "ExitPlanMode"
+            ]
+        );
+    }
 }

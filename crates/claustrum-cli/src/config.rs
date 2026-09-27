@@ -149,7 +149,8 @@ pub struct ClaudeSection {
     /// Path to the `claude` binary.
     pub binary: Option<PathBuf>,
     /// Built-in Claude Code tools to keep enabled (passed to `--tools`).
-    /// Empty by default, which removes every built-in tool. `WebSearch` is a
+    /// Empty by default, which removes every built-in tool except
+    /// `AskUserQuestion`, which only prompts the user. `WebSearch` is a
     /// reasonable addition since it runs on the API side, not on the host.
     #[serde(default)]
     pub tools: Vec<String>,
