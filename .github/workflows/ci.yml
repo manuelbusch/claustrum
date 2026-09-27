@@ -71,7 +71,9 @@ jobs:
           path: |
             packages/*.webc
             packages/*.sha256
-          key: wasmer-packages-${{ hashFiles('packages/*.id') }}
+          # The pinned versions live in DEFAULT_PACKAGES; `pkg sync` rewrites
+          # packages/*.id, so those cannot be the key.
+          key: wasmer-packages-${{ hashFiles('crates/claustrum-cli/src/config.rs') }}
           enableCrossOsArchive: true
 
       - name: Download packages
@@ -79,7 +81,7 @@ jobs:
         run: cargo run --locked -p claustrum-cli -- --packages-dir packages pkg sync
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   shim:
     name: hostcmd shim

@@ -47,10 +47,8 @@ fn run(profile: &Profile, script: &str) -> (bool, String) {
 
 fn workspace() -> (tempfile::TempDir, PathBuf) {
     // Not under /tmp: bubblewrap puts a private tmpfs there.
-    let base = std::env::var_os("CARGO_TARGET_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = tempfile::tempdir_in(base).unwrap();
+    // Cargo sets CARGO_TARGET_TMPDIR at build time only.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let ws = dir.path().canonicalize().unwrap();
     std::fs::write(ws.join("claustrum.toml"), "# original\n").unwrap();
     (dir, ws)
@@ -117,6 +115,67 @@ fn protected_file_cannot_be_changed_under_bubblewrap() {
         &format!("cd {} && mkdir d && echo y > d/f && rm -r d", ws.display()),
     );
     assert!(ok, "{out}");
+}
+
+#[test]
+fn missing_protected_file_cannot_be_created_under_bubblewrap() {
+    setup();
+    if backend().unwrap() != Backend::Bubblewrap {
+        eprintln!("skipped: Landlock alone cannot protect a file in a writable directory");
+        return;
+    }
+    let (_d, ws) = workspace();
+    let (_o, outside) = workspace();
+    std::fs::create_dir_all(ws.join(".claude/skills")).unwrap();
+    std::fs::write(ws.join(".claude/notes.md"), "n\n").unwrap();
+    std::fs::create_dir(ws.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join(".claude/link")).unwrap();
+    let mut p = profile(&ws);
+    p.deny_write
+        .extend([ws.join(".claude/settings.json"), ws.join("sub/dir/file")]);
+    for attempt in [
+        "echo {} > .claude/settings.json",
+        "echo x > .claude/other",
+        "mkdir .claude/settings.json",
+        "mv .claude .claude-moved",
+        "rm -r .claude/skills",
+        "mkdir -p sub/dir && echo x > sub/dir/file",
+        "echo x > .claude/link/through-link",
+    ] {
+        let (ok, out) = run(&p, &format!("cd {} && {attempt}", ws.display()));
+        assert!(!ok, "`{attempt}` succeeded: {out}");
+    }
+    assert!(!ws.join(".claude/settings.json").exists());
+    assert!(!ws.join("sub/dir").exists());
+    assert!(!outside.join("through-link").exists());
+    // Existing entries of the guarded directory stay writable; a link among
+    // them is not bound (the bind would follow it out of the workspace).
+    let (ok, out) = run(
+        &p,
+        &format!(
+            "cd {} && echo s > .claude/skills/s.md && echo m >> .claude/notes.md",
+            ws.display()
+        ),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join(".claude/notes.md")).unwrap(),
+        "n\nm\n"
+    );
+}
+
+#[test]
+fn missing_protected_file_in_a_writable_root_is_refused() {
+    setup();
+    if backend().unwrap() != Backend::Bubblewrap {
+        return;
+    }
+    let (_d, ws) = workspace();
+    let mut p = profile(&ws);
+    p.deny_write.push(ws.join("new.toml"));
+    p.exec = Exec::Any;
+    let err = command(&p, Path::new("/bin/sh")).unwrap_err();
+    assert!(err.to_string().contains("new.toml"), "{err}");
 }
 
 #[test]

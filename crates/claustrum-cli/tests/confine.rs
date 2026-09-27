@@ -8,6 +8,12 @@ use std::{
     process::{Command, Stdio},
 };
 
+fn tempdir() -> tempfile::TempDir {
+    // Not under /tmp: bubblewrap puts a private tmpfs there. Cargo sets
+    // CARGO_TARGET_TMPDIR at build time only.
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
 /// `claustrum trust` for the project configuration in `ws`.
 fn trust(ws: &Path, state: &Path) {
     let out = Command::new(env!("CARGO_BIN_EXE_claustrum"))
@@ -26,10 +32,10 @@ fn trust(ws: &Path, state: &Path) {
 
 #[test]
 fn worker_escape_is_contained() {
-    let ws = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let claude = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let ws = tempdir();
+    let state = tempdir();
+    let claude = tempdir();
+    let cache = tempdir();
     std::fs::create_dir(cache.path().join("modules")).unwrap();
     std::fs::create_dir(claude.path().join("plans")).unwrap();
     std::fs::write(claude.path().join("plans/other.md"), "theirs\n").unwrap();
@@ -85,7 +91,9 @@ fn worker_escape_is_contained() {
         );
     }
     assert!(!escape.exists());
-    assert!(!ws.path().join(".claude/settings.json").exists());
+    if backend != claustrum_confine::Backend::Landlock {
+        assert!(!ws.path().join(".claude/settings.json").exists());
+    }
     assert!(!claude.path().join("plans/claustrum-probe.md").exists());
     assert!(!cache.path().join("modules/claustrum-probe").exists());
     assert_eq!(
@@ -96,7 +104,7 @@ fn worker_escape_is_contained() {
 
 #[test]
 fn confinement_off_runs_in_process() {
-    let ws = tempfile::tempdir().unwrap();
+    let ws = tempdir();
     std::fs::write(
         ws.path().join("claustrum.toml"),
         "[sandbox]\nconfinement = \"off\"\n",
