@@ -75,6 +75,10 @@ jobs:
           key: wasmer-packages-${{ hashFiles('crates/claustrum-cli/src/config.rs') }}
           enableCrossOsArchive: true
 
+      # The repository's own claustrum.toml is refused until it is trusted.
+      - name: Trust the project configuration
+        run: cargo run --locked -p claustrum-cli -- trust
+
       # Also on a cache hit: pkg sync skips present packages but precompiles
       # them, and the tests' time limits assume a warm module cache.
       - name: Download and precompile packages
