@@ -1,6 +1,6 @@
 [package]
 name = "claustrum-confine"
-description = "OS-level confinement (Seatbelt, Landlock, AppContainer) for Claustrum's host processes"
+description = "OS-level confinement (Seatbelt, bubblewrap, Landlock, seccomp) for Claustrum's host processes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

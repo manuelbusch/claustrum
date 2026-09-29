@@ -103,8 +103,8 @@ impl Profile {
 pub enum Backend {
     /// macOS Seatbelt through `/usr/bin/sandbox-exec`.
     Seatbelt,
-    /// Linux: bubblewrap (mount, PID and network namespaces) plus Landlock
-    /// and seccomp inside.
+    /// Linux: bubblewrap (user, mount, PID, IPC, UTS, cgroup and network
+    /// namespaces) plus Landlock and seccomp inside.
     Bubblewrap,
     /// Linux without usable user namespaces: Landlock and seccomp only.
     /// Weaker: files inside writable trees cannot be made read-only, and the

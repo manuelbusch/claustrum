@@ -15,7 +15,7 @@ pub enum Command {
     },
     /// Download one package from the Wasmer registry into the packages directory.
     Add {
-        /// Package spec, e.g. `wasmer/python` or `wasmer/bash@1.0.25`.
+        /// Package spec, e.g. `python/python` or `wasmer/bash@=1.0.25`.
         spec: String,
     },
     /// Register a self-built WASIX `.wasm` binary as a directory package.
