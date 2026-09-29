@@ -49,6 +49,8 @@ available either; use `host status`, `host diff`, `host add <path>`,
 the other git actions. Dependency sources are mounted read-only under
 /cargo/registry."""
 
+tools = ["Agent", "Workflow"]
+
 # Host actions. Everything runs confined: writes are limited to the workspace
 # (target/, Cargo.lock, formatted sources), the action's private $TMPDIR and
 # ~/.cargo/registry (index, downloaded .crate files, unpacked sources).
@@ -248,6 +250,16 @@ name = "message"
 description = "Commit message, a single line"
 pattern = ".{1,1000}"
 max_len = 1000
+
+[[actions.action]]
+name = "commit-file"
+description = "Commit the staged changes with the message read from a file in the workspace (multi-line, e.g. target/commit-msg.txt)"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "commit", "--no-verify", "--cleanup=whitespace", "-F", "{file}"]
+
+[[actions.action.input]]
+name = "file"
+kind = "path"
+must_exist = true
 
 [[actions.action]]
 name = "switch"
