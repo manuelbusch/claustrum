@@ -16,7 +16,7 @@ outside the project directory.
 │  Your machine                                                               │
 │                                                                             │
 │   claude ─────────── MCP over stdio ──────────▶  claustrum                  │
-│   --tools ""                                      │                         │
+│   --tools AskUserQuestion,…                       │                         │
 │   (no built-in Bash, Read, Write, ...)            │  Bash  Read  Write      │
 │                                                   │  Edit  Glob  Grep       │
 │                                                   ▼  Action                 │
@@ -66,7 +66,7 @@ Claustrum is three things stacked on each other:
 | --- | --- | --- |
 | **Sandbox** | Wasmer runtime booting a WASIX environment per command | `bash`, `coreutils`, `python`, `jq` run unmodified as WebAssembly. The guest sees an in-memory root with the project mounted read/write at `/workspace`. Networking is off unless configured. |
 | **Tools** | An MCP server (`claustrum serve`) | `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, named and shaped like Claude Code's own tools, plus `Action` for declared host commands. |
-| **Launcher** | `claustrum run` | Starts `claude` with `--tools ""`, `--strict-mcp-config`, Claustrum as its only MCP server, the tools pre-approved and a system prompt describing the sandbox. |
+| **Launcher** | `claustrum run` | Starts `claude` with every built-in tool removed except the few listed below (`--tools`), Claustrum as its only MCP server (`--strict-mcp-config --mcp-config …`), its tools pre-approved (`--allowedTools mcp__claustrum__*`) and a system prompt describing the sandbox (`--append-system-prompt`). |
 
 From Claude's point of view nothing changes: it still has file and shell access, only inside
 the sandbox.
@@ -104,13 +104,14 @@ Rust on top of the same virtual file system, so they are fast and never spawn a 
 | `Read` | `file_path`, `offset`, `limit` | native, `cat -n` style output |
 | `Write` | `file_path`, `content` | native, creates parent directories |
 | `Edit` | `file_path`, `old_string`, `new_string`, `replace_all` | native, exact string replacement |
-| `Glob` | `pattern`, `path` | native, newest first, skips `.git`, `node_modules`, `target` |
+| `Glob` | `pattern`, `path` | native, newest first, skips `.git`, `.hg`, `.svn`, `node_modules`, `target` |
 | `Grep` | `pattern`, `path`, `glob`, `output_mode`, `-i`, `-C`, `head_limit` | native, ripgrep engine |
 | `Action` | `name`, `inputs` | only when [host actions](#host-actions) are configured |
 | `WritePlan`, `EditPlan` | as `Write` and `Edit` | plan files only, see [Plan mode](#plan-mode) |
 
-`AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` stay enabled as the only built-in
-tools; they ask the user or switch the mode and touch nothing.
+`AskUserQuestion` stays enabled as a built-in tool, and so do `EnterPlanMode` and
+`ExitPlanMode` unless `[claude] plans = false`; they ask the user or switch the mode and
+touch nothing. `[claude] tools` adds further built-in tools.
 
 ### Subagents
 
@@ -159,7 +160,8 @@ Subagents and workflow agents can trigger [host actions](#host-actions) through
 Guest commands get a fixed environment (`HOME=/home/claude`, `USER=claude`,
 `PATH=/usr/local/bin:/bin:/usr/bin`, `TERM=dumb`, `LANG=C.UTF-8`) plus anything under
 `[sandbox.env]`. Because WASIX reports stdio as a terminal, the profile disables colours and
-pagers (`NO_COLOR`, `PAGER=cat`, `jq -M`, `ls --color=never`) so captured output stays clean.
+pagers (`NO_COLOR`, `CLICOLOR=0`, `PAGER=cat`, `GIT_PAGER=cat`, `jq -M`,
+`ls -1 --color=never`) and sets `PYTHONUNBUFFERED=1`, so captured output stays clean.
 
 ## Two sandbox layers
 
@@ -179,7 +181,7 @@ unconfined **broker** and a confined **worker**:
                                           │      OS profile: read own binary, packages,
                                           │      config, read-only mounts; write workspace,
                                           │      writable mounts, cache, log, private tmp;
-                                          │      no exec; no network
+                                          │      exec only itself; no network
                                           │      unless the network mode needs it
                                           │
                                           │  Unix socket: "run action <name>, inputs …"
@@ -199,19 +201,23 @@ unconfined **broker** and a confined **worker**:
 
 | Process | May read | May write | May execute | Network |
 | --- | --- | --- | --- | --- |
-| **worker** | its binary, packages, configuration, read-only extra mounts, the user-wide module cache | workspace, writable extra mounts, its workspace's cache and network log, private temp dir | nothing | none, or outbound only if the mode requires it |
+| **worker** | its binary, packages, configuration, read-only extra mounts, the user-wide module cache | workspace, writable extra mounts, its workspace's cache and network log, private temp dir | its own binary only | none; outbound in `allowlist`/`audit` mode or with `[packages] online`; unrestricted in `host` mode |
 | **broker** | everything (unconfined) | everything (unconfined); for the worker only this workspace's plan files | actions only, each in its own profile | proxy on `127.0.0.1` |
 | **action** | everything except credential stores and `deny_read` | workspace, fresh `$TMPDIR`, `writable` list | anything | `localhost:<proxy port>` only (`host` mode: unrestricted) |
 
 Compiled modules are native code that Wasmer loads without further checks, so the worker
 never writes the user-wide module cache: it reads it and caches what is missing in a
-directory of its own workspace. That cache is only ever loaded by the worker of the same
-workspace. `claustrum pkg sync` and `pkg precompile`, which run unconfined, fill the
-user-wide cache.
+per-workspace directory of the user cache (`workspaces/<key>`), together with downloaded
+packages. That cache is only ever loaded by the worker of the same workspace.
+`claustrum pkg sync` and `pkg precompile`, which run unconfined, fill the user-wide cache.
 
-Credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser profiles, `~/.claude`,
-...) stay unreadable for confined processes even when they lie inside a mount. The
-configuration files stay read-only for all of them.
+Credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.netrc`, cloud CLI
+configurations, keychains, browser profiles, `~/.claude`, ...) stay unreadable for confined
+processes even when they lie inside a mount. The configuration files stay read-only for all
+of them, with one exception on Linux: a workspace `claustrum.toml` that does not exist yet
+cannot be kept from being created by the OS profile. The WASIX layer refuses to create it,
+a new file is not used before you [trust](#a-projects-configuration-needs-your-trust) it,
+and one created by a host action is moved aside afterwards.
 
 `[sandbox] confinement` selects how strict this is:
 
@@ -224,7 +230,7 @@ configuration files stay read-only for all of them.
 | Platform | Backend | Status |
 | --- | --- | --- |
 | macOS | Seatbelt (`sandbox-exec`, generated SBPL profile) | implemented |
-| Linux | bubblewrap (mount, PID, IPC, network namespaces) + Landlock + seccomp | implemented |
+| Linux | bubblewrap (user, mount, PID, IPC, UTS, cgroup, network namespaces) + Landlock + seccomp | implemented; needs Linux 5.13+ with Landlock enabled |
 | Linux without user namespaces | Landlock + seccomp | implemented, weaker (see below) |
 | Windows | AppContainer + Job object | planned; runs unconfined with a warning until then |
 
@@ -232,12 +238,16 @@ On Linux, bubblewrap builds the file system view (root read-only, writable trees
 read/write, credential stores hidden behind empty mounts, the configuration bound read-only
 over itself, a private network namespace when the process may not use the network). A helper
 stage (`claustrum __confine-exec`) then applies Landlock (file access, TCP ports, abstract
-sockets, signals) and a seccomp filter that refuses new namespaces, `ptrace`, `mount`, `bpf`,
-`io_uring`, kernel keyrings, new Unix sockets and, without network, IP sockets. Confined
-actions reach the proxy through a relay inside their network namespace.
+sockets, signals) and a seccomp filter that refuses new namespaces, `ptrace` and
+`process_vm_*`, `mount` and the new mount API, `bpf`, `io_uring`, `perf_event_open`,
+`userfaultfd`, kernel modules and keyrings, netlink and packet sockets and new Unix sockets.
+Actions may only open TCP sockets. Confined actions reach the proxy through a relay inside
+their network namespace. Without a kernel that supports Landlock there is no Linux backend;
+`best-effort` then runs unconfined with a warning.
 
 Where unprivileged user namespaces are disabled (Ubuntu 24.04+ restricts them through
-AppArmor), Claustrum falls back to Landlock and seccomp and says so on start. Landlock can
+AppArmor), Claustrum falls back to Landlock and seccomp and logs a warning on start;
+seccomp then also refuses IP sockets to processes without network. Landlock can
 only grant, not deny, so two guarantees get weaker there: a file inside a writable tree cannot
 be made read-only (the configuration is then protected by the WASIX layer and restored after
 each action only), and the proxy port is reachable on every address, not only on `localhost`.
@@ -275,7 +285,7 @@ claustrum run --permission-mode acceptEdits -- -p "Add a README for this project
 
 | Command | Purpose |
 | --- | --- |
-| `claustrum run [--workspace DIR] [--permission-mode MODE] [-- claude args…]` | Launch Claude Code against the sandbox |
+| `claustrum run [--workspace DIR] [--permission-mode MODE] [--claude PATH] [--dry-run] [-- claude args…]` | Launch Claude Code against the sandbox |
 | `claustrum serve [--workspace DIR]` | Serve the tools over MCP on stdio (what `run` starts under the hood) |
 | `claustrum pkg sync [--force]` | Download the configured packages and precompile them |
 | `claustrum pkg add <spec>` | Download one package, e.g. `python/python` |
@@ -288,7 +298,7 @@ claustrum run --permission-mode acceptEdits -- -p "Add a README for this project
 
 Global options: `--config FILE` (or `CLAUSTRUM_CONFIG`), `--packages-dir DIR` (or
 `CLAUSTRUM_PACKAGES_DIR`). Logging goes to stderr and is controlled by `CLAUSTRUM_LOG`
-(e.g. `CLAUSTRUM_LOG=debug`).
+(e.g. `CLAUSTRUM_LOG=debug`, falling back to `RUST_LOG`; default `warn`).
 
 ## Configuration
 
@@ -319,17 +329,17 @@ writable = ["~/.cargo/registry"]
 
 | Section | Keys | Purpose |
 | --- | --- | --- |
-| `[sandbox]` | `workspace`, `timeout_secs`, `max_output_bytes`, `max_threads`, `max_memory_mb`, `confinement`, `deny_read`, `env` | resource limits, the second layer, guest environment |
+| `[sandbox]` | `workspace`, `timeout_secs`, `max_output_bytes`, `max_threads`, `max_memory_mb`, `confinement`, `deny_read`, `env`, `network` | resource limits, the second layer, guest environment; `network` is a shorthand for `[network] mode` |
 | `[network]` | `mode`, `allow`, `log` | what the guest and host actions may reach, see [Network](#network) |
 | `[packages]` | `dir`, `online`, `[[packages.package]]` (`file`, `source`, `id`) | which `.webc` files are loaded, see [Packages](#packages) |
 | `[[mounts]]` | `guest`, `host`, `writable` | additional host directories, read-only by default |
 | `[actions]` | `command`, `[[actions.action]]` | fixed host commands Claude may trigger, see [Host actions](#host-actions) |
 | `[claude]` | `binary`, `tools`, `args`, `system_prompt`, `plans` | how `claude` is launched, [plan mode](#plan-mode) |
 
-[`claustrum.example.toml`](claustrum.example.toml) documents every key;
+[`claustrum.example.toml`](claustrum.example.toml) documents the keys in detail;
 [`examples/rust.claustrum.toml`](examples/rust.claustrum.toml) is a complete setup for a Rust
-project (check, build, test, clippy, fmt, doc, add-dep, update and the local git workflow as confined
-actions; dependency sources mounted read-only).
+project (check, build, test, clippy, fmt, fmt-check, doc, add-dep, update and the local git
+workflow as confined actions; dependency sources mounted read-only).
 
 ### A project's configuration needs your trust
 
@@ -350,8 +360,9 @@ accepted its exact content, as `direnv allow` does:
 
 Independently of trust, `[claude] args` may not contain flags that would override what
 `claustrum run` sets up (`--tools`, `--allowedTools`, `--mcp-config`, `--strict-mcp-config`,
-`--permission-mode`, `--dangerously-skip-permissions`, `--settings`, `--setting-sources`,
-`--add-dir`, `--plugin-dir`, `--system-prompt`, ...), in any configuration file. Use
+`--disallowedTools`, `--permission-mode`, `--dangerously-skip-permissions`, `--settings`,
+`--setting-sources`, `--add-dir`, `--plugin-dir`, `--system-prompt`, ..., also in their
+kebab-case and `--flag=value` forms), in any configuration file. Use
 `[claude] tools` for built-in tools and the command line for the rest.
 
 ### The configuration is read-only inside the sandbox
@@ -377,18 +388,19 @@ those files nor turn `.claude` into a link. Other files in `.claude` (agents, co
 skills) stay writable. Their shell snippets only run through the built-in Bash tool, which
 Claustrum removes.
 
-`claustrum serve` creates `.claude` in the workspace if it is missing. Under bubblewrap, a
-settings file that does not exist yet cannot be protected by a bind mount of its own, so
-`.claude` itself is bound read-only and its existing entries read/write again: a new entry
-directly in `.claude` (a new `agents` directory, say) has to be created outside the sandbox,
-while everything below existing entries stays writable.
+With OS confinement, `claustrum serve` creates `.claude` in the workspace if it is missing.
+Under bubblewrap, a settings file that does not exist yet cannot be protected by a bind mount
+of its own, so `.claude` itself is bound read-only and its existing entries read/write again:
+a new entry directly in `.claude` (a new `agents` directory, say) has to be created outside
+the sandbox, while everything below existing entries stays writable.
 
 ### Plan mode
 
 `claustrum run --permission-mode plan` (or Shift+Tab in the session) works as usual. Claude
-Code names a plan file in its own plan directory, `~/.claude/plans/<slug>.md`, and in plan
-mode refuses every tool that is not marked read-only, so Claustrum's `Write`, `Edit` and
-`Bash` too. Claude writes the plan with `WritePlan` and `EditPlan` instead:
+Code names a plan file in its own plan directory, `~/.claude/plans/<slug>.md` (or
+`$CLAUDE_CONFIG_DIR/plans`), and in plan mode refuses every tool that is not marked
+read-only, so Claustrum's `Write`, `Edit` and `Bash` too. Claude writes the plan with
+`WritePlan` and `EditPlan` instead:
 
 - They take the plan file path and nothing else: a `<slug>.md` directly in the plan
   directory.
@@ -408,12 +420,15 @@ plan tools and the plan mode tools.
 Every connection Claustrum starts, from the guest and from [host actions](#host-actions),
 passes one gate that allows only declared destinations.
 
-| Mode | Guest and actions may reach | Logged |
+| Mode | Guest and actions may reach | Logged on stderr |
 | --- | --- | --- |
-| `disabled` (default) | nothing | refusals |
-| `allowlist` | the `allow` entries only | refusals |
-| `audit` | everything | everything the allowlist would refuse |
-| `host` | everything | allowed connections at debug level |
+| `disabled` (default) | nothing | refusals (warn) |
+| `allowlist` | the `allow` entries only | refusals (warn) |
+| `audit` | everything | everything the allowlist would refuse (info) |
+| `host` | everything | only allowed connections (debug) |
+
+Allowed connections are logged at debug level in every mode, and every decision is written
+to the network log (see [Building an allowlist](#building-an-allowlist)).
 
 `allow` entries are `host[:ports]`:
 
@@ -454,9 +469,10 @@ allow = [
 - **Local and private addresses need an explicit entry**, even when an allowed name
   resolves to them. This defeats DNS rebinding and keeps the guest away from services on your
   machine and from cloud metadata endpoints such as `169.254.169.254`.
-- **Only outgoing TCP is supported.** UDP, listening sockets and TCP sockets bound before
-  connecting are refused, because their later destinations would not pass the gate. DNS
-  resolution happens on the host.
+- **Only outgoing TCP is supported.** In `disabled` and `allowlist` mode, UDP, listening
+  sockets and TCP sockets bound before connecting are refused, because their later
+  destinations would not pass the gate (`audit` allows and logs them, except binds to the
+  wildcard address). DNS resolution happens on the host.
 - **Guest traffic cannot bypass the gate.** The guest has no sockets of its own; every socket
   call goes through the WASIX runtime, which Claustrum wraps.
 - **Host actions go through a local proxy.** Actions start with `HTTP_PROXY`, `HTTPS_PROXY`
@@ -467,7 +483,7 @@ allow = [
   simply fail. Unconfined actions can ignore the proxy.
 
 Refused connections are logged and appended to the tool result as
-`[network: refused tcp example.com:443 (example.com is not in the allowlist)]`, so Claude can
+`[network: refused dns example.com:443 (example.com is not in the allowlist)]`, so Claude can
 ask for the destination instead of trying workarounds.
 
 ### Building an allowlist
@@ -574,9 +590,11 @@ description carries the same list.
                                                 snapshot protected files
                                                 start program in its own OS profile:
                                                   argv fixed, one element per placeholder
-                                                  clean env (PATH, HOME, LANG, + env)
+                                                  clean env (PATH, HOME, LANG, TERM,
+                                                    NO_COLOR + env)
                                                   stdin closed, own process group
-                                                  proxy variables set, private $TMPDIR
+                                                  proxy variables set (unless host mode)
+                                                  private $TMPDIR (confined actions)
                                                       │
                                                       ▼
                                                 wait: timeout or killed Bash call
@@ -596,8 +614,9 @@ description carries the same list.
 | `integer` | an integer | `min`, `max` |
 
 Every value is limited to `max_len` bytes (default 256), may not contain control characters
-and may not start with `-` unless `allow_leading_dash = true`. `default` makes an input
-optional. An action without inputs refuses any argument.
+or invisible Unicode formatting characters (bidi overrides and the like) and may not start
+with `-` unless `allow_leading_dash = true`. `default` makes an input optional. An action
+without inputs refuses any argument.
 
 ### What holds, by construction
 
@@ -625,27 +644,31 @@ your user with read access to most of the file system.
 | Programs execute code from the workspace, which Claude can write | `cargo` honours `.cargo/config.toml`, `build.rs`, proc macros; `git` honours `.git/config` and hooks; `npm` runs `package.json` scripts; `make` runs the Makefile | keep such actions confined; never `confine = "none"` for them |
 | Validated inputs are still interpreted by the program | `ext::sh -c …` is a valid git URL, `@file` reads a file for curl, `key=value` after `git -c` changes behaviour | keep patterns to the characters the program needs; check how it treats them |
 | Placeholders reaching an interpreter | `sh -c "… {x}"`, `python -c "{x}"` | refused at startup; put the code in a script and pass the input as an argument |
-| Environment values are inputs too | `RUSTFLAGS = "{flags}"`, `env_passthrough` of `PATH`, `LD_PRELOAD`, `GIT_*` | warned at startup; avoid |
+| Environment values are inputs too | `RUSTFLAGS = "{flags}"`, `env_passthrough` of `PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND` | warned at startup; avoid |
 | Path inputs are checked before the program opens them | a file replaced by a symlink between check and open | do not rely on `path` inputs to keep a program away from host files |
 | Side effects leave the sandbox | `git push`, `npm publish` ship whatever the workspace contains | only declare commands you would let Claude run on the host directly |
 | Writable caches | `~/.cargo/bin`, `~/.cargo/config.toml`, shell profiles | never make a directory writable that the host executes from later |
 
-Claustrum refuses the clear cases at startup and logs a warning for the rest. Without OS
-confinement (`confine = "none"`, `confinement = "off"`, or a platform without a backend), an
-action is as trusted as the host command behind it.
+Claustrum refuses placeholders that reach an interpreter at startup and warns about
+placeholders in environment values, risky variables, patterns that accept almost anything and
+`confine = "none"` for programs that run workspace code. The other risks in the table are not
+detected; they are up to you. Without OS confinement (`confine = "none"`,
+`confinement = "off"`, or a platform without a backend), an action is as trusted as the host
+command behind it.
 
 ## Development
 
 ```
 crates/
   claustrum-sandbox/   runtime, mounts, packages, process execution, native tools,
+                       protected files (protect.rs), plan store (plans.rs),
                        host commands (hostcmd.rs), host actions (action/), network
                        gate and action proxy (net/)
   claustrum-mcp/       MCP server (rmcp) exposing the tools
   claustrum-cli/       `claustrum` binary: run, serve (broker + confined worker),
-                       pkg, network, configuration
+                       pkg, network, plans, trust, configuration
   claustrum-confine/   OS confinement profiles and backends (Seatbelt on macOS,
-                       bubblewrap + Landlock + seccomp on Linux)
+                       bubblewrap + Landlock + seccomp on Linux), test helper binary
 shim/                  guest-side WASI shim for host commands (wasm32-wasip1), built by
                        scripts/build-shim.sh and committed as
                        crates/claustrum-sandbox/assets/hostcmd.wasm
@@ -666,8 +689,8 @@ How host commands work: a small WASI shim is registered under each command name 
 It writes its arguments to `/.claustrum/cmd/<name>` and reads the result back; the host runs
 the command while serving that read, so pipes and redirections in bash behave as usual.
 
-[`CODE_REVIEW.md`](CODE_REVIEW.md) holds the notes of a security and stability review of the
-current code, with findings ordered by severity.
+Environment switches for testing: `CLAUSTRUM_NO_BWRAP=1` forces the Landlock-only backend on
+Linux, `CLAUSTRUM_CONFINE_HELPER` points to another confinement helper binary.
 
 ## Roadmap
 
