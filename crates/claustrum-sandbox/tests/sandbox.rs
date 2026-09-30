@@ -702,6 +702,34 @@ async fn config_file_is_read_only() {
     );
 }
 
+/// A mount written with a trailing slash or `.` is the same mount for the
+/// native tools as for Bash; a nested read-only one used to fall through
+/// to the writable workspace for them.
+#[tokio::test(flavor = "multi_thread")]
+async fn mount_paths_are_normalised() {
+    let ws = tempfile::tempdir().unwrap();
+    let ro = tempfile::tempdir().unwrap();
+    std::fs::write(ro.path().join("data.txt"), "data\n").unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.mount("/workspace/./ro/", ro.path())).await else {
+        return;
+    };
+    let read = sb
+        .read("/workspace/ro/data.txt", ReadOptions::default())
+        .await
+        .unwrap();
+    assert!(read.content.contains("data"), "{}", read.content);
+    let err = sb
+        .write("/workspace/ro/data.txt", "changed\n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("read-only"), "{err}");
+    assert!(!ws.path().join("ro").exists());
+    assert_eq!(
+        std::fs::read_to_string(ro.path().join("data.txt")).unwrap(),
+        "data\n"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn read_only_mounts_refuse_writes() {
     let ws = tempfile::tempdir().unwrap();
