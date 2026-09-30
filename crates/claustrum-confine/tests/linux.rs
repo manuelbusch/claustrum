@@ -347,6 +347,42 @@ PY"#;
     }
 }
 
+/// Only IP sockets, in every network mode: families that no namespace
+/// confines (vsock, kernel crypto) are refused like Unix sockets.
+#[test]
+fn only_ip_socket_families_are_allowed() {
+    let (_d, ws) = workspace();
+    let script = r#"python3 - <<'PY'
+import socket
+for name, family, ty in (
+    ("unix", socket.AF_UNIX, socket.SOCK_STREAM),
+    ("netlink", socket.AF_NETLINK, socket.SOCK_RAW),
+    ("alg", 38, socket.SOCK_SEQPACKET),
+    ("vsock", 40, socket.SOCK_STREAM),
+    ("can", 29, socket.SOCK_RAW),
+):
+    try:
+        socket.socket(family, ty, 0).close()
+        print(name, 0)
+    except OSError as e:
+        print(name, e.errno)
+PY"#;
+    for net in [Network::None, Network::Outbound, Network::Any] {
+        let mut p = profile(&ws);
+        p.network = net;
+        let (ok, out) = run(&p, script);
+        assert!(ok, "{out}");
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            let errno: i32 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|e| e.parse().ok())
+                .unwrap_or(-1);
+            assert_eq!(errno, libc::EPERM, "{net:?}: {line}\n{out}");
+        }
+    }
+}
+
 #[test]
 fn name_service_lookups_work_without_unix_sockets() {
     // glibc's NSS modules for systemd (nss-resolve, nss-systemd) talk over

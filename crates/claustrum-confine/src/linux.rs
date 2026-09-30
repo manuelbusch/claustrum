@@ -621,16 +621,20 @@ fn apply_seccomp(spec: &Spec) -> Result<(), String> {
     }
     rules.insert(libc::SYS_clone, clone_rules);
 
-    // Sockets: never new Unix sockets (host daemons such as docker.sock are
-    // reachable through them) or raw packet access; IP only as the profile
-    // allows.
-    let mut socket_rules = Vec::new();
-    for domain in [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET] {
-        socket_rules.push(
-            SeccompRule::new(vec![cond(0, Len::Dword, Op::Eq, domain as u64)?])
-                .map_err(|e| e.to_string())?,
-        );
-    }
+    // Sockets: IP only, and only as the profile allows. Every other family
+    // is refused, whether listed here or added to the kernel later: Unix
+    // sockets (host daemons such as docker.sock are reachable through
+    // them), netlink, packet, and families that no network namespace
+    // confines, such as AF_VSOCK (the hypervisor) and AF_ALG (kernel
+    // crypto). No confined process needs them; the broker socket is
+    // inherited, not created.
+    let mut socket_rules = vec![
+        SeccompRule::new(vec![
+            cond(0, Len::Dword, Op::Ne, libc::AF_INET as u64)?,
+            cond(0, Len::Dword, Op::Ne, libc::AF_INET6 as u64)?,
+        ])
+        .map_err(|e| e.to_string())?,
+    ];
     let no_ip = p_no_ip(spec);
     for domain in [libc::AF_INET, libc::AF_INET6] {
         if no_ip {

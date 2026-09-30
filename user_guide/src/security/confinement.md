@@ -32,8 +32,8 @@ over itself, a private network namespace when the process may not use the networ
 stage (`claustrum __confine-exec`) then applies Landlock (file access, TCP ports, abstract
 sockets, signals) and a seccomp filter that refuses new namespaces, `ptrace` and
 `process_vm_*`, `mount` and the new mount API, `bpf`, `io_uring`, `perf_event_open`,
-`userfaultfd`, kernel modules and keyrings, netlink and packet sockets and new Unix sockets.
-Actions may only open TCP sockets. Confined actions reach the proxy through a relay inside
+`userfaultfd`, kernel modules and keyrings, the x32 system call ABI, and every socket family
+but IP (Unix, netlink, packet, vsock, ...). Actions may only open TCP sockets. Confined actions reach the proxy through a relay inside
 their network namespace. Without a kernel that supports Landlock there is no Linux backend;
 Claustrum then refuses to start, and `best-effort` runs unconfined with a warning.
 
