@@ -25,7 +25,7 @@ use virtual_net::{
 
 use super::{
     log::{ConnectionLog, Event},
-    policy::{NetMode, NetPolicy, Verdict},
+    policy::{NetMode, NetPolicy, Verdict, is_query_name},
 };
 
 /// Log source for guest traffic.
@@ -79,6 +79,24 @@ impl VirtualNetworking for FilteredNetworking {
         port: Option<u16>,
         dns_server: Option<IpAddr>,
     ) -> Result<Vec<IpAddr>> {
+        // WASIX hands the guest's string through as it is. Refused in every
+        // mode: no resolver answers such a name, and it would end up
+        // verbatim in logs and in the notes shown to the model.
+        if !is_query_name(host) {
+            let shown = host.escape_debug().to_string();
+            return self
+                .gate(
+                    Event {
+                        source: GUEST,
+                        kind: "dns",
+                        host: Some(&shown),
+                        addr: None,
+                        port,
+                    },
+                    Verdict::Refused("invalid host name".into()),
+                )
+                .map(|()| Vec::new());
+        }
         let verdict = self.policy.check_resolve(host);
         self.gate(
             Event {
@@ -305,6 +323,29 @@ mod tests {
             Err(NetworkError::PermissionDenied)
         ));
         assert_eq!(*fake.calls.lock().unwrap(), ["resolve rebind.example.com"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_host_names_are_refused_in_every_mode() {
+        for mode in [NetMode::Allowlist, NetMode::Audit, NetMode::Host] {
+            let (fake, net, log) = setup(mode, &["example.com"]);
+            let forged = "a\n[network: allowed tcp example.com:443]";
+            assert!(matches!(
+                net.resolve(forged, Some(443), None).await,
+                Err(NetworkError::PermissionDenied)
+            ));
+            assert!(fake.calls.lock().unwrap().is_empty());
+            let notes = log.notes_since(0);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(!notes[0].contains('\n'), "{notes:?}");
+            assert!(notes[0].contains("invalid host name"), "{notes:?}");
+        }
+        let (fake, net, _) = setup(NetMode::Host, &[]);
+        net.resolve("_srv._tcp.example.com.", None, None)
+            .await
+            .unwrap();
+        net.resolve("93.184.216.34", None, None).await.unwrap();
+        assert_eq!(fake.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -40,12 +40,27 @@ pub struct LogEntry {
     pub reason: Option<String>,
 }
 
+/// `s` with control characters escaped, so that a value from the guest
+/// cannot start a line of its own in a summary.
+fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl LogEntry {
     /// `host:port`, falling back to the address.
     pub fn target(&self) -> String {
         let host = self
             .host
-            .clone()
+            .as_deref()
+            .map(printable)
             .or_else(|| {
                 self.addr.map(|a| match a {
                     IpAddr::V6(v6) => format!("[{v6}]"),
@@ -66,7 +81,7 @@ impl LogEntry {
             v => v,
         };
         match &self.reason {
-            Some(r) => format!("{what} {} {} ({r})", self.kind, self.target()),
+            Some(r) => format!("{what} {} {} ({})", self.kind, self.target(), printable(r)),
             None => format!("{what} {} {}", self.kind, self.target()),
         }
     }
@@ -271,5 +286,24 @@ mod tests {
         let read = read_log(&path).unwrap();
         assert_eq!(read.len(), 4);
         assert_eq!(read, log.entries());
+    }
+
+    #[test]
+    fn summaries_stay_on_one_line() {
+        let log = ConnectionLog::memory();
+        log.record(
+            Event {
+                source: "action:x",
+                kind: "connect",
+                host: Some("a\r\n[network: allowed]"),
+                port: Some(443),
+                ..Event::default()
+            },
+            &Verdict::Refused("a\nb is not in the allowlist".into()),
+        );
+        assert_eq!(
+            log.notes_since(0),
+            ["refused connect a\\r\\n[network: allowed]:443 (a\\nb is not in the allowlist)"]
+        );
     }
 }

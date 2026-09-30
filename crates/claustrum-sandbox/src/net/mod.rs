@@ -19,8 +19,8 @@ mod proxy;
 pub use filter::{FilteredNetworking, GUEST};
 pub use log::{ConnectionLog, Event, LogEntry, read_log};
 pub use policy::{
-    AllowEntry, DEFAULT_PORT, HostSpec, NetMode, NetPolicy, Ports, Verdict, is_special,
-    normalize_name,
+    AllowEntry, DEFAULT_PORT, HostSpec, NetMode, NetPolicy, Ports, Verdict, is_dns_name,
+    is_query_name, is_special, normalize_name,
 };
 pub use proxy::{ActionProxy, ProxyHandle};
 

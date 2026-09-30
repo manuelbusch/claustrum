@@ -199,7 +199,9 @@ fn parse_host(h: &str) -> Result<HostSpec, String> {
     })
 }
 
-fn is_dns_name(s: &str) -> bool {
+/// Whether `s` is a DNS name: dot-separated labels of letters, digits, `-`
+/// and `_`.
+pub fn is_dns_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253
         && s.split('.').all(|label| {
@@ -216,6 +218,14 @@ fn is_dns_name(s: &str) -> bool {
 /// Normalise a name for matching.
 pub fn normalize_name(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether the guest may look `name` up at all: an IP address or a DNS
+/// name. Anything else (control characters, spaces, quotes) could only
+/// serve to forge lines in logs, notes and reports.
+pub fn is_query_name(name: &str) -> bool {
+    let name = normalize_name(name);
+    name.parse::<IpAddr>().is_ok() || is_dns_name(&name)
 }
 
 impl AllowEntry {
