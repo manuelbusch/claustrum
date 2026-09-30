@@ -315,6 +315,18 @@ async fn host_links_cannot_leave_the_mount() {
     .await;
     assert_eq!(allowed, "", "these attempts were not refused");
 
+    // `..` behind the link never reaches the directory above its target,
+    // whether the write is refused or lands in the workspace.
+    let _ = sb
+        .bash("echo x > absdir/../escaped.txt", ExecOptions::default())
+        .await
+        .unwrap();
+    let _ = sb.write("absdir/../escaped2.txt", "x\n").await;
+    let above = outside.path().canonicalize().unwrap();
+    let above = above.parent().unwrap();
+    assert!(!above.join("escaped.txt").exists());
+    assert!(!above.join("escaped2.txt").exists());
+
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET\n");
     let mut names: Vec<_> = std::fs::read_dir(outside.path())
         .unwrap()
