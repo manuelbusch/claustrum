@@ -588,15 +588,60 @@ impl Config {
     pub fn network_log_path(&self, workspace: &Path) -> Result<PathBuf> {
         if let Some(p) = &self.file.network.log {
             let p = expand_home(p);
-            return Ok(if p.is_relative() {
+            let p = if p.is_relative() {
                 workspace.join(p)
             } else {
                 p
-            });
+            };
+            self.check_log_path(&p, workspace, state_dir().ok().as_deref())?;
+            return Ok(p);
         }
         Ok(state_dir()?
             .join("network")
             .join(format!("{}.jsonl", workspace_key(workspace))))
+    }
+
+    /// The confined worker may append to the network log, so a configured
+    /// one must not be a file Claustrum or Claude Code relies on: nothing in
+    /// the state directory but network logs (trust records, plan ledgers),
+    /// nothing in Claude Code's configuration directory, none of the
+    /// protected files.
+    fn check_log_path(&self, log: &Path, workspace: &Path, state: Option<&Path>) -> Result<()> {
+        // Case-folded on macOS, whose file systems usually ignore case.
+        let fold = |p: &Path| {
+            let p = claustrum_confine::resolve(p);
+            if cfg!(target_os = "macos") {
+                PathBuf::from(p.to_string_lossy().to_lowercase())
+            } else {
+                p
+            }
+        };
+        let log_key = fold(log);
+        let refuse = |what: &str| {
+            anyhow::bail!(
+                "[network] log = {}: {what}; choose another file",
+                log.display()
+            )
+        };
+        if let Some(state) = state
+            && log_key.starts_with(fold(state))
+            && !log_key.starts_with(fold(&state.join("network")))
+        {
+            return refuse(
+                "it lies in the Claustrum state directory (trust records, plan ledgers)",
+            );
+        }
+        if log_key.starts_with(fold(&claude_config_dir())) {
+            return refuse("it lies in Claude Code's configuration directory");
+        }
+        if self
+            .protected_paths(workspace)
+            .iter()
+            .any(|p| fold(p) == log_key)
+        {
+            return refuse("it is a protected file");
+        }
+        Ok(())
     }
 
     /// Rename the network log and plan ledger of `workspace` from the file
@@ -1017,6 +1062,35 @@ writable = true
             assert!(err.to_string().contains("not allowed"), "{bad}: {err}");
         }
         check_claude_args(&["--model".into(), "opus".into(), "--verbose".into()]).unwrap();
+    }
+
+    #[test]
+    fn the_network_log_cannot_overwrite_trusted_files() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let state = ws.join("state");
+        let log = |path: &Path| config("").check_log_path(path, &ws, Some(&state));
+        for bad in [
+            state.join("trust").join("0123"),
+            state.join("plans/x.list"),
+            claude_config_dir().join("settings.json"),
+            ws.join("claustrum.toml"),
+            ws.join(".claude/settings.json"),
+        ] {
+            let err = log(&bad).unwrap_err();
+            assert!(
+                err.to_string().contains("choose another file"),
+                "{bad:?}: {err}"
+            );
+        }
+        for ok in [ws.join("net.jsonl"), state.join("network/other.jsonl")] {
+            log(&ok).unwrap();
+        }
+        // Relative paths are taken against the workspace, then checked.
+        let err = config("[network]\nlog = \"claustrum.toml\"\n")
+            .network_log_path(&ws)
+            .unwrap_err();
+        assert!(err.to_string().contains("protected file"), "{err}");
     }
 
     #[test]

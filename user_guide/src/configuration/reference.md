@@ -32,7 +32,7 @@ RUST_LOG = "info"
 | --- | --- | --- |
 | `mode` | `"disabled"` | `"disabled"`, `"allowlist"`, `"audit"` or `"host"`, see [Network](../network/index.md) |
 | `allow` | `[]` | destinations as `host[:ports]`, see [allow entries](../network/index.md#allow-entries) |
-| `log` | per-workspace file in the user state directory | JSON-lines file every decision is appended to |
+| `log` | per-workspace file in the user state directory | JSON-lines file every decision is appended to; relative to the workspace. It may not lie in the state directory (other than its `network` directory), in Claude Code's configuration directory, or be a protected file |
 
 ## `[packages]`
 
