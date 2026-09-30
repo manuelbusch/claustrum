@@ -420,7 +420,9 @@ fn decode_request(buf: &[u8]) -> Result<(Vec<String>, String, usize), String> {
         let end = pos.checked_add(len).ok_or("truncated")?;
         let b = buf.get(*pos..end).ok_or("truncated")?;
         *pos = end;
-        Ok(String::from_utf8_lossy(b).into_owned())
+        // Strict: a lossy conversion would turn invalid bytes into U+FFFD,
+        // which the input validation then sees instead of what was sent.
+        String::from_utf8(b.to_vec()).map_err(|_| "argument is not valid UTF-8".to_owned())
     };
     for _ in 0..argc {
         args.push(string_at(&mut pos)?);
@@ -557,6 +559,24 @@ mod tests {
         fn run(&self, _args: &[String], _invocation: &Invocation) -> HostOutput {
             HostOutput::default()
         }
+    }
+
+    fn request(args: &[&[u8]], cwd: &[u8]) -> Vec<u8> {
+        let mut buf = (args.len() as u32).to_le_bytes().to_vec();
+        for a in args.iter().chain([&cwd]) {
+            buf.extend_from_slice(&(a.len() as u32).to_le_bytes());
+            buf.extend_from_slice(a);
+        }
+        buf
+    }
+
+    #[test]
+    fn requests_must_be_utf8() {
+        let (args, cwd, _) = decode_request(&request(&[b"a", "\u{e9}".as_bytes()], b"/w")).unwrap();
+        assert_eq!(args, ["a", "\u{e9}"]);
+        assert_eq!(cwd, "/w");
+        assert!(decode_request(&request(&[b"a\xff"], b"/w")).is_err());
+        assert!(decode_request(&request(&[b"a"], b"/\xc3")).is_err());
     }
 
     #[test]
