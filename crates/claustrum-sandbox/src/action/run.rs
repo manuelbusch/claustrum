@@ -82,9 +82,37 @@ pub(crate) fn execute(
         Some(p) => claustrum_confine::command(p, &spec.program).map_err(|e| e.to_string())?,
         None => Command::new(&spec.program),
     };
+    // The working directory was resolved when the definition was compiled;
+    // since then the guest may have replaced a directory on the way with a
+    // link to somewhere else. Open it without following links and enter
+    // that very directory, so neither the program nor the `path` inputs
+    // (relative to it) end up outside the workspace.
+    #[cfg(unix)]
+    let cwd = open_dir_nofollow(&spec.cwd).map_err(|e| {
+        format!(
+            "the working directory {} changed since startup: {e}",
+            spec.cwd.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
+        let fd = cwd.as_raw_fd();
+        // SAFETY: fchdir is async-signal-safe; `cwd` outlives the spawn.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(fd) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    command.current_dir(&spec.cwd);
     command
         .args(&bound.argv)
-        .current_dir(&spec.cwd)
         .env_clear()
         .envs(base_env())
         .envs(
@@ -205,6 +233,51 @@ pub(crate) fn execute(
         outcome.exit_code = 1;
     }
     Ok(outcome)
+}
+
+/// Open the directory `path` (absolute and free of links when the action
+/// was compiled) one component at a time, refusing any link on the way.
+#[cfg(unix)]
+fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+            unix::ffi::OsStrExt as _,
+        },
+    };
+    let open = |dir: libc::c_int, name: &CString| {
+        // SAFETY: `name` is a valid C string; the result is checked.
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: a fresh descriptor owned by nobody else.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    let mut dir = open(libc::AT_FDCWD, &CString::new("/")?)?;
+    for c in path.components() {
+        match c {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                let name = CString::new(name.as_bytes())?;
+                dir = open(dir.as_raw_fd(), &name)?;
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "the path is not absolute and normalised",
+                ));
+            }
+        }
+    }
+    Ok(dir)
 }
 
 /// The environment every action starts from.
@@ -623,6 +696,41 @@ mod tests {
         assert_eq!(out.exit_code, KILLED_EXIT_CODE);
         assert_eq!(out.stdout.len(), 4096);
         assert!(out.stdout_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_swapped_for_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let s = ActionDef {
+            name: "t".into(),
+            command: vec!["/bin/pwd".into()],
+            cwd: Some("sub".into()),
+            ..Default::default()
+        }
+        .compile(&CompileContext {
+            workspace: &ws,
+            default_timeout: None,
+            max_output_bytes: 4096,
+            resolve_programs: true,
+        })
+        .unwrap();
+        let out = run(&s, &ws, &[]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            ws.join("sub").display().to_string()
+        );
+
+        std::fs::remove_dir(ws.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("sub")).unwrap();
+        let bound = bind(&s, &[], &BTreeMap::new(), crate::WORKSPACE, &ws).unwrap();
+        let err = execute(&s, &bound, &[], &BTreeMap::new(), &Cancel::new(), None).unwrap_err();
+        assert!(err.contains("changed since startup"), "{err}");
     }
 
     #[test]
