@@ -99,7 +99,7 @@ mod broker {
             .context("the network log path is not set")?;
 
         let plans: Option<Arc<dyn PlanStore>> = config
-            .host_plans(workspace)
+            .host_plans(workspace)?
             .map(|p| Arc::new(p) as Arc<dyn PlanStore>);
         let host: Option<Arc<ActionHost>> = if specs.is_empty() {
             None
@@ -409,13 +409,9 @@ mod broker {
         let _ = std::fs::remove_file(&own);
         report(
             "other-log-write",
-            std::fs::write(
-                config
-                    .network_log_path(workspace)
-                    .with_file_name("claustrum-probe.jsonl"),
-                "x",
-            )
-            .is_ok(),
+            config.network_log_path(workspace).is_ok_and(|log| {
+                std::fs::write(log.with_file_name("claustrum-probe.jsonl"), "x").is_ok()
+            }),
         );
         let plans = crate::config::claude_plans_dir();
         report("claude-plans-read", std::fs::read_dir(&plans).is_ok());

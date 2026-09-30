@@ -98,7 +98,9 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         .unwrap_or_else(|| which::which("claude").map_err(anyhow::Error::from))
         .context("cannot find the `claude` binary; pass --claude or set [claude].binary")?;
 
-    let plans = config.host_plans(&workspace).map(|p| p.dir().to_path_buf());
+    let plans = config
+        .host_plans(&workspace)?
+        .map(|p| p.dir().to_path_buf());
     if let Some(dir) = &plans {
         eprintln!(
             "claustrum: plans: {} (written through WritePlan/EditPlan, this workspace's files only)",

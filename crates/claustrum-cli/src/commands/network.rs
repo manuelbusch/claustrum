@@ -29,7 +29,7 @@ pub fn run(config: Config, cmd: Command) -> Result<()> {
         Command::Report { workspace, all } => {
             let workspace = config.workspace(workspace.as_deref())?;
             config.migrate_state(&workspace);
-            let path = config.network_log_path(&workspace);
+            let path = config.network_log_path(&workspace)?;
             let entries = match read_log(&path) {
                 Ok(e) => e,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

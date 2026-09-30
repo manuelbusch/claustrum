@@ -76,7 +76,7 @@ pub fn command(config: &Config, revoke: bool) -> Result<()> {
     };
     let path = canonical(path)?;
     if revoke {
-        match std::fs::remove_file(record_path(&path)) {
+        match std::fs::remove_file(record_path(&path)?) {
             Ok(()) => println!("Trust for {} revoked.", path.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 println!("{} was not trusted.", path.display());
@@ -99,14 +99,14 @@ fn canonical(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve {}", path.display()))
 }
 
-fn record_path(config: &Path) -> PathBuf {
+fn record_path(config: &Path) -> Result<PathBuf> {
     let key = sha256_hex(config.as_os_str().as_encoded_bytes());
-    state_dir().join("trust").join(&key[..32])
+    Ok(state_dir()?.join("trust").join(&key[..32]))
 }
 
 /// The trusted digest of `config`, if any.
 fn recorded(config: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(record_path(config)) {
+    match std::fs::read_to_string(record_path(config)?) {
         Ok(text) => Ok(text.lines().next().map(|l| l.trim().to_owned())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).context("cannot read the trust record"),
@@ -114,7 +114,7 @@ fn recorded(config: &Path) -> Result<Option<String>> {
 }
 
 fn record(config: &Path, digest: &str) -> Result<()> {
-    let path = record_path(config);
+    let path = record_path(config)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }

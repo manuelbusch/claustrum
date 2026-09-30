@@ -325,18 +325,26 @@ pub fn default_packages_dir() -> PathBuf {
 }
 
 /// Per-user directory for logs, plans and trust records;
-/// `CLAUSTRUM_STATE_DIR` overrides it.
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CLAUSTRUM_STATE_DIR") {
-        return PathBuf::from(dir);
+/// `CLAUSTRUM_STATE_DIR` overrides it. Without either there is no such
+/// directory, and none is guessed: the current directory is usually the
+/// workspace, where the guest could forge trust records and plan ledgers.
+pub fn state_dir() -> Result<PathBuf> {
+    state_dir_from(std::env::var_os("CLAUSTRUM_STATE_DIR"), project_dirs())
+}
+
+fn state_dir_from(
+    overridden: Option<std::ffi::OsString>,
+    dirs: Option<directories::ProjectDirs>,
+) -> Result<PathBuf> {
+    if let Some(dir) = overridden {
+        return Ok(PathBuf::from(dir));
     }
-    project_dirs()
-        .map(|d| {
-            d.state_dir()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| d.data_dir().to_path_buf())
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
+    dirs.map(|d| {
+        d.state_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| d.data_dir().to_path_buf())
+    })
+    .context("cannot determine the user state directory (is HOME set?); set CLAUSTRUM_STATE_DIR")
 }
 
 /// File name stem that identifies a workspace in the state directory:
@@ -571,18 +579,18 @@ impl Config {
     }
 
     /// Where the network decisions for `workspace` are logged.
-    pub fn network_log_path(&self, workspace: &Path) -> PathBuf {
+    pub fn network_log_path(&self, workspace: &Path) -> Result<PathBuf> {
         if let Some(p) = &self.file.network.log {
             let p = expand_home(p);
-            return if p.is_relative() {
+            return Ok(if p.is_relative() {
                 workspace.join(p)
             } else {
                 p
-            };
+            });
         }
-        state_dir()
+        Ok(state_dir()?
             .join("network")
-            .join(format!("{}.jsonl", workspace_key(workspace)))
+            .join(format!("{}.jsonl", workspace_key(workspace))))
     }
 
     /// Rename the network log and plan ledger of `workspace` from the file
@@ -593,7 +601,9 @@ impl Config {
         if new == old {
             return;
         }
-        let dir = state_dir();
+        let Ok(dir) = state_dir() else {
+            return;
+        };
         let mut moves = vec![(
             dir.join("plans").join(format!("{old}.list")),
             dir.join("plans").join(format!("{new}.list")),
@@ -633,16 +643,16 @@ impl Config {
     /// Where Claude Code's plans for `workspace` are written, if plan mode
     /// is enabled: Claude Code's own plan directory, with a ledger in the
     /// user state directory of the files this workspace created there.
-    pub fn host_plans(&self, workspace: &Path) -> Option<HostPlans> {
+    pub fn host_plans(&self, workspace: &Path) -> Result<Option<HostPlans>> {
         if !self.file.claude.plans {
-            return None;
+            return Ok(None);
         }
-        Some(HostPlans::new(
+        Ok(Some(HostPlans::new(
             claude_plans_dir(),
-            state_dir()
+            state_dir()?
                 .join("plans")
                 .join(format!("{}.list", workspace_key(workspace))),
-        ))
+        )))
     }
 
     pub fn network_policy(&self, workspace: &Path) -> Result<NetworkPolicy> {
@@ -658,7 +668,7 @@ impl Config {
         Ok(NetworkPolicy {
             mode,
             allow,
-            log: Some(self.network_log_path(workspace)),
+            log: Some(self.network_log_path(workspace)?),
         })
     }
 
@@ -796,7 +806,7 @@ impl Config {
                 builder.mount(&m.guest, expand_home(&m.host))
             };
         }
-        if let Some(host) = self.host_plans(&workspace) {
+        if let Some(host) = self.host_plans(&workspace)? {
             let dir = host.dir().to_string_lossy().into_owned();
             let store = plans.unwrap_or_else(|| Arc::new(host));
             builder = builder.plans(dir, store);
@@ -965,14 +975,21 @@ writable = true
 
     #[test]
     fn plan_ledgers_are_per_workspace() {
-        let a = config("").host_plans(Path::new("/tmp/a/ws")).unwrap();
-        let b = config("").host_plans(Path::new("/tmp/b/ws")).unwrap();
+        let a = config("")
+            .host_plans(Path::new("/tmp/a/ws"))
+            .unwrap()
+            .unwrap();
+        let b = config("")
+            .host_plans(Path::new("/tmp/b/ws"))
+            .unwrap()
+            .unwrap();
         assert_eq!(a.dir(), b.dir());
         assert!(a.dir().ends_with("plans"));
         assert_ne!(format!("{a:?}"), format!("{b:?}"));
         assert!(
             config("[claude]\nplans = false\n")
                 .host_plans(Path::new("/tmp/a/ws"))
+                .unwrap()
                 .is_none()
         );
     }
@@ -991,6 +1008,16 @@ writable = true
             assert!(err.to_string().contains("not allowed"), "{bad}: {err}");
         }
         check_claude_args(&["--model".into(), "opus".into(), "--verbose".into()]).unwrap();
+    }
+
+    #[test]
+    fn state_dir_is_never_guessed() {
+        let err = state_dir_from(None, None).unwrap_err();
+        assert!(err.to_string().contains("CLAUSTRUM_STATE_DIR"), "{err}");
+        assert_eq!(
+            state_dir_from(Some("/s".into()), None).unwrap(),
+            PathBuf::from("/s")
+        );
     }
 
     #[test]
