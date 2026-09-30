@@ -16,6 +16,8 @@ use std::{
 use regex::Regex;
 use serde::Deserialize;
 
+use super::reparse::refuse_reparsed_inputs;
+
 /// Upper bound for input values when the definition does not set `max_len`.
 pub const DEFAULT_MAX_LEN: usize = 256;
 /// Largest `max_len` a definition may ask for.
@@ -235,6 +237,22 @@ impl Template {
         self.inputs().next().is_none()
     }
 
+    /// The text, if the template has no placeholders.
+    pub(super) fn as_literal(&self) -> Option<&str> {
+        match self.segments.as_slice() {
+            [Segment::Literal(l)] => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The literal text before the first placeholder.
+    pub(super) fn literal_prefix(&self) -> &str {
+        match self.segments.first() {
+            Some(Segment::Literal(l)) => l,
+            _ => "",
+        }
+    }
+
     /// Substitute the placeholders. Every placeholder must have a value.
     pub fn render(&self, values: &BTreeMap<String, String>) -> String {
         let mut out = String::new();
@@ -452,25 +470,6 @@ fn expand_writable(path: &Path, workspace: &Path) -> Result<PathBuf, String> {
     Ok(expanded)
 }
 
-/// Programs that re-parse an argument as code. A placeholder in the argument
-/// after one of these flags would be interpreted again on the host, which
-/// defeats the input validation entirely, so such definitions are refused.
-const REPARSING_PROGRAMS: &[(&str, &[&str])] = &[
-    ("sh", &["-c"]),
-    ("bash", &["-c"]),
-    ("zsh", &["-c"]),
-    ("dash", &["-c"]),
-    ("ksh", &["-c"]),
-    ("fish", &["-c"]),
-    ("python", &["-c"]),
-    ("python3", &["-c"]),
-    ("node", &["-e", "--eval", "-p", "--print"]),
-    ("perl", &["-e", "-E"]),
-    ("ruby", &["-e"]),
-    ("php", &["-r"]),
-    ("osascript", &["-e"]),
-];
-
 /// Programs that execute configuration or scripts found in the workspace,
 /// which the guest can write. Triggering them is code execution on the host
 /// even without inputs.
@@ -512,7 +511,7 @@ const WORKSPACE_CODE_PROGRAMS: &[(&str, &str)] = &[
 /// Host variables that change what a process loads or runs. Forwarding them
 /// hands that control to whoever set them; templating them hands it to the
 /// guest.
-const LOADER_ENV: &[&str] = &[
+pub(super) const LOADER_ENV: &[&str] = &[
     "PATH",
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -549,29 +548,6 @@ fn program_basename(program: &Path) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// Refuse a placeholder in an argument that the program evaluates as code.
-fn refuse_reparsed_inputs(program: &Path, argv: &[Template]) -> Result<(), String> {
-    let base = program_basename(program);
-    let Some((_, flags)) = REPARSING_PROGRAMS.iter().find(|(p, _)| *p == base) else {
-        return Ok(());
-    };
-    for (i, arg) in argv.iter().enumerate() {
-        let text = arg.to_string();
-        // `-c code` and `-ccode` / `--eval=code`.
-        let flag_before = i > 0 && flags.contains(&argv[i - 1].to_string().as_str());
-        let flag_inline = flags
-            .iter()
-            .any(|f| text.len() > f.len() && text.starts_with(f) && !arg.is_literal());
-        if (flag_before && !arg.is_literal()) || flag_inline {
-            return Err(format!(
-                "`{base}` would re-parse the placeholder in `{text}` as code; put the code in \
-                 a script and pass the input as an argument to it instead"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Legal but risky traits of a definition, reported as warnings at startup.
@@ -900,6 +876,8 @@ mod tests {
             &["/bin/bash", "-c", "{x}"][..],
             &["/bin/sh", "-c{x}"][..],
             &["/bin/zsh", "-c", "{x}"][..],
+            &["/bin/sh", "-ec", "{x}"][..],
+            &["/usr/bin/env", "sh", "-c", "{x}"][..],
         ] {
             let e = with_input(command).compile(&c).unwrap_err();
             assert!(e.contains("re-parse"), "{command:?}: {e}");
