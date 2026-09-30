@@ -4,14 +4,16 @@
 //! closed stdin, its own process group and, when a [`Profile`] is given, the
 //! OS sandbox. Output is captured with a limit,
 //! the wall-clock timeout and the guest's cancel flag both end in a SIGKILL
-//! of the whole group, and the protected files (the Claustrum configuration)
-//! are put back if the program touched them.
+//! of the whole group, as does the program's own exit for whatever it left
+//! running there. The protected files (the Claustrum configuration) are put
+//! back if the program touched them.
 
 use std::{
     collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -102,41 +104,50 @@ pub(crate) fn execute(
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start `{}`: {e}", spec.program.display()))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
     let limit = spec.max_output_bytes;
+    let out = Drain::start(child.stdout.take().expect("stdout is piped"), limit);
+    let err = Drain::start(child.stderr.take().expect("stderr is piped"), limit);
 
-    let (status, killed, out, err) = std::thread::scope(|s| {
-        let out = s.spawn(move || drain(stdout, limit));
-        let err = s.spawn(move || drain(stderr, limit));
-        let deadline = spec.timeout.map(|t| started + t);
-        let mut killed = false;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => {}
-                Err(e) => break Err(e),
-            }
-            let expired = deadline.is_some_and(|d| Instant::now() >= d);
-            if expired || cancel.is_cancelled() {
-                tracing::warn!(
-                    action = spec.name,
-                    reason = if expired { "timeout" } else { "guest killed" },
-                    "killing host action"
-                );
-                kill_group(&mut child);
-                killed = true;
-                break child.wait();
-            }
-            std::thread::sleep(POLL);
-        };
-        (
-            status,
-            killed,
-            out.join().unwrap_or_default(),
-            err.join().unwrap_or_default(),
-        )
-    });
+    let deadline = spec.timeout.map(|t| started + t);
+    let mut killed = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        let expired = deadline.is_some_and(|d| Instant::now() >= d);
+        if expired || cancel.is_cancelled() {
+            tracing::warn!(
+                action = spec.name,
+                reason = if expired { "timeout" } else { "guest killed" },
+                "killing host action"
+            );
+            kill_group(&mut child);
+            killed = true;
+            break child.wait();
+        }
+        std::thread::sleep(POLL);
+    };
+    // An action is one job: whatever it left running in its process group
+    // goes with it, instead of holding the output pipes open.
+    kill_process_group(&child);
+    // Output still in the pipes arrives at once. A descendant that left the
+    // group (`setsid`, a daemon) may keep them open for good; it must not
+    // hold up the action, and with it every later one.
+    let until = Instant::now() + DRAIN_GRACE;
+    let (out, out_done) = out.finish(until);
+    let (mut err, err_done) = err.finish(until);
+    if !(out_done && err_done) {
+        tracing::warn!(
+            action = spec.name,
+            "a process started by the action still holds its output open; stopped reading"
+        );
+        err.0.extend_from_slice(
+            b"\nclaustrum: a background process started by the action still holds its output \
+              open; stopped reading\n",
+        );
+    }
     let status =
         status.map_err(|e| format!("waiting for `{}` failed: {e}", spec.program.display()))?;
 
@@ -204,40 +215,86 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 }
 
 fn kill_group(child: &mut std::process::Child) {
+    kill_process_group(child);
+    let _ = child.kill();
+}
+
+/// SIGKILL the child's process group. The child is its leader (see
+/// `execute`), so this reaches everything it spawned that did not start a
+/// group or session of its own. After the child exited, the id stays
+/// reserved for the group while any member is alive; without members
+/// killpg fails with ESRCH (short of the pid space wrapping around first).
+fn kill_process_group(child: &std::process::Child) {
     #[cfg(unix)]
     {
-        // The child is the leader of its own process group (see `execute`),
-        // so this reaches everything it spawned.
-        // SAFETY: killpg has no memory-safety preconditions; a stale pid can
-        // at worst fail with ESRCH.
+        // SAFETY: killpg has no memory-safety preconditions; a group
+        // without members fails with ESRCH.
         unsafe {
             libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
         }
     }
-    let _ = child.kill();
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
-/// Read a stream to EOF, keeping at most `limit` bytes.
-fn drain(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let mut truncated = false;
+/// How long the output is still read after the action ended.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Output captured by a reader thread of its own. The thread is detached:
+/// if a leftover process keeps the pipe open it stays blocked in `read`
+/// (holding at most `limit` bytes) until that process exits, but the action
+/// does not wait for it.
+struct Drain {
+    captured: Arc<Mutex<(Vec<u8>, bool)>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl Drain {
+    fn start(reader: impl Read + Send + 'static, limit: usize) -> Drain {
+        let captured = Arc::new(Mutex::new((Vec::new(), false)));
+        let (tx, done) = mpsc::channel();
+        let buf = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            drain(reader, limit, &buf);
+            drop(tx);
+        });
+        Drain { captured, done }
+    }
+
+    /// What was read so far, and whether the stream reached its end, waiting
+    /// for that at most until `until`.
+    fn finish(self, until: Instant) -> ((Vec<u8>, bool), bool) {
+        let wait = until.saturating_duration_since(Instant::now());
+        // The sender is only dropped, never used: disconnected means done.
+        let done = matches!(
+            self.done.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        let mut captured = self.captured.lock().unwrap_or_else(|e| e.into_inner());
+        (std::mem::take(&mut *captured), done)
+    }
+}
+
+/// Read a stream to EOF, keeping at most `limit` bytes in `captured`.
+fn drain(mut reader: impl Read, limit: usize, captured: &Mutex<(Vec<u8>, bool)>) {
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
+                let mut c = captured.lock().unwrap_or_else(|e| e.into_inner());
+                let (buf, truncated) = &mut *c;
                 let room = limit.saturating_sub(buf.len());
                 let take = room.min(n);
                 buf.extend_from_slice(&chunk[..take]);
                 if take < n {
-                    truncated = true;
+                    *truncated = true;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
-    (buf, truncated)
 }
 
 /// State of a protected path, observed without following links.
@@ -560,6 +617,83 @@ mod tests {
         // SAFETY: signal 0 only checks for existence.
         let alive = unsafe { libc::kill(gpid, 0) } == 0;
         assert!(!alive, "grandchild {gpid} survived");
+    }
+
+    fn pid_in(file: &Path) -> i32 {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks for existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn background_children_do_not_hold_up_a_finished_action() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        // The background sleep inherits stdout and would keep it open.
+        let s = spec(
+            &ws,
+            &[
+                "/bin/sh",
+                "-c",
+                "/bin/sleep 30 & echo $! > gpid; echo started",
+            ],
+            None,
+        );
+        let started = Instant::now();
+        let out = run(&s, &ws, &[]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.killed);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        let gpid = pid_in(&ws.join("gpid"));
+        assert!(!alive(gpid), "background child {gpid} survived");
+    }
+
+    #[test]
+    fn a_descendant_in_its_own_session_does_not_hold_up_the_action() {
+        if !Path::new("/usr/bin/perl").exists() {
+            eprintln!("skipped: needs /usr/bin/perl for setsid");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        // Out of reach of killpg, holding stdout and stderr open.
+        let s = spec(
+            &ws,
+            &[
+                "/bin/sh",
+                "-c",
+                "/usr/bin/perl -MPOSIX -e 'setsid(); open(my $f, \">\", \"ready\"); \
+                 close($f); exec \"/bin/sleep\", \"30\"' & echo $! > spid; \
+                 while [ ! -e ready ]; do /bin/sleep 0.05; done; echo started",
+            ],
+            Some(10),
+        );
+        let started = Instant::now();
+        let out = run(&s, &ws, &[]);
+        let spid = pid_in(&ws.join("spid"));
+        // SAFETY: plain kill of the test's own leftover.
+        unsafe { libc::kill(spid, libc::SIGKILL) };
+        assert!(
+            started.elapsed() < DRAIN_GRACE + Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("stopped reading"),
+            "{out:?}"
+        );
     }
 
     #[test]
