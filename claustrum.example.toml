@@ -126,7 +126,7 @@ source = "syrusakbary/jq@=0.1.0"
 # Claude can write, even without inputs. Declare no inputs when you can, keep
 # patterns as narrow as possible, never put a placeholder where a shell or
 # interpreter would re-parse it, and only declare commands you would let
-# Claude run on the host directly. See README, "Host actions".
+# Claude run on the host directly. See the user guide, "Host actions".
 [actions]
 # Guest command that triggers the actions (`host test` in Bash). Must not
 # collide with a package command.
@@ -181,7 +181,7 @@ source = "syrusakbary/jq@=0.1.0"
 # AskUserQuestion, which only prompts the user; WebSearch is safe to keep
 # because it runs on the API side. Agent enables subagents and Workflow
 # (together with Agent) multi-agent workflows; their agents only get the
-# Claustrum tools (see "Subagents" in the README).
+# Claustrum tools (see "Subagents and workflows" in the user guide).
 tools = []
 
 # Extra arguments always passed to claude. Flags that would override the

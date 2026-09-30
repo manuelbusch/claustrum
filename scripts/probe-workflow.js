@@ -4,10 +4,10 @@ export const meta = {
   phases: [{ title: 'Probe' }, { title: 'Summarize' }],
 }
 
-// Checks that workflow agents stay in the Claustrum sandbox (see "Subagents" in
-// the README). Ask Claude to run this file as a workflow, passing the script
-// inline; `leakedBuiltins` in the result must be empty. Rerun after upgrading
-// Claude Code.
+// Checks that workflow agents stay in the Claustrum sandbox (see "Subagents and
+// workflows" in the user guide). Ask Claude to run this file as a workflow,
+// passing the script inline; `leakedBuiltins` in the result must be empty.
+// Rerun after upgrading Claude Code.
 
 const REPORT = {
   type: 'object',

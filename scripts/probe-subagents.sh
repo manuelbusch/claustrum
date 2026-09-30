@@ -1,6 +1,7 @@
 #!/bin/sh
 # Probes whether Claude Code subagents stay in the sandbox under `claustrum run`
-# (see "Subagents" in the README). Rerun after upgrading Claude Code.
+# (see "Subagents and workflows" in the user guide). Rerun after upgrading
+# Claude Code.
 # Run on the host: sh scripts/probe-subagents.sh
 set -u
 DIR=/tmp/agent-probe

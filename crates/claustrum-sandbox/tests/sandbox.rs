@@ -1,7 +1,7 @@
 //! Integration tests against the bundled bash + coreutils packages.
 //!
 //! Requires `packages/bash.webc` and `packages/coreutils.webc` in the repo
-//! root (see README, "Packages"). Tests are skipped when they are missing.
+//! root (see README, "Development"). Tests are skipped when they are missing.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 

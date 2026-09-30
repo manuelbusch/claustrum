@@ -1,0 +1,8 @@
+[book]
+title = "Claustrum (User Guide)"
+authors = ["Manuel Busch"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/manuelbusch/claustrum"
