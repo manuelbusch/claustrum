@@ -178,11 +178,13 @@ impl FromStr for AllowEntry {
 }
 
 fn parse_host(h: &str) -> Result<HostSpec, String> {
+    // Addresses are compared in canonical form (see `canonical_ip`), so an
+    // IPv4-mapped entry is stored as the IPv4 address or net it carries.
     if let Ok(ip) = h.parse::<IpAddr>() {
-        return Ok(HostSpec::Net(IpNet::from(ip)));
+        return Ok(HostSpec::Net(IpNet::from(canonical_ip(ip))));
     }
     if let Ok(net) = h.parse::<IpNet>() {
-        return Ok(HostSpec::Net(net.trunc()));
+        return Ok(HostSpec::Net(canonical_net(net.trunc())));
     }
     let lower = h.trim_end_matches('.').to_ascii_lowercase();
     let (wild, name) = match lower.strip_prefix("*.") {
@@ -263,6 +265,19 @@ impl std::fmt::Display for AllowEntry {
     }
 }
 
+/// A net inside `::ffff:0:0/96` as the IPv4 net it maps.
+fn canonical_net(net: IpNet) -> IpNet {
+    match net {
+        IpNet::V6(v6) if v6.prefix_len() >= 96 => match v6.addr().to_ipv4_mapped() {
+            Some(v4) => ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96)
+                .map(IpNet::V4)
+                .unwrap_or(net),
+            None => net,
+        },
+        other => other,
+    }
+}
+
 /// IPv4-mapped IPv6 addresses are treated as the IPv4 address they carry.
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
@@ -296,6 +311,7 @@ fn is_special_v4(ip: Ipv4Addr) -> bool {
         || o[0] == 0
         || (o[0] == 100 && (64..128).contains(&o[1])) // shared / CGNAT
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 6to4 relay anycast (deprecated)
         || (o[0] == 198 && (18..20).contains(&o[1])) // benchmarking
         || o[0] >= 240 // reserved
 }
@@ -308,6 +324,8 @@ fn is_special_v6(ip: Ipv6Addr) -> bool {
         || (s[0] & 0xfe00) == 0xfc00 // unique local
         || (s[0] & 0xffc0) == 0xfe80 // link local
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+        || (s[0] & 0xfff0) == 0x3ff0 // documentation (3fff::/20)
+        || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0) // benchmarking
         || (s[0] & 0xffc0) == 0xfec0 // deprecated site local
         || (s[0] == 0x0100 && s[1..4] == [0, 0, 0]) // discard-only
         // Transition ranges embed an IPv4 address and can reach private IPv4
@@ -316,6 +334,8 @@ fn is_special_v6(ip: Ipv6Addr) -> bool {
         || s[0] == 0x2002 // 6to4
         || (s[0] == 0x2001 && s[1] == 0x0000) // Teredo
         || s[..6] == [0; 6] // IPv4-compatible (deprecated), ::/96
+        || s[..6] == [0, 0, 0, 0, 0xffff, 0] // IPv4-translated (SIIT), ::ffff:0:0:0/96
+        || ((s[4] & 0xfdff) == 0 && s[5] == 0x5efe) // ISATAP interface identifier
 }
 
 /// Why something was refused, for logs and for the model.
@@ -555,6 +575,9 @@ mod tests {
             ("[::1]:8080", "[::1]:8080"),
             ("::1", "[::1]:443"),
             ("[fd00::/8]:*", "[fd00::/8]:*"),
+            // IPv4-mapped entries are the IPv4 address or net they carry.
+            ("[::ffff:10.0.0.5]:5432", "10.0.0.5:5432"),
+            ("[::ffff:10.0.0.0/104]:22", "10.0.0.0/8:22"),
         ];
         for (input, shown) in cases {
             let e: AllowEntry = input.parse().unwrap_or_else(|e| panic!("{input}: {e}"));
@@ -576,6 +599,14 @@ mod tests {
         ] {
             assert!(bad.parse::<AllowEntry>().is_err(), "{bad:?} was accepted");
         }
+    }
+
+    #[test]
+    fn ipv4_mapped_entries_match_both_forms() {
+        let p = policy(NetMode::Allowlist, &["[::ffff:10.0.0.5]:5432"]);
+        assert!(p.check_connect(ip("10.0.0.5"), 5432).allowed());
+        assert!(p.check_connect(ip("::ffff:10.0.0.5"), 5432).allowed());
+        assert!(!p.check_connect(ip("10.0.0.6"), 5432).allowed());
     }
 
     #[test]
@@ -613,6 +644,12 @@ mod tests {
             "::8.8.8.8",
             "fec0::1",
             "100::1",
+            "192.88.99.1",
+            "::ffff:0:a00:1",
+            "2001:db8:1::5efe:a00:1",
+            "2a00:1450::200:5efe:a00:1",
+            "3fff::1",
+            "2001:2::1",
         ] {
             assert!(is_special(ip(s)), "{s} should be special");
         }
