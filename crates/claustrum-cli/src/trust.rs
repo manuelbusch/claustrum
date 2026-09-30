@@ -149,6 +149,10 @@ pub fn describe(path: &Path, file: &FileConfig, changed: bool) -> String {
     }
     match s.confinement.as_deref() {
         Some("off") => item(true, "OS confinement: off (single sandbox layer)".into()),
+        Some("best-effort") => item(
+            true,
+            "OS confinement: best-effort (runs unconfined where unavailable)".into(),
+        ),
         Some(m) => item(false, format!("OS confinement: {m}")),
         None => {}
     }
@@ -362,6 +366,10 @@ tools = ["Bash"]
         let file: FileConfig = toml::from_str("[sandbox]\nworkspace = \"~\"\n").unwrap();
         let text = describe(Path::new("/p/claustrum.toml"), &file, false);
         assert!(text.contains("! workspace: ~"), "{text}");
+        let file: FileConfig =
+            toml::from_str("[sandbox]\nconfinement = \"best-effort\"\n").unwrap();
+        let text = describe(Path::new("/p/claustrum.toml"), &file, false);
+        assert!(text.contains("! OS confinement: best-effort"), "{text}");
         assert!(!text.contains("nothing beyond the defaults"), "{text}");
     }
 }

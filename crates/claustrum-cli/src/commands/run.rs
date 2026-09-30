@@ -66,9 +66,13 @@ pub fn run(config: Config, args: Args) -> Result<()> {
     config.migrate_state(&workspace);
     let actions = config.validate_actions(&workspace)?;
     let network = config.network_policy(&workspace)?;
-    let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;
+    let confinement = config.confinement()?;
+    let confined = confinement.active().map_err(anyhow::Error::msg)?;
     eprintln!("claustrum: {}", Config::network_notice(&network));
-    eprintln!("claustrum: {}", Config::confinement_notice(confined));
+    eprintln!(
+        "claustrum: {}",
+        Config::confinement_notice(confinement.mode, confined)
+    );
     if let Some(notice) = Config::actions_notice(&actions, confined) {
         eprintln!("claustrum: {notice}");
     }

@@ -80,7 +80,7 @@ pub struct SandboxSection {
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     /// OS sandbox around the Wasmer worker and the host actions (the second
-    /// layer): `"best-effort"` (default), `"required"` or `"off"`.
+    /// layer): `"required"` (default), `"best-effort"` or `"off"`.
     pub confinement: Option<String>,
     /// Host paths confined processes may never read, in addition to the
     /// built-in list of credential stores (`~/.ssh`, `~/.aws`, keychains...).
@@ -521,16 +521,23 @@ impl Config {
         ))
     }
 
-    /// One line for stderr describing the second sandbox layer.
-    pub fn confinement_notice(confined: bool) -> String {
-        match claustrum_confine::backend() {
+    /// One line for stderr describing the second sandbox layer, and why it
+    /// is off if it is.
+    pub fn confinement_notice(mode: ConfinementMode, confined: bool) -> String {
+        let why = match claustrum_confine::backend() {
             Ok(backend) if confined => {
-                format!("confinement: {backend} around the Wasmer worker and the host actions")
+                return format!(
+                    "confinement: {backend} around the Wasmer worker and the host actions"
+                );
             }
-            _ => "confinement: OFF, the Wasmer runtime and host actions run with your full \
-                  rights"
-                .to_owned(),
-        }
+            _ if mode == ConfinementMode::Off => "confinement = \"off\"".to_owned(),
+            Ok(_) => "not active".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        format!(
+            "confinement: OFF ({why}), the Wasmer runtime and host actions run with your full \
+             rights"
+        )
     }
 
     /// The `[sandbox] confinement` settings.
@@ -540,7 +547,7 @@ impl Config {
             Some(m) => m
                 .parse::<ConfinementMode>()
                 .map_err(|e| anyhow::anyhow!("[sandbox] {e}"))?,
-            None => ConfinementMode::BestEffort,
+            None => ConfinementMode::Required,
         };
         let mut deny_read = std::env::var_os("HOME")
             .map(|h| claustrum_confine::secret_paths(Path::new(&h)))

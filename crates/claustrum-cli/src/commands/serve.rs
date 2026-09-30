@@ -33,10 +33,14 @@ pub struct Args {
 pub async fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
     config.migrate_state(&workspace);
-    let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;
+    let confinement = config.confinement()?;
+    let confined = confinement.active().map_err(anyhow::Error::msg)?;
     let network = config.network_policy(&workspace)?;
     eprintln!("claustrum: {}", Config::network_notice(&network));
-    eprintln!("claustrum: {}", Config::confinement_notice(confined));
+    eprintln!(
+        "claustrum: {}",
+        Config::confinement_notice(confinement.mode, confined)
+    );
     #[cfg(unix)]
     if confined {
         return broker::broker(config, &workspace).await;

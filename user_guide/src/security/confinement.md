@@ -6,13 +6,14 @@
 
 | Value | Behaviour |
 | --- | --- |
-| `"best-effort"` (default) | confine where the platform supports it, warn loudly where not |
-| `"required"` | refuse to start without OS confinement |
+| `"required"` (default) | refuse to start without OS confinement |
+| `"best-effort"` | confine where the platform supports it; elsewhere run unconfined, with the reason on stderr |
 | `"off"` | single process, single layer; host actions run with your full rights |
 
-`claustrum run` and `serve` print the active confinement, network mode and enabled actions on
-every start. Use `"required"` whenever you declare [host actions](../host-actions/index.md)
-for programs that run code from the workspace.
+`claustrum run` and `serve` print the active confinement (and why it is off, if it is),
+network mode and enabled actions on every start. Keep `"required"` whenever you declare
+[host actions](../host-actions/index.md) for programs that run code from the workspace; the
+trust prompt flags a project that lowers it.
 
 ## Platforms
 
@@ -34,7 +35,7 @@ sockets, signals) and a seccomp filter that refuses new namespaces, `ptrace` and
 `userfaultfd`, kernel modules and keyrings, netlink and packet sockets and new Unix sockets.
 Actions may only open TCP sockets. Confined actions reach the proxy through a relay inside
 their network namespace. Without a kernel that supports Landlock there is no Linux backend;
-`best-effort` then runs unconfined with a warning.
+Claustrum then refuses to start, and `best-effort` runs unconfined with a warning.
 
 ### Linux without user namespaces
 

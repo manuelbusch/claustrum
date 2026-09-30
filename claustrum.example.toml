@@ -30,11 +30,11 @@ max_output_bytes = 1048576
 # max_memory_mb = 1024
 
 # OS sandbox around the Wasmer worker and the host actions, the second layer
-# behind WASIX: "best-effort" (default; confine where supported, warn where
-# not), "required" (refuse to start without it) or "off" (single process,
-# host actions run with your full rights). macOS (Seatbelt) and Linux
-# (bubblewrap + Landlock + seccomp) for now.
-# confinement = "best-effort"
+# behind WASIX: "required" (default; refuse to start without it),
+# "best-effort" (confine where supported, run unconfined with a warning where
+# not) or "off" (single process, host actions run with your full rights).
+# macOS (Seatbelt) and Linux (bubblewrap + Landlock + seccomp) for now.
+# confinement = "required"
 
 # Host paths confined processes may never read, in addition to the built-in
 # credential stores (~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles...).

@@ -13,7 +13,7 @@ contains the same information as comments.
 | `max_output_bytes` | `1048576` | bytes kept per output stream (stdout, stderr) of a command; at most 64 MiB |
 | `max_threads` | `64` | guest processes and threads per command, counted together |
 | `max_memory_mb` | `1024` | memory one guest process may grow to, in MiB; `0` allows wasm32's 4 GiB |
-| `confinement` | `"best-effort"` | OS sandbox around the worker and the host actions: `"best-effort"`, `"required"` or `"off"`, see [OS confinement](../security/confinement.md) |
+| `confinement` | `"required"` | OS sandbox around the worker and the host actions: `"required"`, `"best-effort"` or `"off"`, see [OS confinement](../security/confinement.md) |
 | `deny_read` | `[]` | host paths confined processes may never read, in addition to the built-in credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser profiles, ...) |
 | `network` | – | shorthand for `[network] mode`, accepts `"disabled"` or `"host"` |
 

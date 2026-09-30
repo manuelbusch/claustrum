@@ -42,6 +42,15 @@ fn confine_helper() {
     });
 }
 
+/// Best effort, so that the tests run on machines without a backend; the
+/// ones about confinement check for one themselves.
+fn best_effort() -> claustrum_sandbox::Confinement {
+    claustrum_sandbox::Confinement {
+        mode: claustrum_sandbox::ConfinementMode::BestEffort,
+        ..Default::default()
+    }
+}
+
 async fn sandbox(workspace: &std::path::Path) -> Option<Sandbox> {
     sandbox_with(workspace, |b| b).await
 }
@@ -59,6 +68,7 @@ async fn sandbox_with(
     }
     let policy = Policy {
         default_timeout: Some(Duration::from_secs(60)),
+        confinement: best_effort(),
         ..Policy::default()
     };
     let mut builder = Sandbox::builder()
@@ -1323,15 +1333,6 @@ async fn confined_actions_cannot_even_write_the_configuration() {
     let ws = tempfile::tempdir().unwrap();
     let config = ws.path().join("claustrum.toml");
     std::fs::write(&config, "# original\n").unwrap();
-    // The library default confines where the platform can.
-    let Some(sb) = sandbox_with(ws.path(), |b| {
-        b.protect(ws.path().join("claustrum.toml"))
-            .actions(test_actions())
-    })
-    .await
-    else {
-        return;
-    };
     if !claustrum_sandbox::Confinement::default()
         .active()
         .unwrap_or(false)
@@ -1339,6 +1340,19 @@ async fn confined_actions_cannot_even_write_the_configuration() {
         eprintln!("skipping: no confinement backend");
         return;
     }
+    // The library default requires confinement.
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.protect(ws.path().join("claustrum.toml"))
+            .actions(test_actions())
+            .policy(Policy {
+                default_timeout: Some(Duration::from_secs(60)),
+                ..Policy::default()
+            })
+    })
+    .await
+    else {
+        return;
+    };
     let out = sb
         .bash("host tamper", ExecOptions::default())
         .await
@@ -1434,6 +1448,7 @@ fn network_policy(network: claustrum_sandbox::NetworkPolicy) -> Policy {
     Policy {
         default_timeout: Some(Duration::from_secs(300)),
         network,
+        confinement: best_effort(),
         ..Policy::default()
     }
 }

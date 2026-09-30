@@ -40,11 +40,12 @@ impl NetworkPolicy {
 /// Claustrum uses for its host processes. See the `claustrum-confine` crate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConfinementMode {
-    /// Refuse to start when the platform has no confinement backend.
-    Required,
-    /// Confine where possible, warn loudly where not. The default, for the
-    /// library as for the CLI: no second layer must be an explicit choice.
+    /// Refuse to start when the platform has no confinement backend. The
+    /// default, for the library as for the CLI: running without the second
+    /// layer must be an explicit choice.
     #[default]
+    Required,
+    /// Confine where possible, run unconfined with a warning where not.
     BestEffort,
     /// Never confine. Host actions run with the user's full rights.
     Off,
@@ -94,7 +95,8 @@ impl Confinement {
         match claustrum_confine::backend() {
             Ok(_) => Ok(true),
             Err(e) if self.mode == ConfinementMode::Required => Err(format!(
-                "confinement = \"required\" but OS confinement is unavailable: {e}"
+                "OS confinement is required but unavailable: {e}. To run without it, set \
+                 [sandbox] confinement = \"best-effort\" (or \"off\")"
             )),
             Err(e) => {
                 tracing::warn!(
