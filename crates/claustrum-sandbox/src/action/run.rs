@@ -45,6 +45,9 @@ pub struct ActionOutcome {
     pub duration: Duration,
     /// Protected files the program changed and Claustrum restored.
     pub restored: Vec<PathBuf>,
+    /// Protected files the program changed and Claustrum could not restore.
+    #[serde(default)]
+    pub restore_failed: Vec<PathBuf>,
     /// Network refusals (through the proxy) during the run, for the model.
     pub network_notes: Vec<String>,
 }
@@ -163,15 +166,19 @@ pub(crate) fn execute(
         stderr: err.0,
         stderr_truncated: err.1,
         duration: started.elapsed(),
-        restored: restore(&snapshot),
+        restored: Vec::new(),
+        restore_failed: Vec::new(),
         network_notes: Vec::new(),
     };
-    if !outcome.restored.is_empty() {
-        let names: Vec<_> = outcome
-            .restored
+    (outcome.restored, outcome.restore_failed) = restore(&snapshot);
+    let names = |paths: &[PathBuf]| {
+        paths
             .iter()
             .map(|p| p.display().to_string())
-            .collect();
+            .collect::<Vec<_>>()
+    };
+    if !outcome.restored.is_empty() {
+        let names = names(&outcome.restored);
         tracing::warn!(action = spec.name, files = ?names, "action changed protected files; restored");
         outcome.stderr.extend_from_slice(
             format!(
@@ -180,9 +187,22 @@ pub(crate) fn execute(
             )
             .as_bytes(),
         );
-        if outcome.exit_code == 0 {
-            outcome.exit_code = 1;
-        }
+    }
+    if !outcome.restore_failed.is_empty() {
+        let names = names(&outcome.restore_failed);
+        tracing::error!(action = spec.name, files = ?names, "action changed protected files; restoring them failed");
+        outcome.stderr.extend_from_slice(
+            format!(
+                "\nclaustrum: the action modified protected file(s) {} and they could NOT be restored; inspect them before the next run\n",
+                names.join(", ")
+            )
+            .as_bytes(),
+        );
+    }
+    if (!outcome.restored.is_empty() || !outcome.restore_failed.is_empty())
+        && outcome.exit_code == 0
+    {
+        outcome.exit_code = 1;
     }
     Ok(outcome)
 }
@@ -336,19 +356,23 @@ impl Entry {
         }
     }
 
-    /// Same contents in the same file (a hard link to another file with
-    /// equal bytes still counts as changed).
+    /// Same contents and permissions in the same file (a hard link to
+    /// another file with equal bytes still counts as changed).
     fn unchanged(&self, before: &Entry) -> bool {
         match (self, before) {
             (Entry::Absent, Entry::Absent) => true,
             (
                 Entry::File {
-                    bytes: a, id: ia, ..
+                    bytes: a,
+                    mode: ma,
+                    id: ia,
                 },
                 Entry::File {
-                    bytes: b, id: ib, ..
+                    bytes: b,
+                    mode: mb,
+                    id: ib,
                 },
-            ) => a == b && ia == ib,
+            ) => a == b && ma == mb && ia == ib,
             _ => false,
         }
     }
@@ -386,24 +410,29 @@ fn snapshot(protected: &[PathBuf]) -> Vec<(PathBuf, Entry)> {
         .collect()
 }
 
-/// Put back every protected file the action changed; returns those paths.
+/// Put back every protected file the action changed; returns the paths
+/// restored and those that could not be.
 ///
 /// This runs outside any OS sandbox, so it never writes through what the
 /// action left behind: links in place of the file or of a parent directory
 /// are removed, directories are moved aside instead of deleted, and the
 /// original contents go to a new file that is renamed into place.
-fn restore(snapshot: &[(PathBuf, Entry)]) -> Vec<PathBuf> {
+fn restore(snapshot: &[(PathBuf, Entry)]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut restored = Vec::new();
+    let mut failed = Vec::new();
     for (path, before) in snapshot {
         if ancestors_intact(path) && Entry::observe(path).unchanged(before) {
             continue;
         }
-        if let Err(e) = restore_one(path, before) {
-            tracing::error!(path = %path.display(), error = %e, "cannot restore protected file");
+        match restore_one(path, before) {
+            Ok(()) => restored.push(path.clone()),
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "cannot restore protected file");
+                failed.push(path.clone());
+            }
         }
-        restored.push(path.clone());
     }
-    restored
+    (restored, failed)
 }
 
 fn restore_one(path: &Path, before: &Entry) -> std::io::Result<()> {
@@ -437,6 +466,12 @@ fn restore_one(path: &Path, before: &Entry) -> std::io::Result<()> {
     let written = opts.open(&tmp).and_then(|mut f| {
         use std::io::Write;
         f.write_all(bytes)?;
+        // The mode given to open is masked by the umask; set it exactly.
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(*m))?;
+        }
         f.sync_all()
     });
     // rename replaces a file or link at `path` without following it.
@@ -737,6 +772,53 @@ mod tests {
         assert_eq!(out.exit_code, 1);
         assert!(String::from_utf8_lossy(&out.stderr).contains("restored"));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_permissions_are_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let config = ws.join("claustrum.toml");
+        std::fs::write(&config, "# original\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let s = spec(&ws, &["/bin/sh", "-c", "chmod 666 claustrum.toml"], None);
+        let out = run(&s, &ws, std::slice::from_ref(&config));
+        assert_eq!(out.restored, [config.clone()]);
+        assert!(out.restore_failed.is_empty());
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_restores_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root ignores the directory permissions");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let config = ws.join("claustrum.toml");
+        std::fs::write(&config, "# original\n").unwrap();
+        // The restore needs a new file next to the config, which the
+        // read-only directory refuses.
+        let s = spec(
+            &ws,
+            &["/bin/sh", "-c", "echo hacked > claustrum.toml; chmod 555 ."],
+            None,
+        );
+        let out = run(&s, &ws, std::slice::from_ref(&config));
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(out.restored.is_empty(), "{out:?}");
+        assert_eq!(out.restore_failed, [config]);
+        assert_eq!(out.exit_code, 1);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("could NOT be restored"), "{stderr}");
+        assert!(!stderr.contains("were restored"), "{stderr}");
     }
 
     /// Runs `script` as an action in a fresh workspace with a protected
