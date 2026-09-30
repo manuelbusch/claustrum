@@ -55,7 +55,6 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(200);
 pub struct ActionProxy;
 
 /// A running proxy; stops when dropped.
-#[derive(Debug)]
 pub struct ProxyHandle {
     addr: SocketAddr,
     secret: String,
@@ -77,6 +76,17 @@ impl ProxyHandle {
     /// Proxy URL for one action; its name becomes the log source.
     pub fn url_for(&self, action: &str) -> String {
         format!("http://{action}:{}@{}", self.secret, self.addr)
+    }
+}
+
+/// Without the secret: whoever holds it can use the proxy, and handles are
+/// reachable from types that end up in debug logs.
+impl std::fmt::Debug for ProxyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyHandle")
+            .field("addr", &self.addr)
+            .field("unix_socket", &self.unix_socket())
+            .finish_non_exhaustive()
     }
 }
 
@@ -569,6 +579,19 @@ mod tests {
             name,
             value: value.as_bytes(),
         }
+    }
+
+    #[tokio::test]
+    async fn debug_output_leaves_out_the_secret() {
+        let handle = ProxyHandle {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            secret: random_secret().unwrap(),
+            task: tokio::spawn(async {}),
+            unix: None,
+        };
+        let text = format!("{handle:?}");
+        assert!(text.contains("127.0.0.1:1"), "{text}");
+        assert!(!text.contains(&handle.secret), "{text}");
     }
 
     #[test]
