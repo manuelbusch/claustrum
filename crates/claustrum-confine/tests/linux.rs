@@ -383,6 +383,38 @@ PY"#;
     }
 }
 
+/// Without bubblewrap, only Landlock's TCP rules (ABI 4) keep a loopback
+/// profile on its port; an older kernel must refuse it, not run it with
+/// TCP open to everywhere.
+#[test]
+fn loopback_without_bubblewrap_needs_tcp_rules() {
+    setup();
+    if backend().unwrap() != Backend::Landlock {
+        eprintln!("skipped: bubblewrap provides a network namespace");
+        return;
+    }
+    // SAFETY: with a null attribute and the VERSION flag the call only
+    // returns the ABI version.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            1u32,
+        )
+    };
+    let (_d, ws) = workspace();
+    let mut p = profile(&ws);
+    p.network = Network::Loopback(1);
+    let result = command(&p, Path::new("/bin/sh"));
+    if abi < 4 {
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Landlock ABI"), "{err}");
+    } else {
+        result.unwrap();
+    }
+}
+
 #[test]
 fn name_service_lookups_work_without_unix_sockets() {
     // glibc's NSS modules for systemd (nss-resolve, nss-systemd) talk over

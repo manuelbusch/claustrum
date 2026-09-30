@@ -33,8 +33,8 @@ stage (`claustrum __confine-exec`) then applies Landlock (file access, TCP ports
 sockets, signals) and a seccomp filter that refuses new namespaces, `ptrace` and
 `process_vm_*`, `mount` and the new mount API, `bpf`, `io_uring`, `perf_event_open`,
 `userfaultfd`, kernel modules and keyrings, the x32 system call ABI, and every socket family
-but IP (Unix, netlink, packet, vsock, ...). Actions may only open TCP sockets. Confined actions reach the proxy through a relay inside
-their network namespace. Without a kernel that supports Landlock there is no Linux backend;
+but IP (Unix, netlink, packet, vsock, ...). Actions may only open TCP sockets. Confined
+actions reach the proxy through a relay inside their network namespace. Without a kernel that supports Landlock there is no Linux backend;
 Claustrum then refuses to start, and `best-effort` runs unconfined with a warning.
 
 ### Linux without user namespaces
@@ -44,7 +44,9 @@ AppArmor), Claustrum falls back to Landlock and seccomp and logs a warning on st
 seccomp then also refuses IP sockets to processes without network. Landlock can
 only grant, not deny, so two guarantees get weaker there: a file inside a writable tree cannot
 be made read-only (the configuration is then protected by the WASIX layer and restored after
-each action only), and the proxy port is reachable on every address, not only on `localhost`.
+each action only), and the proxy port is reachable on every address, not only on `localhost`. Keeping actions on
+the proxy port then rests on Landlock's TCP rules, which need Linux 6.7; on older kernels
+such actions are refused.
 A process that escapes the WASIX layer could then also create `.claude/settings.json` or
 `settings.local.json` in the workspace and so plant Claude Code hooks, which run on the host.
 Enable unprivileged user namespaces where you can, so that bubblewrap is used.

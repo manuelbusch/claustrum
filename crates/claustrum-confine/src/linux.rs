@@ -51,6 +51,9 @@ struct Spec {
     bwrap: bool,
 }
 
+/// First Landlock ABI with TCP port rules (Linux 6.7).
+const LANDLOCK_ABI_TCP: i64 = 4;
+
 fn landlock_abi() -> i64 {
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
     // SAFETY: with a null attribute pointer and the VERSION flag the call
@@ -83,7 +86,13 @@ pub(crate) fn backend() -> Result<Backend, Unavailable> {
                     landlock_abi = abi,
                     "bubblewrap is missing or cannot create namespaces: confining with Landlock \
                      only (no read-only protection inside writable directories, no private \
-                     network namespace)"
+                     network namespace{})",
+                    if abi < LANDLOCK_ABI_TCP {
+                        "; this kernel cannot restrict TCP either, so host actions that \
+                         must use the proxy are refused"
+                    } else {
+                        ""
+                    }
                 );
                 Ok(Backend::Landlock)
             }
@@ -157,6 +166,18 @@ pub(crate) fn command(
     let helper = helper_binary()?;
     let profile = resolved(profile);
     let bwrap = backend == Backend::Bubblewrap;
+    // Without bubblewrap's network namespace, only Landlock's TCP rules keep
+    // a loopback profile on the proxy port; seccomp lets TCP through.
+    if !bwrap && matches!(profile.network, Network::Loopback(_)) {
+        let abi = landlock_abi();
+        if abi < LANDLOCK_ABI_TCP {
+            return Err(Unavailable(format!(
+                "{}: without bubblewrap, keeping TCP on the proxy port needs Landlock ABI \
+                 {LANDLOCK_ABI_TCP} (Linux 6.7), and this kernel has ABI {abi}",
+                profile.name
+            )));
+        }
+    }
     let json = serde_json::to_string(&Spec {
         profile: profile.clone(),
         bwrap,
@@ -515,9 +536,21 @@ fn apply_landlock(spec: &Spec) -> Result<(), String> {
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| e.to_string())?;
     if !handle_net.is_empty() {
+        // Best effort would silently drop TCP rules on kernels without them
+        // (the status then only says "partially enforced", as it does for
+        // any newer feature). Without bubblewrap they are all that keeps a
+        // loopback profile on the proxy port, so there they are required;
+        // `command` refuses such a profile before it gets here.
+        let net_required = !spec.bwrap && matches!(p.network, Network::Loopback(_));
         ruleset = ruleset
+            .set_compatibility(if net_required {
+                CompatLevel::HardRequirement
+            } else {
+                CompatLevel::BestEffort
+            })
             .handle_access(handle_net)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("cannot restrict TCP: {e}"))?
+            .set_compatibility(CompatLevel::BestEffort);
     }
     ruleset = ruleset
         .scope(Scope::AbstractUnixSocket | Scope::Signal)
