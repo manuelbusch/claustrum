@@ -158,7 +158,8 @@ It writes its arguments to `/.claustrum/cmd/<name>` and reads the result back; t
 the command while serving that read, so pipes and redirections in bash behave as usual.
 
 Environment switches for testing: `CLAUSTRUM_NO_BWRAP=1` forces the Landlock-only backend on
-Linux, `CLAUSTRUM_CONFINE_HELPER` points to another confinement helper binary.
+Linux, `CLAUSTRUM_CONFINE_HELPER` points to another confinement helper binary (an absolute
+path; its use is announced on stderr).
 
 ## Roadmap
 

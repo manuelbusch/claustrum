@@ -204,10 +204,31 @@ pub fn helper_main() -> ! {
 
 /// The binary that acts as the helper: `CLAUSTRUM_CONFINE_HELPER` if set,
 /// otherwise the running executable.
+///
+/// The helper is what applies Landlock and seccomp, so the override (meant
+/// for tests, whose executable is not a Claustrum binary) takes only an
+/// absolute path and is announced on stderr: a replaced helper would run
+/// every confined process with bubblewrap's namespaces alone, or with
+/// nothing on the Landlock-only backend. It is not a boundary against the
+/// guest, which cannot set the host's environment.
 #[cfg(target_os = "linux")]
 fn helper_binary() -> Result<PathBuf, Unavailable> {
     if let Some(p) = std::env::var_os("CLAUSTRUM_CONFINE_HELPER") {
-        return Ok(PathBuf::from(p));
+        let p = PathBuf::from(p);
+        if !p.is_absolute() {
+            return Err(Unavailable(format!(
+                "CLAUSTRUM_CONFINE_HELPER must be an absolute path, not {}",
+                p.display()
+            )));
+        }
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| {
+            eprintln!(
+                "claustrum: CLAUSTRUM_CONFINE_HELPER is set; {} applies the confinement",
+                p.display()
+            );
+        });
+        return Ok(p);
     }
     std::env::current_exe()
         .and_then(|p| p.canonicalize())
