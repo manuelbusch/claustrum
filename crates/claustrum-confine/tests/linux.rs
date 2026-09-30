@@ -319,6 +319,34 @@ PY"#;
     }
 }
 
+/// x32 system calls (`nr | 0x40000000` with the x86_64 audit arch) match
+/// no seccompiler rule; they must not get around the filter.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn x32_system_calls_are_refused() {
+    let (_d, ws) = workspace();
+    let p = profile(&ws);
+    // socket(AF_UNIX) and unshare(CLONE_NEWUSER), both refused natively,
+    // through the x32 numbers (41 and 272 with the x32 bit).
+    let script = r#"python3 - <<'PY'
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+for name, nr, args in (("socket", 41, (1, 1, 0)), ("unshare", 272, (0x10000000,))):
+    r = libc.syscall(0x40000000 | nr, *args)
+    print(name, 0 if r >= 0 else ctypes.get_errno())
+PY"#;
+    let (ok, out) = run(&p, script);
+    assert!(ok, "{out}");
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let errno: i32 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|e| e.parse().ok())
+            .unwrap_or(-1);
+        assert_eq!(errno, libc::ENOSYS, "{line}\n{out}");
+    }
+}
+
 #[test]
 fn name_service_lookups_work_without_unix_sockets() {
     // glibc's NSS modules for systemd (nss-resolve, nss-systemd) talk over

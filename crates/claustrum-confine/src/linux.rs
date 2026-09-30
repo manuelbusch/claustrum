@@ -687,9 +687,46 @@ fn apply_seccomp(spec: &Spec) -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error().to_string());
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        seccompiler::apply_filter(&x32_filter()).map_err(|e| e.to_string())?;
+    }
     seccompiler::apply_filter(&deny).map_err(|e| e.to_string())?;
     seccompiler::apply_filter(&clone3).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Refuses the x32 ABI. On kernels built with `CONFIG_X86_X32_ABI` its
+/// system calls report `AUDIT_ARCH_X86_64`, so they pass the architecture
+/// check every seccompiler filter starts with, and carry
+/// `__X32_SYSCALL_BIT` in their number, so they match none of its rules
+/// (keyed by exact number) and would get the default action, Allow: every
+/// rule above could be sidestepped. seccompiler cannot match a range of
+/// numbers, hence this hand-written filter; stacked filters all apply, the
+/// strictest result wins. Other architectures (i386, `int 0x80`) are
+/// already killed by the architecture check.
+#[cfg(target_arch = "x86_64")]
+fn x32_filter() -> seccompiler::BpfProgram {
+    use seccompiler::sock_filter;
+    const LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    const JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
+    const RET_K: u16 = 0x06; // BPF_RET | BPF_K
+    const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    let op = |code, k, jt, jf| sock_filter { code, jt, jf, k };
+    vec![
+        // seccomp_data.arch
+        op(LD_W_ABS, 4, 0, 0),
+        op(JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        op(RET_K, libc::SECCOMP_RET_KILL_PROCESS, 0, 0),
+        // seccomp_data.nr
+        op(LD_W_ABS, 0, 0, 0),
+        op(JGE_K, X32_SYSCALL_BIT, 0, 1),
+        // What a kernel without x32 answers.
+        op(RET_K, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32, 0, 0),
+        op(RET_K, libc::SECCOMP_RET_ALLOW, 0, 0),
+    ]
 }
 
 /// No IP sockets at all: no network, and no private namespace that would
@@ -701,6 +738,20 @@ fn p_no_ip(spec: &Spec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_filter_is_well_formed() {
+        let f = x32_filter();
+        assert_eq!(f.len(), 7);
+        // Both jumps land inside the program.
+        for (i, ins) in f.iter().enumerate() {
+            if ins.code & 0x07 == 0x05 {
+                assert!(i + 1 + (ins.jt.max(ins.jf) as usize) < f.len(), "{i}");
+            }
+        }
+        assert_eq!(f[5].k, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
+    }
 
     #[test]
     fn carve_grants_siblings_of_denied_paths() {
