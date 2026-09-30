@@ -785,7 +785,7 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
         let s = spec(&ws, &["/bin/sh", "-c", "chmod 666 claustrum.toml"], None);
         let out = run(&s, &ws, std::slice::from_ref(&config));
-        assert_eq!(out.restored, [config.clone()]);
+        assert_eq!(out.restored, std::slice::from_ref(&config));
         assert!(out.restore_failed.is_empty());
         let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640);
