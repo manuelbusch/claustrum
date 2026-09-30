@@ -144,15 +144,18 @@ pub(crate) fn write_shim_package(
          [[module]]\nname = \"hostcmd\"\nsource = \"./hostcmd.wasm\"\nabi = \"wasi\"\n",
     );
     for c in commands {
-        // Interpolated into TOML; host command names are validated where
-        // they are declared (`action::is_action_name`).
-        debug_assert!(
-            c.name()
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || "-_".contains(ch)),
-            "host command name {:?}",
-            c.name()
-        );
+        // Interpolated into TOML and used as a file name. Actions are
+        // validated where they are declared, but `SandboxBuilder` takes any
+        // `HostCommand`.
+        if !is_command_name(c.name()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "host command name {:?}: use letters, digits, `-` and `_` (at most 64)",
+                    c.name()
+                ),
+            ));
+        }
         write!(
             manifest,
             "\n[[command]]\nname = \"{0}\"\nmodule = \"hostcmd\"\nrunner = \"https://webc.org/runner/wasi\"\n\n\
@@ -177,6 +180,14 @@ pub(crate) fn write_shim_package(
     }
     std::fs::write(dir.join("wasmer.toml"), manifest)?;
     Ok(dir)
+}
+
+fn is_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// File system mounted at [`MOUNT`]: `/cmd/<name>` are the request channels.
@@ -528,5 +539,38 @@ impl VirtualFile for ChannelFile {
 
     fn poll_write_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         Poll::Ready(Ok(8192))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Named(String);
+
+    impl HostCommand for Named {
+        fn name(&self) -> &str {
+            &self.0
+        }
+
+        fn run(&self, _args: &[String], _invocation: &Invocation) -> HostOutput {
+            HostOutput::default()
+        }
+    }
+
+    #[test]
+    fn command_names_are_checked_in_every_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = |name: &str| {
+            let command: Arc<dyn HostCommand> = Arc::new(Named(name.to_owned()));
+            write_shim_package(dir.path(), &[command])
+        };
+        for bad in ["", "a\"\n[x]", "../x", "a b", &"x".repeat(65)] {
+            assert!(shim(bad).is_err(), "{bad:?}");
+        }
+        let package = shim("test-crate_2").unwrap();
+        let manifest = std::fs::read_to_string(package.join("wasmer.toml")).unwrap();
+        assert!(manifest.contains("name = \"test-crate_2\""), "{manifest}");
     }
 }
