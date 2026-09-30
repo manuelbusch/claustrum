@@ -6,11 +6,14 @@
 //! connection the policy did not see.
 //!
 //! Only name resolution and outgoing TCP connections are checked per
-//! destination. A TCP socket bound before connecting, a UDP socket, a
-//! listener or a raw/ICMP socket can later talk to any address without
-//! passing through this type again, so those are refused unless the mode is
-//! `host` (or recorded as audit findings in `audit` mode). Methods not
-//! overridden here keep the trait's default, which reports `Unsupported`.
+//! destination. A UDP socket, a listener or a raw/ICMP socket can later talk
+//! to any address without passing through this type again, so those are
+//! refused unless the mode is `host` (or recorded as audit findings in
+//! `audit` mode). Binding a TCP socket before connecting is refused the same
+//! way; where it is allowed, the bound socket is wrapped so that its
+//! `connect` and `listen` pass the gate like `connect_tcp` and `listen_tcp`.
+//! Methods not overridden here keep the trait's default, which reports
+//! `Unsupported`.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -48,12 +51,7 @@ impl FilteredNetworking {
     }
 
     fn gate(&self, event: Event<'_>, verdict: Verdict) -> Result<()> {
-        self.log.record(event, &verdict);
-        if verdict.allowed() {
-            Ok(())
-        } else {
-            Err(NetworkError::PermissionDenied)
-        }
+        gate(&self.log, event, verdict)
     }
 
     fn socket_gate(&self, kind: &str, what: &str, addr: Option<SocketAddr>) -> Result<()> {
@@ -68,6 +66,78 @@ impl FilteredNetworking {
             },
             verdict,
         )
+    }
+}
+
+/// Record the decision; fail unless it allows the operation.
+fn gate(log: &ConnectionLog, event: Event<'_>, verdict: Verdict) -> Result<()> {
+    log.record(event, &verdict);
+    if verdict.allowed() {
+        Ok(())
+    } else {
+        Err(NetworkError::PermissionDenied)
+    }
+}
+
+/// Check and record an outgoing TCP connection to `peer`.
+fn gate_connect(policy: &NetPolicy, log: &ConnectionLog, peer: SocketAddr) -> Result<()> {
+    let verdict = policy.check_connect(peer.ip(), peer.port());
+    let host = policy.name_of(peer.ip());
+    gate(
+        log,
+        Event {
+            source: GUEST,
+            kind: "tcp",
+            host: host.as_deref(),
+            addr: Some(peer.ip()),
+            port: Some(peer.port()),
+        },
+        verdict,
+    )
+}
+
+/// A bound TCP socket: WASIX connects or listens on it directly, without
+/// another call to [`FilteredNetworking`], so both are gated here.
+#[derive(Debug)]
+struct FilteredBoundSocket {
+    inner: Box<dyn VirtualTcpBoundSocket + Sync>,
+    policy: Arc<NetPolicy>,
+    log: Arc<ConnectionLog>,
+}
+
+impl VirtualTcpBoundSocket for FilteredBoundSocket {
+    fn addr_local(&self) -> Result<SocketAddr> {
+        self.inner.addr_local()
+    }
+
+    fn listen(&mut self) -> Result<Box<dyn VirtualTcpListener + Sync>> {
+        let addr = self.inner.addr_local().ok();
+        gate(
+            &self.log,
+            Event {
+                source: GUEST,
+                kind: "listen",
+                host: None,
+                addr: addr.map(|a| a.ip()),
+                port: addr.map(|a| a.port()),
+            },
+            self.policy
+                .check_unchecked_socket("listening for connections"),
+        )?;
+        self.inner.listen()
+    }
+
+    fn connect(&mut self, peer: SocketAddr) -> Result<Box<dyn VirtualTcpSocket + Sync>> {
+        gate_connect(&self.policy, &self.log, peer)?;
+        self.inner.connect(peer)
+    }
+
+    fn set_ttl(&mut self, ttl: u32) -> Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    fn ttl(&self) -> Result<u32> {
+        self.inner.ttl()
     }
 }
 
@@ -118,18 +188,7 @@ impl VirtualNetworking for FilteredNetworking {
         addr: SocketAddr,
         peer: SocketAddr,
     ) -> Result<Box<dyn VirtualTcpSocket + Sync>> {
-        let verdict = self.policy.check_connect(peer.ip(), peer.port());
-        let host = self.policy.name_of(peer.ip());
-        self.gate(
-            Event {
-                source: GUEST,
-                kind: "tcp",
-                host: host.as_deref(),
-                addr: Some(peer.ip()),
-                port: Some(peer.port()),
-            },
-            verdict,
-        )?;
+        gate_connect(&self.policy, &self.log, peer)?;
         self.inner.connect_tcp(addr, peer).await
     }
 
@@ -140,8 +199,10 @@ impl VirtualNetworking for FilteredNetworking {
         reuse_port: bool,
         reuse_addr: bool,
     ) -> Result<Box<dyn VirtualTcpBoundSocket + Sync>> {
-        // A bound socket connects without passing through `connect_tcp`, so
-        // binding is refused outside host mode. The WASIX build of CPython
+        // Binding says nothing about the destination, so it is refused
+        // outside host mode like the other sockets that are not checked
+        // per destination (the bound socket's connect is gated nonetheless,
+        // see `FilteredBoundSocket`). The WASIX build of CPython
         // binds every new TCP socket to 0.0.0.0:10275 and ignores the
         // failure; refusing that silently keeps its connects on the checked
         // path without a misleading note in every result. Audit mode refuses
@@ -151,9 +212,15 @@ impl VirtualNetworking for FilteredNetworking {
             return Err(NetworkError::PermissionDenied);
         }
         self.socket_gate("bind", "binding a TCP socket before connecting", Some(addr))?;
-        self.inner
+        let inner = self
+            .inner
             .bind_tcp(addr, only_v6, reuse_port, reuse_addr)
-            .await
+            .await?;
+        Ok(Box::new(FilteredBoundSocket {
+            inner,
+            policy: Arc::clone(&self.policy),
+            log: Arc::clone(&self.log),
+        }))
     }
 
     async fn listen_tcp(
@@ -200,6 +267,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct Fake {
         calls: Mutex<Vec<String>>,
+        bound_calls: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -234,6 +302,51 @@ mod tests {
         ) -> Result<Box<dyn VirtualUdpSocket + Sync>> {
             self.calls.lock().unwrap().push(format!("udp {addr}"));
             Err(NetworkError::Unsupported)
+        }
+
+        async fn bind_tcp(
+            &self,
+            addr: SocketAddr,
+            _only_v6: bool,
+            _reuse_port: bool,
+            _reuse_addr: bool,
+        ) -> Result<Box<dyn VirtualTcpBoundSocket + Sync>> {
+            self.calls.lock().unwrap().push(format!("bind {addr}"));
+            Ok(Box::new(FakeBound {
+                addr,
+                calls: Arc::clone(&self.bound_calls),
+            }))
+        }
+    }
+
+    /// Records what reaches a bound socket.
+    #[derive(Debug)]
+    struct FakeBound {
+        addr: SocketAddr,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl VirtualTcpBoundSocket for FakeBound {
+        fn addr_local(&self) -> Result<SocketAddr> {
+            Ok(self.addr)
+        }
+
+        fn listen(&mut self) -> Result<Box<dyn VirtualTcpListener + Sync>> {
+            self.calls.lock().unwrap().push("listen".into());
+            Err(NetworkError::Unsupported)
+        }
+
+        fn connect(&mut self, peer: SocketAddr) -> Result<Box<dyn VirtualTcpSocket + Sync>> {
+            self.calls.lock().unwrap().push(format!("connect {peer}"));
+            Err(NetworkError::ConnectionRefused)
+        }
+
+        fn set_ttl(&mut self, _ttl: u32) -> Result<()> {
+            Ok(())
+        }
+
+        fn ttl(&self) -> Result<u32> {
+            Ok(64)
         }
     }
 
@@ -346,6 +459,38 @@ mod tests {
             .unwrap();
         net.resolve("93.184.216.34", None, None).await.unwrap();
         assert_eq!(fake.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bound_sockets_connect_and_listen_through_the_gate() {
+        let (fake, net, log) = setup(NetMode::Audit, &["example.com"]);
+        net.resolve("example.com", Some(443), None).await.unwrap();
+        let mut bound = net
+            .bind_tcp(sa("127.0.0.1:5000"), false, false, false)
+            .await
+            .unwrap();
+        let _ = bound.connect(sa("93.184.216.34:443"));
+        let _ = bound.connect(sa("10.0.0.5:5432"));
+        let _ = bound.listen();
+        assert_eq!(
+            *fake.bound_calls.lock().unwrap(),
+            [
+                "connect 93.184.216.34:443",
+                "connect 10.0.0.5:5432",
+                "listen"
+            ]
+        );
+        let notes = log.notes_since(0);
+        assert!(notes.iter().any(|n| n.contains("bind")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("tcp 10.0.0.5:5432")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("example.com:443")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.contains("listen")), "{notes:?}");
     }
 
     #[tokio::test]
