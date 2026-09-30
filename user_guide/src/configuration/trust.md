@@ -18,6 +18,10 @@ accepted its exact content, as `direnv allow` does:
 The check applies to every `claustrum` command started in a directory with an untrusted
 `claustrum.toml`, not only to `run`.
 
+`[sandbox] workspace` is always flagged with `!`: it replaces the project directory at
+`/workspace` with another host directory, read/write, so `workspace = "~"` alone hands the
+guest your whole home directory.
+
 ## Setups without a terminal
 
 When `claustrum serve` is started by another MCP client or in CI, there is nobody to ask.

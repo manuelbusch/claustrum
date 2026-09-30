@@ -87,9 +87,10 @@ mod broker {
         let specs = config.validate_actions(workspace)?;
         // So that the missing Claude Code settings have a directory that
         // bubblewrap can bind read-only (see `claustrum_confine::linux`).
-        let claude_dir = workspace.join(".claude");
-        std::fs::create_dir_all(&claude_dir)
-            .with_context(|| format!("cannot create {}", claude_dir.display()))?;
+        for claude_dir in config.claude_settings_dirs(workspace) {
+            std::fs::create_dir_all(&claude_dir)
+                .with_context(|| format!("cannot create {}", claude_dir.display()))?;
+        }
         let protected = resolve_all(&config.protected_paths(workspace));
         let log_path = policy
             .network

@@ -420,17 +420,38 @@ impl Config {
     ///
     /// The Claude Code settings in the workspace are protected for the same
     /// reason: Claude Code runs on the host, outside the sandbox, and executes
-    /// the hooks, status line and helper commands configured there.
+    /// the hooks, status line and helper commands configured there. Those
+    /// next to the loaded file are protected as well: with `[sandbox]
+    /// workspace` pointing elsewhere (e.g. `~`), the project directory the
+    /// file comes from may still lie inside the mounted tree.
     pub fn protected_paths(&self, workspace: &Path) -> Vec<PathBuf> {
         let mut paths = vec![workspace.join("claustrum.toml")];
-        paths.extend(
-            CLAUDE_SETTINGS
-                .iter()
-                .map(|f| workspace.join(".claude").join(f)),
-        );
+        for dir in self.claude_settings_dirs(workspace) {
+            paths.extend(CLAUDE_SETTINGS.iter().map(|f| dir.join(f)));
+        }
         paths.extend(default_config_paths());
         paths.extend(self.path.clone());
         paths
+    }
+
+    /// The `.claude` directories whose settings are protected: the
+    /// workspace's and, if it lies inside the workspace, the one next to the
+    /// loaded configuration file (the project directory when `[sandbox]
+    /// workspace` points to a directory above it).
+    pub fn claude_settings_dirs(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![workspace.join(".claude")];
+        let project = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(claustrum_confine::resolve);
+        if let Some(dir) = project
+            && dir != workspace
+            && dir.starts_with(workspace)
+        {
+            dirs.push(dir.join(".claude"));
+        }
+        dirs
     }
 
     /// Guest command name for the actions.
@@ -991,6 +1012,24 @@ writable = true
         let paths = config("").protected_paths(ws);
         assert!(paths.contains(&ws.join(".claude/settings.json")));
         assert!(paths.contains(&ws.join(".claude/settings.local.json")));
+
+        // The project the file comes from, when the workspace lies above it.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = claustrum_confine::resolve(tmp.path());
+        let proj = home.join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mut cfg = config("[sandbox]\nworkspace = \"~\"\n");
+        cfg.path = Some(proj.join("claustrum.toml"));
+        let paths = cfg.protected_paths(&home);
+        for f in CLAUDE_SETTINGS {
+            assert!(paths.contains(&proj.join(".claude").join(f)), "{paths:?}");
+            assert!(paths.contains(&home.join(".claude").join(f)), "{paths:?}");
+        }
+        assert!(paths.contains(&proj.join("claustrum.toml")));
+
+        // A configuration outside the workspace adds nothing.
+        let dirs = cfg.claude_settings_dirs(&proj.join("sub"));
+        assert_eq!(dirs, [proj.join("sub/.claude")]);
     }
 
     #[test]

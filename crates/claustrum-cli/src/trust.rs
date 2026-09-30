@@ -138,6 +138,15 @@ pub fn describe(path: &Path, file: &FileConfig, changed: bool) -> String {
         lines.push(format!("  {} {text}", if risky { "!" } else { "-" }));
     };
     let s = &file.sandbox;
+    if let Some(dir) = &s.workspace {
+        item(
+            true,
+            format!(
+                "workspace: {} mounted read/write at /workspace instead of the project directory",
+                dir.display()
+            ),
+        );
+    }
     match s.confinement.as_deref() {
         Some("off") => item(true, "OS confinement: off (single sandbox layer)".into()),
         Some(m) => item(false, format!("OS confinement: {m}")),
@@ -309,6 +318,7 @@ mod tests {
             r#"
 [sandbox]
 confinement = "off"
+workspace = "~"
 [network]
 mode = "host"
 [[mounts]]
@@ -327,6 +337,7 @@ tools = ["Bash"]
         .unwrap();
         let text = describe(Path::new("/p/claustrum.toml"), &file, false);
         for expected in [
+            "! workspace: ~ mounted read/write at /workspace",
             "! OS confinement: off",
             "! network: host",
             "! mount ~ -> /home (read/write)",
@@ -342,5 +353,15 @@ tools = ["Bash"]
             false,
         );
         assert!(text.contains("nothing beyond the defaults"), "{text}");
+    }
+
+    /// A different workspace is the whole home directory read/write, even
+    /// when nothing else is set.
+    #[test]
+    fn description_flags_a_foreign_workspace() {
+        let file: FileConfig = toml::from_str("[sandbox]\nworkspace = \"~\"\n").unwrap();
+        let text = describe(Path::new("/p/claustrum.toml"), &file, false);
+        assert!(text.contains("! workspace: ~"), "{text}");
+        assert!(!text.contains("nothing beyond the defaults"), "{text}");
     }
 }
