@@ -33,6 +33,7 @@ explicitly with `--config` / `CLAUSTRUM_CONFIG`, which counts as your own choice
 Independently of trust, `[claude] args` may not contain flags that would override what
 `claustrum run` sets up (`--tools`, `--allowedTools`, `--mcp-config`, `--strict-mcp-config`,
 `--disallowedTools`, `--permission-mode`, `--dangerously-skip-permissions`, `--settings`,
-`--setting-sources`, `--add-dir`, `--plugin-dir`, `--system-prompt`, ..., also in their
+`--setting-sources`, `--add-dir`, `--plugin-dir`, `--system-prompt`,
+`--append-system-prompt` (use `[claude] system_prompt`), `--permission-prompt-tool`, ..., also in their
 kebab-case and `--flag=value` forms), in any configuration file. Use
 [`[claude] tools`](reference.md#claude) for built-in tools and the command line for the rest.

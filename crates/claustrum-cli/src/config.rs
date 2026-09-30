@@ -237,6 +237,12 @@ const FORBIDDEN_CLAUDE_ARGS: &[&str] = &[
     "--plugin-url",
     "--system-prompt",
     "--system-prompt-file",
+    // `claustrum run` passes its own sandbox description with this flag; a
+    // second one would replace it.
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    // Would hand permission prompts to a tool of the file's choosing.
+    "--permission-prompt-tool",
 ];
 
 fn check_claude_args(args: &[String]) -> Result<()> {
@@ -1003,6 +1009,9 @@ writable = true
             "--settings",
             "--mcp-config",
             "--allowedTools",
+            "--append-system-prompt",
+            "--append-system-prompt-file=x.md",
+            "--permission-prompt-tool=mcp__x__y",
         ] {
             let err = check_claude_args(&[bad.to_owned()]).unwrap_err();
             assert!(err.to_string().contains("not allowed"), "{bad}: {err}");
