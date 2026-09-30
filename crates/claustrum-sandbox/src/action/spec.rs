@@ -422,6 +422,13 @@ impl ActionDef {
             Some(0) => None,
             Some(secs) => Some(Duration::from_secs(secs)),
         };
+        let max_output_bytes = self.max_output_bytes.unwrap_or(ctx.max_output_bytes);
+        if max_output_bytes > crate::policy::MAX_OUTPUT_BYTES {
+            return Err(err(format!(
+                "`max_output_bytes` must be at most {}",
+                crate::policy::MAX_OUTPUT_BYTES
+            )));
+        }
         let mut spec = ActionSpec {
             name: name.clone(),
             description: self.description.clone(),
@@ -431,7 +438,7 @@ impl ActionDef {
             env,
             env_passthrough: self.env_passthrough.clone(),
             timeout,
-            max_output_bytes: self.max_output_bytes.unwrap_or(ctx.max_output_bytes),
+            max_output_bytes,
             inputs,
             confine: self.confine,
             writable: self
@@ -1048,6 +1055,13 @@ mod tests {
                     ..def("x", &["/bin/echo"])
                 },
                 "environment variable name",
+            ),
+            (
+                ActionDef {
+                    max_output_bytes: Some(usize::MAX),
+                    ..def("x", &["/bin/echo"])
+                },
+                "at most",
             ),
         ];
         for (d, expected) in cases {

@@ -44,6 +44,10 @@ use crate::{
 const MAX_REQUEST: u64 = 1024 * 1024;
 /// Longest response line the worker accepts (outputs are base64 encoded).
 const MAX_RESPONSE: u64 = 256 * 1024 * 1024;
+
+// Two output streams at the largest limit, base64-encoded, fit.
+const _: () =
+    assert!(2 * crate::policy::MAX_OUTPUT_BYTES as u64 * 4 / 3 + 1024 * 1024 < MAX_RESPONSE);
 /// How often a waiting worker checks its cancel flag.
 const POLL: Duration = Duration::from_millis(50);
 /// How long the worker waits for the broker's answer after it forwarded a

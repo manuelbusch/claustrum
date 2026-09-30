@@ -759,13 +759,25 @@ impl Config {
             policy.default_timeout = (secs > 0).then(|| Duration::from_secs(secs));
         }
         if let Some(bytes) = s.max_output_bytes {
+            if bytes > claustrum_sandbox::MAX_OUTPUT_BYTES {
+                anyhow::bail!(
+                    "[sandbox] max_output_bytes must be at most {}",
+                    claustrum_sandbox::MAX_OUTPUT_BYTES
+                );
+            }
             policy.max_output_bytes = bytes;
         }
         if let Some(threads) = s.max_threads {
             policy.max_threads = Some(threads);
         }
         if let Some(mb) = s.max_memory_mb {
-            policy.max_memory_bytes = (mb > 0).then(|| mb * 1024 * 1024);
+            policy.max_memory_bytes = match mb {
+                0 => None,
+                mb => Some(
+                    mb.checked_mul(1024 * 1024)
+                        .context("[sandbox] max_memory_mb is too large")?,
+                ),
+            };
         }
         policy.confinement = self.confinement()?;
         Ok(policy)
@@ -1091,6 +1103,24 @@ writable = true
             .network_log_path(&ws)
             .unwrap_err();
         assert!(err.to_string().contains("protected file"), "{err}");
+    }
+
+    #[test]
+    fn resource_limits_are_bounded() {
+        let ws = Path::new("/tmp/ws");
+        let err = config("[sandbox]\nmax_output_bytes = 999999999999\n")
+            .policy(ws)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most"), "{err}");
+        let err = config("[sandbox]\nmax_memory_mb = 9223372036854775807\n")
+            .policy(ws)
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let p = config("[sandbox]\nmax_memory_mb = 0\nmax_output_bytes = 4096\n")
+            .policy(ws)
+            .unwrap();
+        assert_eq!(p.max_memory_bytes, None);
+        assert_eq!(p.max_output_bytes, 4096);
     }
 
     #[test]

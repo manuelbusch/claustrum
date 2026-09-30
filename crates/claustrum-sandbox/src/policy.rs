@@ -107,6 +107,11 @@ impl Confinement {
     }
 }
 
+/// Largest [`Policy::max_output_bytes`] (and per-action limit) accepted:
+/// the output of an action crosses the broker socket base64-encoded in one
+/// message, both streams together, which must stay below its size limit.
+pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Default for [`Policy::max_memory_bytes`]: 1 GiB per guest process.
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 

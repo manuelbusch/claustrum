@@ -97,6 +97,7 @@ mod broker {
             .log
             .clone()
             .context("the network log path is not set")?;
+        claustrum_sandbox::net::rotate_full_log(&log_path);
 
         let plans: Option<Arc<dyn PlanStore>> = config
             .host_plans(workspace)?

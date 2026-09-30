@@ -26,7 +26,7 @@ pub use action::{ActionDef, ActionSpec};
 pub use error::{Error, Result};
 pub use hostcmd::{Cancel, HostCommand, HostOutput, Invocation};
 pub use packages::{Downloaded, PackageSet, download};
-pub use policy::{Confinement, ConfinementMode, NetworkPolicy, Policy};
+pub use policy::{Confinement, ConfinementMode, MAX_OUTPUT_BYTES, NetworkPolicy, Policy};
 pub use process::{ExecOptions, ExecOutput, ExitReason};
 pub use runtime::{BundledPackage, RuntimeConfig};
 pub use sandbox::{Sandbox, SandboxBuilder};
