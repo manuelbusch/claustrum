@@ -1,4 +1,6 @@
-# Claustrum
+<p align="center">
+  <img src="docs/assets/claustrum-logo.svg" alt="Claustrum" width="440">
+</p>
 
 **A sandbox for [Claude Code](https://claude.com/claude-code).** Claustrum runs a POSIX
 environment and a curated set of tools inside [Wasmer](https://wasmer.io/) using

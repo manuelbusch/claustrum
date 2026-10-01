@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 256" role="img" aria-label="Claustrum"><title>Claustrum</title>
+  <path d="M 112.67 210.79 A 98 98 0 1 1 143.33 210.79" fill="none" stroke="#0F3D3E" stroke-width="14" stroke-linecap="butt"/>
+  <path d="M 113.31 189.59 A 77 77 0 1 1 142.69 189.59" fill="none" stroke="#1F8A7E" stroke-width="6" stroke-linecap="butt"/>
+  <path d="M 104 162 Q 128 170 128 196 L 128 236" fill="none" stroke="#F2A93B" stroke-width="5" stroke-linecap="round"/>
+  <rect x="116" y="184" width="24" height="34" rx="7" fill="#FFFFFF" stroke="#0F3D3E" stroke-width="5"/>
+  <line x1="128" y1="190" x2="128" y2="212" stroke="#F2A93B" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="128" cy="242" r="8" fill="#FFFFFF" stroke="#F2A93B" stroke-width="5"/>
+  <line x1="96.6" y1="89.7" x2="122.0" y2="57.5" stroke="#A9D4CD" stroke-width="4" stroke-linecap="round"/>
+  <line x1="95.0" y1="99.1" x2="147.8" y2="78.4" stroke="#A9D4CD" stroke-width="4" stroke-linecap="round"/>
+  <line x1="94.0" y1="113.0" x2="159.6" y2="109.3" stroke="#A9D4CD" stroke-width="4" stroke-linecap="round"/>
+  <line x1="94.8" y1="127.7" x2="154.5" y2="142.0" stroke="#A9D4CD" stroke-width="4" stroke-linecap="round"/>
+  <line x1="96.8" y1="139.3" x2="133.6" y2="167.8" stroke="#A9D4CD" stroke-width="4" stroke-linecap="round"/>
+  <line x1="94.6" y1="102.0" x2="121.2" y2="84.9" stroke="#A9D4CD" stroke-width="3" stroke-linecap="round"/>
+  <line x1="94.1" y1="109.5" x2="133.3" y2="101.7" stroke="#A9D4CD" stroke-width="3" stroke-linecap="round"/>
+  <line x1="94.1" y1="118.8" x2="135.5" y2="122.3" stroke="#A9D4CD" stroke-width="3" stroke-linecap="round"/>
+  <line x1="94.8" y1="127.3" x2="127.1" y2="141.2" stroke="#A9D4CD" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="122.0" cy="57.5" r="9" fill="#1F8A7E"/>
+  <circle cx="147.8" cy="78.4" r="9" fill="#1F8A7E"/>
+  <circle cx="159.6" cy="109.3" r="9" fill="#1F8A7E"/>
+  <circle cx="154.5" cy="142.0" r="9" fill="#1F8A7E"/>
+  <circle cx="133.6" cy="167.8" r="9" fill="#1F8A7E"/>
+  <circle cx="121.2" cy="84.9" r="6" fill="#1F8A7E"/>
+  <circle cx="133.3" cy="101.7" r="6" fill="#1F8A7E"/>
+  <circle cx="135.5" cy="122.3" r="6" fill="#1F8A7E"/>
+  <circle cx="127.1" cy="141.2" r="6" fill="#1F8A7E"/>
+  <path d="M 106 60 Q 66 114 106 168 Q 88 114 106 60 Z" fill="#F2A93B" stroke="#F2A93B" stroke-width="3" stroke-linejoin="round"/>
+  <text x="268" y="160" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="104" font-weight="600" letter-spacing="-2" fill="#0F3D3E">claustrum</text>
+</svg>
