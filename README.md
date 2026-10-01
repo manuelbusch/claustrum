@@ -2,6 +2,11 @@
   <img src="docs/assets/claustrum-logo.svg" alt="Claustrum" width="440">
 </p>
 
+<p align="center">
+  <strong>Give your programming agents the freedom to work while keeping all boundaries firmly under control.</strong><br>
+  More autonomy for the agents, full control for you — all within a sandbox they can’t escape from.
+</p>
+
 **A sandbox for [Claude Code](https://claude.com/claude-code).** Claustrum runs a POSIX
 environment and a curated set of tools inside [Wasmer](https://wasmer.io/) using
 [WASIX](https://wasix.org/) and exposes them to Claude through an
