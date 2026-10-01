@@ -34,7 +34,7 @@ use tokio::{
 
 use super::{
     log::{ConnectionLog, Event},
-    policy::{NetPolicy, Verdict, normalize_name},
+    policy::{NetPolicy, Verdict, is_query_name, normalize_name},
 };
 
 /// Largest request head accepted.
@@ -55,7 +55,6 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(200);
 pub struct ActionProxy;
 
 /// A running proxy; stops when dropped.
-#[derive(Debug)]
 pub struct ProxyHandle {
     addr: SocketAddr,
     secret: String,
@@ -77,6 +76,17 @@ impl ProxyHandle {
     /// Proxy URL for one action; its name becomes the log source.
     pub fn url_for(&self, action: &str) -> String {
         format!("http://{action}:{}@{}", self.secret, self.addr)
+    }
+}
+
+/// Without the secret: whoever holds it can use the proxy, and handles are
+/// reachable from types that end up in debug logs.
+impl std::fmt::Debug for ProxyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyHandle")
+            .field("addr", &self.addr)
+            .field("unix_socket", &self.unix_socket())
+            .finish_non_exhaustive()
     }
 }
 
@@ -405,6 +415,67 @@ async fn open_upstream(
     Err(last_err)
 }
 
+/// Refuse a request whose end is ambiguous: with duplicate, differing
+/// `Content-Length` headers or `Transfer-Encoding` next to them, the proxy
+/// and the server behind it could disagree on where it ends, and the rest
+/// would reach the server as a request of its own (request smuggling).
+fn check_framing(headers: &[httparse::Header<'_>]) -> Result<(), &'static str> {
+    let values = |name: &str| {
+        headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.trim_ascii())
+            .collect::<Vec<_>>()
+    };
+    let lengths = values("content-length");
+    if let Some(first) = lengths.first() {
+        if first.is_empty() || !first.iter().all(u8::is_ascii_digit) {
+            return Err("invalid Content-Length");
+        }
+        if lengths.iter().any(|l| l != first) {
+            return Err("conflicting Content-Length headers");
+        }
+    }
+    let encodings = values("transfer-encoding");
+    if !encodings.is_empty() {
+        if !lengths.is_empty() {
+            return Err("both Transfer-Encoding and Content-Length");
+        }
+        if encodings.len() > 1 || !encodings[0].eq_ignore_ascii_case(b"chunked") {
+            return Err("only Transfer-Encoding: chunked is supported");
+        }
+    }
+    Ok(())
+}
+
+/// The request head sent upstream for a plain HTTP request: origin-form
+/// target, the checked `authority` as `Host` (the client's own `Host` could
+/// name another site on the same server), without hop-by-hop and proxy
+/// headers, and `Connection: close`.
+fn forward_head(
+    method: &str,
+    path: &str,
+    authority: &str,
+    headers: &[httparse::Header<'_>],
+) -> String {
+    let mut out = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    for h in headers {
+        let name = h.name.to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "host" | "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive"
+        ) {
+            continue;
+        }
+        out.push_str(h.name);
+        out.push_str(": ");
+        out.push_str(&String::from_utf8_lossy(h.value));
+        out.push_str("\r\n");
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    out
+}
+
 async fn serve(
     mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
     policy: &NetPolicy,
@@ -431,7 +502,8 @@ async fn serve(
     let source = format!("action:{user}");
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let Some((host, port)) = split_authority(&target, 443) else {
+        let Some((host, port)) = split_authority(&target, 443).filter(|(h, _)| is_query_name(h))
+        else {
             return respond(&mut stream, 400, "Bad Request", "bad CONNECT target\n").await;
         };
         let mut upstream = match open_upstream(policy, log, &source, "connect", &host, port).await {
@@ -470,9 +542,13 @@ async fn serve(
         None => (after_scheme, "/"),
     };
     let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let Some((host, port)) = split_authority(authority, 80) else {
+    let Some((host, port)) = split_authority(authority, 80).filter(|(h, _)| is_query_name(h))
+    else {
         return respond(&mut stream, 400, "Bad Request", "bad request target\n").await;
     };
+    if let Err(why) = check_framing(req.headers) {
+        return respond(&mut stream, 400, "Bad Request", &format!("{why}\n")).await;
+    }
     let mut upstream = match open_upstream(policy, log, &source, "http", &host, port).await {
         Ok(s) => s,
         Err(reason) => {
@@ -485,21 +561,7 @@ async fn serve(
             .await;
         }
     };
-    let mut out = format!("{method} {path} HTTP/1.1\r\n");
-    for h in req.headers.iter() {
-        let name = h.name.to_ascii_lowercase();
-        if matches!(
-            name.as_str(),
-            "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive"
-        ) {
-            continue;
-        }
-        out.push_str(h.name);
-        out.push_str(": ");
-        out.push_str(&String::from_utf8_lossy(h.value));
-        out.push_str("\r\n");
-    }
-    out.push_str("Connection: close\r\n\r\n");
+    let out = forward_head(&method, path, authority, req.headers);
     upstream.write_all(out.as_bytes()).await?;
     if !rest.is_empty() {
         upstream.write_all(&rest).await?;
@@ -511,6 +573,77 @@ async fn serve(
 mod tests {
     use super::*;
     use crate::net::policy::NetMode;
+
+    fn header<'a>(name: &'a str, value: &'a str) -> httparse::Header<'a> {
+        httparse::Header {
+            name,
+            value: value.as_bytes(),
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_output_leaves_out_the_secret() {
+        let handle = ProxyHandle {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            secret: random_secret().unwrap(),
+            task: tokio::spawn(async {}),
+            unix: None,
+        };
+        let text = format!("{handle:?}");
+        assert!(text.contains("127.0.0.1:1"), "{text}");
+        assert!(!text.contains(&handle.secret), "{text}");
+    }
+
+    #[test]
+    fn ambiguous_request_framing_is_refused() {
+        for ok in [
+            &[][..],
+            &[header("Content-Length", "5")],
+            &[
+                header("Content-Length", "5"),
+                header("content-length", " 5"),
+            ],
+            &[header("Transfer-Encoding", "chunked")],
+        ] {
+            assert_eq!(check_framing(ok), Ok(()), "{ok:?}");
+        }
+        for bad in [
+            &[header("Content-Length", "5"), header("Content-Length", "6")][..],
+            &[header("Content-Length", "5, 5")],
+            &[header("Content-Length", "")],
+            &[
+                header("Transfer-Encoding", "chunked"),
+                header("Content-Length", "5"),
+            ],
+            &[header("Transfer-Encoding", "gzip, chunked")],
+            &[
+                header("Transfer-Encoding", "chunked"),
+                header("Transfer-Encoding", "chunked"),
+            ],
+        ] {
+            assert!(check_framing(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn forwarded_requests_name_the_checked_host() {
+        let head = forward_head(
+            "GET",
+            "/x",
+            "allowed.example:8080",
+            &[
+                header("Host", "other.example"),
+                header("Proxy-Authorization", "Basic c2VjcmV0"),
+                header("Connection", "keep-alive"),
+                header("Accept", "*/*"),
+            ],
+        );
+        assert_eq!(
+            head,
+            "GET /x HTTP/1.1\r\nHost: allowed.example:8080\r\nAccept: */*\r\n\
+             Connection: close\r\n\r\n"
+        );
+    }
 
     #[tokio::test]
     async fn relay_copies_both_ways_and_drops_idle_connections() {

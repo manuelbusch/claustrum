@@ -14,6 +14,7 @@ mod command;
 mod host;
 #[cfg(unix)]
 pub mod remote;
+mod reparse;
 mod run;
 mod spec;
 

@@ -80,7 +80,7 @@ pub struct SandboxSection {
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     /// OS sandbox around the Wasmer worker and the host actions (the second
-    /// layer): `"best-effort"` (default), `"required"` or `"off"`.
+    /// layer): `"required"` (default), `"best-effort"` or `"off"`.
     pub confinement: Option<String>,
     /// Host paths confined processes may never read, in addition to the
     /// built-in list of credential stores (`~/.ssh`, `~/.aws`, keychains...).
@@ -237,6 +237,12 @@ const FORBIDDEN_CLAUDE_ARGS: &[&str] = &[
     "--plugin-url",
     "--system-prompt",
     "--system-prompt-file",
+    // `claustrum run` passes its own sandbox description with this flag; a
+    // second one would replace it.
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    // Would hand permission prompts to a tool of the file's choosing.
+    "--permission-prompt-tool",
 ];
 
 fn check_claude_args(args: &[String]) -> Result<()> {
@@ -325,18 +331,26 @@ pub fn default_packages_dir() -> PathBuf {
 }
 
 /// Per-user directory for logs, plans and trust records;
-/// `CLAUSTRUM_STATE_DIR` overrides it.
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CLAUSTRUM_STATE_DIR") {
-        return PathBuf::from(dir);
+/// `CLAUSTRUM_STATE_DIR` overrides it. Without either there is no such
+/// directory, and none is guessed: the current directory is usually the
+/// workspace, where the guest could forge trust records and plan ledgers.
+pub fn state_dir() -> Result<PathBuf> {
+    state_dir_from(std::env::var_os("CLAUSTRUM_STATE_DIR"), project_dirs())
+}
+
+fn state_dir_from(
+    overridden: Option<std::ffi::OsString>,
+    dirs: Option<directories::ProjectDirs>,
+) -> Result<PathBuf> {
+    if let Some(dir) = overridden {
+        return Ok(PathBuf::from(dir));
     }
-    project_dirs()
-        .map(|d| {
-            d.state_dir()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| d.data_dir().to_path_buf())
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
+    dirs.map(|d| {
+        d.state_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| d.data_dir().to_path_buf())
+    })
+    .context("cannot determine the user state directory (is HOME set?); set CLAUSTRUM_STATE_DIR")
 }
 
 /// File name stem that identifies a workspace in the state directory:
@@ -420,17 +434,38 @@ impl Config {
     ///
     /// The Claude Code settings in the workspace are protected for the same
     /// reason: Claude Code runs on the host, outside the sandbox, and executes
-    /// the hooks, status line and helper commands configured there.
+    /// the hooks, status line and helper commands configured there. Those
+    /// next to the loaded file are protected as well: with `[sandbox]
+    /// workspace` pointing elsewhere (e.g. `~`), the project directory the
+    /// file comes from may still lie inside the mounted tree.
     pub fn protected_paths(&self, workspace: &Path) -> Vec<PathBuf> {
         let mut paths = vec![workspace.join("claustrum.toml")];
-        paths.extend(
-            CLAUDE_SETTINGS
-                .iter()
-                .map(|f| workspace.join(".claude").join(f)),
-        );
+        for dir in self.claude_settings_dirs(workspace) {
+            paths.extend(CLAUDE_SETTINGS.iter().map(|f| dir.join(f)));
+        }
         paths.extend(default_config_paths());
         paths.extend(self.path.clone());
         paths
+    }
+
+    /// The `.claude` directories whose settings are protected: the
+    /// workspace's and, if it lies inside the workspace, the one next to the
+    /// loaded configuration file (the project directory when `[sandbox]
+    /// workspace` points to a directory above it).
+    pub fn claude_settings_dirs(&self, workspace: &Path) -> Vec<PathBuf> {
+        let mut dirs = vec![workspace.join(".claude")];
+        let project = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(claustrum_confine::resolve);
+        if let Some(dir) = project
+            && dir != workspace
+            && dir.starts_with(workspace)
+        {
+            dirs.push(dir.join(".claude"));
+        }
+        dirs
     }
 
     /// Guest command name for the actions.
@@ -486,16 +521,23 @@ impl Config {
         ))
     }
 
-    /// One line for stderr describing the second sandbox layer.
-    pub fn confinement_notice(confined: bool) -> String {
-        match claustrum_confine::backend() {
+    /// One line for stderr describing the second sandbox layer, and why it
+    /// is off if it is.
+    pub fn confinement_notice(mode: ConfinementMode, confined: bool) -> String {
+        let why = match claustrum_confine::backend() {
             Ok(backend) if confined => {
-                format!("confinement: {backend} around the Wasmer worker and the host actions")
+                return format!(
+                    "confinement: {backend} around the Wasmer worker and the host actions"
+                );
             }
-            _ => "confinement: OFF, the Wasmer runtime and host actions run with your full \
-                  rights"
-                .to_owned(),
-        }
+            _ if mode == ConfinementMode::Off => "confinement = \"off\"".to_owned(),
+            Ok(_) => "not active".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        format!(
+            "confinement: OFF ({why}), the Wasmer runtime and host actions run with your full \
+             rights"
+        )
     }
 
     /// The `[sandbox] confinement` settings.
@@ -505,7 +547,7 @@ impl Config {
             Some(m) => m
                 .parse::<ConfinementMode>()
                 .map_err(|e| anyhow::anyhow!("[sandbox] {e}"))?,
-            None => ConfinementMode::BestEffort,
+            None => ConfinementMode::Required,
         };
         let mut deny_read = std::env::var_os("HOME")
             .map(|h| claustrum_confine::secret_paths(Path::new(&h)))
@@ -550,18 +592,63 @@ impl Config {
     }
 
     /// Where the network decisions for `workspace` are logged.
-    pub fn network_log_path(&self, workspace: &Path) -> PathBuf {
+    pub fn network_log_path(&self, workspace: &Path) -> Result<PathBuf> {
         if let Some(p) = &self.file.network.log {
             let p = expand_home(p);
-            return if p.is_relative() {
+            let p = if p.is_relative() {
                 workspace.join(p)
             } else {
                 p
             };
+            self.check_log_path(&p, workspace, state_dir().ok().as_deref())?;
+            return Ok(p);
         }
-        state_dir()
+        Ok(state_dir()?
             .join("network")
-            .join(format!("{}.jsonl", workspace_key(workspace)))
+            .join(format!("{}.jsonl", workspace_key(workspace))))
+    }
+
+    /// The confined worker may append to the network log, so a configured
+    /// one must not be a file Claustrum or Claude Code relies on: nothing in
+    /// the state directory but network logs (trust records, plan ledgers),
+    /// nothing in Claude Code's configuration directory, none of the
+    /// protected files.
+    fn check_log_path(&self, log: &Path, workspace: &Path, state: Option<&Path>) -> Result<()> {
+        // Case-folded on macOS, whose file systems usually ignore case.
+        let fold = |p: &Path| {
+            let p = claustrum_confine::resolve(p);
+            if cfg!(target_os = "macos") {
+                PathBuf::from(p.to_string_lossy().to_lowercase())
+            } else {
+                p
+            }
+        };
+        let log_key = fold(log);
+        let refuse = |what: &str| {
+            anyhow::bail!(
+                "[network] log = {}: {what}; choose another file",
+                log.display()
+            )
+        };
+        if let Some(state) = state
+            && log_key.starts_with(fold(state))
+            && !log_key.starts_with(fold(&state.join("network")))
+        {
+            return refuse(
+                "it lies in the Claustrum state directory (trust records, plan ledgers)",
+            );
+        }
+        if log_key.starts_with(fold(&claude_config_dir())) {
+            return refuse("it lies in Claude Code's configuration directory");
+        }
+        if self
+            .protected_paths(workspace)
+            .iter()
+            .any(|p| fold(p) == log_key)
+        {
+            return refuse("it is a protected file");
+        }
+        Ok(())
     }
 
     /// Rename the network log and plan ledger of `workspace` from the file
@@ -572,7 +659,9 @@ impl Config {
         if new == old {
             return;
         }
-        let dir = state_dir();
+        let Ok(dir) = state_dir() else {
+            return;
+        };
         let mut moves = vec![(
             dir.join("plans").join(format!("{old}.list")),
             dir.join("plans").join(format!("{new}.list")),
@@ -612,16 +701,16 @@ impl Config {
     /// Where Claude Code's plans for `workspace` are written, if plan mode
     /// is enabled: Claude Code's own plan directory, with a ledger in the
     /// user state directory of the files this workspace created there.
-    pub fn host_plans(&self, workspace: &Path) -> Option<HostPlans> {
+    pub fn host_plans(&self, workspace: &Path) -> Result<Option<HostPlans>> {
         if !self.file.claude.plans {
-            return None;
+            return Ok(None);
         }
-        Some(HostPlans::new(
+        Ok(Some(HostPlans::new(
             claude_plans_dir(),
-            state_dir()
+            state_dir()?
                 .join("plans")
                 .join(format!("{}.list", workspace_key(workspace))),
-        ))
+        )))
     }
 
     pub fn network_policy(&self, workspace: &Path) -> Result<NetworkPolicy> {
@@ -637,7 +726,7 @@ impl Config {
         Ok(NetworkPolicy {
             mode,
             allow,
-            log: Some(self.network_log_path(workspace)),
+            log: Some(self.network_log_path(workspace)?),
         })
     }
 
@@ -677,13 +766,25 @@ impl Config {
             policy.default_timeout = (secs > 0).then(|| Duration::from_secs(secs));
         }
         if let Some(bytes) = s.max_output_bytes {
+            if bytes > claustrum_sandbox::MAX_OUTPUT_BYTES {
+                anyhow::bail!(
+                    "[sandbox] max_output_bytes must be at most {}",
+                    claustrum_sandbox::MAX_OUTPUT_BYTES
+                );
+            }
             policy.max_output_bytes = bytes;
         }
         if let Some(threads) = s.max_threads {
             policy.max_threads = Some(threads);
         }
         if let Some(mb) = s.max_memory_mb {
-            policy.max_memory_bytes = (mb > 0).then(|| mb * 1024 * 1024);
+            policy.max_memory_bytes = match mb {
+                0 => None,
+                mb => Some(
+                    mb.checked_mul(1024 * 1024)
+                        .context("[sandbox] max_memory_mb is too large")?,
+                ),
+            };
         }
         policy.confinement = self.confinement()?;
         Ok(policy)
@@ -775,7 +876,7 @@ impl Config {
                 builder.mount(&m.guest, expand_home(&m.host))
             };
         }
-        if let Some(host) = self.host_plans(&workspace) {
+        if let Some(host) = self.host_plans(&workspace)? {
             let dir = host.dir().to_string_lossy().into_owned();
             let store = plans.unwrap_or_else(|| Arc::new(host));
             builder = builder.plans(dir, store);
@@ -944,14 +1045,21 @@ writable = true
 
     #[test]
     fn plan_ledgers_are_per_workspace() {
-        let a = config("").host_plans(Path::new("/tmp/a/ws")).unwrap();
-        let b = config("").host_plans(Path::new("/tmp/b/ws")).unwrap();
+        let a = config("")
+            .host_plans(Path::new("/tmp/a/ws"))
+            .unwrap()
+            .unwrap();
+        let b = config("")
+            .host_plans(Path::new("/tmp/b/ws"))
+            .unwrap()
+            .unwrap();
         assert_eq!(a.dir(), b.dir());
         assert!(a.dir().ends_with("plans"));
         assert_ne!(format!("{a:?}"), format!("{b:?}"));
         assert!(
             config("[claude]\nplans = false\n")
                 .host_plans(Path::new("/tmp/a/ws"))
+                .unwrap()
                 .is_none()
         );
     }
@@ -965,11 +1073,71 @@ writable = true
             "--settings",
             "--mcp-config",
             "--allowedTools",
+            "--append-system-prompt",
+            "--append-system-prompt-file=x.md",
+            "--permission-prompt-tool=mcp__x__y",
         ] {
             let err = check_claude_args(&[bad.to_owned()]).unwrap_err();
             assert!(err.to_string().contains("not allowed"), "{bad}: {err}");
         }
         check_claude_args(&["--model".into(), "opus".into(), "--verbose".into()]).unwrap();
+    }
+
+    #[test]
+    fn the_network_log_cannot_overwrite_trusted_files() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let state = ws.join("state");
+        let log = |path: &Path| config("").check_log_path(path, &ws, Some(&state));
+        for bad in [
+            state.join("trust").join("0123"),
+            state.join("plans/x.list"),
+            claude_config_dir().join("settings.json"),
+            ws.join("claustrum.toml"),
+            ws.join(".claude/settings.json"),
+        ] {
+            let err = log(&bad).unwrap_err();
+            assert!(
+                err.to_string().contains("choose another file"),
+                "{bad:?}: {err}"
+            );
+        }
+        for ok in [ws.join("net.jsonl"), state.join("network/other.jsonl")] {
+            log(&ok).unwrap();
+        }
+        // Relative paths are taken against the workspace, then checked.
+        let err = config("[network]\nlog = \"claustrum.toml\"\n")
+            .network_log_path(&ws)
+            .unwrap_err();
+        assert!(err.to_string().contains("protected file"), "{err}");
+    }
+
+    #[test]
+    fn resource_limits_are_bounded() {
+        let ws = Path::new("/tmp/ws");
+        let err = config("[sandbox]\nmax_output_bytes = 999999999999\n")
+            .policy(ws)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most"), "{err}");
+        let err = config("[sandbox]\nmax_memory_mb = 9223372036854775807\n")
+            .policy(ws)
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let p = config("[sandbox]\nmax_memory_mb = 0\nmax_output_bytes = 4096\n")
+            .policy(ws)
+            .unwrap();
+        assert_eq!(p.max_memory_bytes, None);
+        assert_eq!(p.max_output_bytes, 4096);
+    }
+
+    #[test]
+    fn state_dir_is_never_guessed() {
+        let err = state_dir_from(None, None).unwrap_err();
+        assert!(err.to_string().contains("CLAUSTRUM_STATE_DIR"), "{err}");
+        assert_eq!(
+            state_dir_from(Some("/s".into()), None).unwrap(),
+            PathBuf::from("/s")
+        );
     }
 
     #[test]
@@ -991,6 +1159,24 @@ writable = true
         let paths = config("").protected_paths(ws);
         assert!(paths.contains(&ws.join(".claude/settings.json")));
         assert!(paths.contains(&ws.join(".claude/settings.local.json")));
+
+        // The project the file comes from, when the workspace lies above it.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = claustrum_confine::resolve(tmp.path());
+        let proj = home.join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mut cfg = config("[sandbox]\nworkspace = \"~\"\n");
+        cfg.path = Some(proj.join("claustrum.toml"));
+        let paths = cfg.protected_paths(&home);
+        for f in CLAUDE_SETTINGS {
+            assert!(paths.contains(&proj.join(".claude").join(f)), "{paths:?}");
+            assert!(paths.contains(&home.join(".claude").join(f)), "{paths:?}");
+        }
+        assert!(paths.contains(&proj.join("claustrum.toml")));
+
+        // A configuration outside the workspace adds nothing.
+        let dirs = cfg.claude_settings_dirs(&proj.join("sub"));
+        assert_eq!(dirs, [proj.join("sub/.claude")]);
     }
 
     #[test]

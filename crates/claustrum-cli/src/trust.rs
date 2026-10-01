@@ -76,7 +76,7 @@ pub fn command(config: &Config, revoke: bool) -> Result<()> {
     };
     let path = canonical(path)?;
     if revoke {
-        match std::fs::remove_file(record_path(&path)) {
+        match std::fs::remove_file(record_path(&path)?) {
             Ok(()) => println!("Trust for {} revoked.", path.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 println!("{} was not trusted.", path.display());
@@ -99,14 +99,14 @@ fn canonical(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve {}", path.display()))
 }
 
-fn record_path(config: &Path) -> PathBuf {
+fn record_path(config: &Path) -> Result<PathBuf> {
     let key = sha256_hex(config.as_os_str().as_encoded_bytes());
-    state_dir().join("trust").join(&key[..32])
+    Ok(state_dir()?.join("trust").join(&key[..32]))
 }
 
 /// The trusted digest of `config`, if any.
 fn recorded(config: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(record_path(config)) {
+    match std::fs::read_to_string(record_path(config)?) {
         Ok(text) => Ok(text.lines().next().map(|l| l.trim().to_owned())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).context("cannot read the trust record"),
@@ -114,7 +114,7 @@ fn recorded(config: &Path) -> Result<Option<String>> {
 }
 
 fn record(config: &Path, digest: &str) -> Result<()> {
-    let path = record_path(config);
+    let path = record_path(config)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
@@ -138,8 +138,21 @@ pub fn describe(path: &Path, file: &FileConfig, changed: bool) -> String {
         lines.push(format!("  {} {text}", if risky { "!" } else { "-" }));
     };
     let s = &file.sandbox;
+    if let Some(dir) = &s.workspace {
+        item(
+            true,
+            format!(
+                "workspace: {} mounted read/write at /workspace instead of the project directory",
+                dir.display()
+            ),
+        );
+    }
     match s.confinement.as_deref() {
         Some("off") => item(true, "OS confinement: off (single sandbox layer)".into()),
+        Some("best-effort") => item(
+            true,
+            "OS confinement: best-effort (runs unconfined where unavailable)".into(),
+        ),
         Some(m) => item(false, format!("OS confinement: {m}")),
         None => {}
     }
@@ -309,6 +322,7 @@ mod tests {
             r#"
 [sandbox]
 confinement = "off"
+workspace = "~"
 [network]
 mode = "host"
 [[mounts]]
@@ -327,6 +341,7 @@ tools = ["Bash"]
         .unwrap();
         let text = describe(Path::new("/p/claustrum.toml"), &file, false);
         for expected in [
+            "! workspace: ~ mounted read/write at /workspace",
             "! OS confinement: off",
             "! network: host",
             "! mount ~ -> /home (read/write)",
@@ -342,5 +357,19 @@ tools = ["Bash"]
             false,
         );
         assert!(text.contains("nothing beyond the defaults"), "{text}");
+    }
+
+    /// A different workspace is the whole home directory read/write, even
+    /// when nothing else is set.
+    #[test]
+    fn description_flags_a_foreign_workspace() {
+        let file: FileConfig = toml::from_str("[sandbox]\nworkspace = \"~\"\n").unwrap();
+        let text = describe(Path::new("/p/claustrum.toml"), &file, false);
+        assert!(text.contains("! workspace: ~"), "{text}");
+        let file: FileConfig =
+            toml::from_str("[sandbox]\nconfinement = \"best-effort\"\n").unwrap();
+        let text = describe(Path::new("/p/claustrum.toml"), &file, false);
+        assert!(text.contains("! OS confinement: best-effort"), "{text}");
+        assert!(!text.contains("nothing beyond the defaults"), "{text}");
     }
 }

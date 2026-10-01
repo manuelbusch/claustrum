@@ -26,7 +26,7 @@ A project's `claustrum.toml` is only used after you have
 ```toml
 [sandbox]
 timeout_secs = 120            # per command, 0 = unlimited
-confinement = "best-effort"   # best-effort | required | off
+confinement = "required"      # required (default) | best-effort | off
 
 [network]
 mode = "allowlist"            # disabled (default) | allowlist | audit | host

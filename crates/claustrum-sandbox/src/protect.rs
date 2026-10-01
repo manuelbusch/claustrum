@@ -82,6 +82,13 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// A mount-relative path as an absolute, normalised one: `/d/../f` is
+/// `/f`. [`ProtectedFs`] checks and forwards this same path, so the check
+/// never depends on how the file system below treats `..` behind a link.
+fn inside(path: &Path) -> PathBuf {
+    lexical_normalize(&Path::new("/").join(path))
+}
+
 /// Comparison key: case-folded where host file systems are usually
 /// case-insensitive, so `CLAUSTRUM.TOML` cannot sneak past on macOS.
 pub(crate) fn key(path: &Path) -> PathBuf {
@@ -138,7 +145,7 @@ impl ProtectedFs {
 
     /// Host path of a mount-relative path, resolved like the host would.
     fn host(&self, path: &Path) -> Option<PathBuf> {
-        let inside = lexical_normalize(&Path::new("/").join(path));
+        let inside = inside(path);
         let rel = inside.strip_prefix("/").unwrap_or(&inside);
         resolve_host_path(&self.root.join(rel)).ok()
     }
@@ -157,7 +164,7 @@ impl ProtectedFs {
     /// Host path of a mount-relative path without resolving any link: the
     /// name a host program such as Claude Code opens.
     fn lexical(&self, path: &Path) -> PathBuf {
-        let inside = lexical_normalize(&Path::new("/").join(path));
+        let inside = inside(path);
         self.root.join(inside.strip_prefix("/").unwrap_or(&inside))
     }
 
@@ -220,8 +227,7 @@ impl ProtectedFs {
     /// itself (remove, rename, lstat): only the parent is resolved, so a link
     /// that points outside can still be inspected, renamed or removed.
     fn contain_entry(&self, path: &Path) -> virtual_fs::Result<()> {
-        let inside = lexical_normalize(&Path::new("/").join(path));
-        match inside.parent() {
+        match inside(path).parent() {
             Some(parent) => self.contain(parent),
             // The mount root itself.
             None => Ok(()),
@@ -234,18 +240,23 @@ impl ProtectedFs {
     }
 }
 
+// Every method checks and forwards the same normalised path (see
+// [`inside`]).
 impl FileSystem for ProtectedFs {
     fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        let path = &inside(path);
         self.contain_entry(path)?;
         self.inner.readlink(path)
     }
 
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<ReadDir> {
+        let path = &inside(path);
         self.contain(path)?;
         self.inner.read_dir(path)
     }
 
     fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        let path = &inside(path);
         self.contain(path)?;
         self.check_file(path)?;
         self.inner.create_dir(path)
@@ -256,7 +267,9 @@ impl FileSystem for ProtectedFs {
         // writes through it resolve to the protected path and are refused. A
         // link in place of a missing directory above one (`.claude` for
         // `.claude/settings.json`) would redirect the protected path to a
-        // file the guest can write.
+        // file the guest can write. `source` is the link's content, kept as
+        // written.
+        let target = &inside(target);
         self.contain_entry(target)?;
         self.check_tree(target)?;
         self.inner.create_symlink(source, target)
@@ -264,6 +277,7 @@ impl FileSystem for ProtectedFs {
 
     fn hard_link(&self, source: &Path, target: &Path) -> virtual_fs::Result<()> {
         // A second name for a protected file would be a writable alias.
+        let (source, target) = (&inside(source), &inside(target));
         self.contain(source)?;
         self.contain_entry(target)?;
         self.check_file(source)?;
@@ -272,6 +286,7 @@ impl FileSystem for ProtectedFs {
     }
 
     fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
+        let path = &inside(path);
         self.contain_entry(path)?;
         self.check_tree(path)?;
         self.inner.remove_dir(path)
@@ -279,8 +294,20 @@ impl FileSystem for ProtectedFs {
 
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, virtual_fs::Result<()>> {
         Box::pin(async move {
+            let (from, to) = (&inside(from), &inside(to));
             self.contain_entry(from)?;
             self.contain_entry(to)?;
+            // Across directories the host file system copies and deletes
+            // instead of renaming, and the copy follows a link: its target
+            // must then be inside, or its contents would be pulled in.
+            if from.parent() != to.parent()
+                && self
+                    .inner
+                    .symlink_metadata(from)
+                    .is_ok_and(|m| m.ft.is_symlink())
+            {
+                self.contain(from)?;
+            }
             self.check_tree(from)?;
             self.check_tree(to)?;
             self.inner.rename(from, to).await
@@ -288,16 +315,19 @@ impl FileSystem for ProtectedFs {
     }
 
     fn metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        let path = &inside(path);
         self.contain(path)?;
         self.inner.metadata(path)
     }
 
     fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
+        let path = &inside(path);
         self.contain_entry(path)?;
         self.inner.symlink_metadata(path)
     }
 
     fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
+        let path = &inside(path);
         self.contain_entry(path)?;
         self.check_file(path)?;
         self.inner.remove_file(path)
@@ -317,6 +347,7 @@ impl FileOpener for ProtectedFs {
         // WASIX first tries a read/write handle for every regular file and
         // falls back to the requested mode on PermissionDenied, so refusing
         // here keeps plain reads working.
+        let path = &inside(path);
         self.contain(path)?;
         if conf.would_mutate() {
             self.check_file(path)?;
@@ -516,6 +547,49 @@ mod tests {
             );
         }
         assert!(!root.join("missing.toml").exists());
+    }
+
+    /// `..` behind a link: the check and the operation see the same path,
+    /// `/d/../f` is `/f` in the mount whatever `d` points to.
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_behind_a_link_stays_in_the_mount() {
+        let (dir, fs, rt) = setup();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outer = outside.path().canonicalize().unwrap();
+        std::fs::create_dir(outer.join("deeper")).unwrap();
+        std::os::unix::fs::symlink(outer.join("deeper"), root.join("d")).unwrap();
+
+        write_open(&fs, "/d/../f").unwrap();
+        assert!(root.join("f").exists());
+        assert!(!outer.join("f").exists());
+        assert!(matches!(
+            write_open(&fs, "/d/../claustrum.toml"),
+            Err(FsError::PermissionDenied)
+        ));
+        // Through the link itself it is still refused.
+        assert!(matches!(
+            write_open(&fs, "/d/x"),
+            Err(FsError::PermissionDenied)
+        ));
+        // Renaming something through the link is refused, and so is moving
+        // the link to another directory, which the host file system does by
+        // copying what it points to. Renaming it in place is fine.
+        std::fs::write(outer.join("deeper/secret"), "s").unwrap();
+        let rename = |a: &str, b: &str| rt.block_on(fs.rename(Path::new(a), Path::new(b)));
+        assert!(rename("/d/secret", "/stolen").is_err());
+        assert!(rename("/d", "/sub/copied").is_err());
+        assert!(!root.join("stolen").exists());
+        assert!(!root.join("sub/copied").exists());
+        rename("/d", "/e").unwrap();
+        assert!(
+            std::fs::symlink_metadata(root.join("e"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outer.join("deeper/secret").exists());
     }
 
     #[test]

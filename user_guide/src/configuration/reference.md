@@ -10,10 +10,10 @@ contains the same information as comments.
 | --- | --- | --- |
 | `workspace` | current directory | host directory mounted read/write at `/workspace` |
 | `timeout_secs` | `120` | per-command timeout in seconds; `0` = unlimited. A `Bash` call always ends after at most 10 minutes. Host actions inherit it unless they set their own. |
-| `max_output_bytes` | `1048576` | bytes kept per output stream (stdout, stderr) of a command |
+| `max_output_bytes` | `1048576` | bytes kept per output stream (stdout, stderr) of a command; at most 64 MiB |
 | `max_threads` | `64` | guest processes and threads per command, counted together |
 | `max_memory_mb` | `1024` | memory one guest process may grow to, in MiB; `0` allows wasm32's 4 GiB |
-| `confinement` | `"best-effort"` | OS sandbox around the worker and the host actions: `"best-effort"`, `"required"` or `"off"`, see [OS confinement](../security/confinement.md) |
+| `confinement` | `"required"` | OS sandbox around the worker and the host actions: `"required"`, `"best-effort"` or `"off"`, see [OS confinement](../security/confinement.md) |
 | `deny_read` | `[]` | host paths confined processes may never read, in addition to the built-in credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains, browser profiles, ...) |
 | `network` | – | shorthand for `[network] mode`, accepts `"disabled"` or `"host"` |
 
@@ -32,7 +32,7 @@ RUST_LOG = "info"
 | --- | --- | --- |
 | `mode` | `"disabled"` | `"disabled"`, `"allowlist"`, `"audit"` or `"host"`, see [Network](../network/index.md) |
 | `allow` | `[]` | destinations as `host[:ports]`, see [allow entries](../network/index.md#allow-entries) |
-| `log` | per-workspace file in the user state directory | JSON-lines file every decision is appended to |
+| `log` | per-workspace file in the user state directory | JSON-lines file every decision is appended to; relative to the workspace. At 64 MiB it stops growing (entries are then only kept in memory), and the next session moves it aside to `<name>.1`. It may not lie in the state directory (other than its `network` directory), in Claude Code's configuration directory, or be a protected file |
 
 ## `[packages]`
 
@@ -90,7 +90,7 @@ writable = true
 | `command` | – | the host argv; `command[0]` is an absolute path or a name looked up on `PATH` at startup, the rest may contain `{input}` placeholders. No shell is involved. |
 | `cwd` | workspace | working directory, relative to the workspace and inside it |
 | `timeout_secs` | `[sandbox] timeout_secs` | wall-clock limit; `0` = none |
-| `max_output_bytes` | `[sandbox] max_output_bytes` | bytes kept per output stream |
+| `max_output_bytes` | `[sandbox] max_output_bytes` | bytes kept per output stream; at most 64 MiB |
 | `env` | `{}` | environment variables for the program; only `PATH`, `HOME` and `LANG` are inherited from the host |
 | `env_passthrough` | `[]` | host environment variables forwarded by name |
 | `writable` | `[]` | extra host directories the confined program may write, e.g. `~/.cargo/registry`; relative paths are taken against the workspace |

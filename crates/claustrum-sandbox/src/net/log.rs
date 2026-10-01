@@ -18,6 +18,13 @@ use super::policy::Verdict;
 /// Entries kept in memory.
 const RING: usize = 1000;
 
+/// Size at which the log file stops growing. Past it entries are only kept
+/// in memory; the next session that opens the file moves it aside to
+/// `<name>.1` (where it may: the confined worker cannot rename it) and
+/// starts a new one. The guest decides how many refusals it causes, so the
+/// file must not grow without bound.
+pub const MAX_LOG_FILE: u64 = 64 * 1024 * 1024;
+
 /// One decision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -40,12 +47,27 @@ pub struct LogEntry {
     pub reason: Option<String>,
 }
 
+/// `s` with control characters escaped, so that a value from the guest
+/// cannot start a line of its own in a summary.
+fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl LogEntry {
     /// `host:port`, falling back to the address.
     pub fn target(&self) -> String {
         let host = self
             .host
-            .clone()
+            .as_deref()
+            .map(printable)
             .or_else(|| {
                 self.addr.map(|a| match a {
                     IpAddr::V6(v6) => format!("[{v6}]"),
@@ -66,7 +88,7 @@ impl LogEntry {
             v => v,
         };
         match &self.reason {
-            Some(r) => format!("{what} {} {} ({r})", self.kind, self.target()),
+            Some(r) => format!("{what} {} {} ({})", self.kind, self.target(), printable(r)),
             None => format!("{what} {} {}", self.kind, self.target()),
         }
     }
@@ -87,6 +109,10 @@ struct Inner {
     ring: VecDeque<LogEntry>,
     next_seq: u64,
     file: Option<File>,
+    /// See [`MAX_LOG_FILE`].
+    max_file: u64,
+    /// Whether the file reached `max_file` (reported once).
+    full: bool,
 }
 
 /// Shared by the guest gate and the action proxy of one sandbox.
@@ -104,6 +130,8 @@ impl ConnectionLog {
                 ring: VecDeque::new(),
                 next_seq: 1,
                 file: None,
+                max_file: MAX_LOG_FILE,
+                full: false,
             }),
             path: None,
         }
@@ -112,7 +140,13 @@ impl ConnectionLog {
     /// Also append every entry to `path` (created with its parent directory).
     /// Failing to open the file is logged, not fatal.
     pub fn with_file(path: &Path) -> Self {
+        Self::with_file_limit(path, MAX_LOG_FILE)
+    }
+
+    fn with_file_limit(path: &Path, max_file: u64) -> Self {
         let log = Self::memory();
+        log.inner.lock().expect("log lock").max_file = max_file;
+        move_aside_if_full(path, max_file);
         let file = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
@@ -183,7 +217,20 @@ impl ConnectionLog {
         }
         // One write per line: broker and worker append to the same file
         // (O_APPEND), and a single write cannot interleave with theirs.
+        let max_file = inner.max_file;
+        let full = inner
+            .file
+            .as_ref()
+            .is_some_and(|f| f.metadata().is_ok_and(|m| m.len() >= max_file));
+        if full && !inner.full {
+            tracing::warn!(
+                limit = max_file,
+                "the network log file is full; further entries are kept in memory only"
+            );
+        }
+        inner.full = full;
         if let Some(file) = &mut inner.file
+            && !full
             && let Ok(mut line) = serde_json::to_string(&entry)
             && let Err(e) = {
                 line.push('\n');
@@ -229,6 +276,23 @@ impl ConnectionLog {
     }
 }
 
+/// Move a log file that reached [`MAX_LOG_FILE`] aside to `<name>.1`, so
+/// that a new one starts. Run by the unconfined broker before it starts the
+/// worker, which may append to the file but not rename it.
+pub fn rotate_full_log(path: &Path) {
+    move_aside_if_full(path, MAX_LOG_FILE);
+}
+
+fn move_aside_if_full(path: &Path, max_file: u64) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= max_file) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        if let Err(e) = std::fs::rename(path, &old) {
+            tracing::debug!(path = %path.display(), error = %e, "cannot move the full network log aside");
+        }
+    }
+}
+
 /// Read a JSONL log written by [`ConnectionLog::with_file`]. Malformed lines
 /// are skipped.
 pub fn read_log(path: &Path) -> std::io::Result<Vec<LogEntry>> {
@@ -271,5 +335,53 @@ mod tests {
         let read = read_log(&path).unwrap();
         assert_eq!(read.len(), 4);
         assert_eq!(read, log.entries());
+    }
+
+    #[test]
+    fn the_file_stops_growing_and_is_moved_aside_next_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.jsonl");
+        let ev = || Event {
+            source: "guest",
+            kind: "udp",
+            ..Event::default()
+        };
+        let log = ConnectionLog::with_file_limit(&path, 300);
+        for _ in 0..10 {
+            log.record(ev(), &Verdict::Refused("UDP is not allowed".into()));
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!((300..600).contains(&size), "{size}");
+        assert_eq!(log.entries().len(), 10);
+        drop(log);
+
+        let log = ConnectionLog::with_file_limit(&path, 300);
+        log.record(ev(), &Verdict::Allowed);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("net.jsonl.1"))
+                .unwrap()
+                .len(),
+            size
+        );
+        assert_eq!(read_log(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn summaries_stay_on_one_line() {
+        let log = ConnectionLog::memory();
+        log.record(
+            Event {
+                source: "action:x",
+                kind: "connect",
+                host: Some("a\r\n[network: allowed]"),
+                port: Some(443),
+                ..Event::default()
+            },
+            &Verdict::Refused("a\nb is not in the allowlist".into()),
+        );
+        assert_eq!(
+            log.notes_since(0),
+            ["refused connect a\\r\\n[network: allowed]:443 (a\\nb is not in the allowlist)"]
+        );
     }
 }

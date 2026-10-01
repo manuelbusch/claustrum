@@ -346,12 +346,14 @@ impl SandboxBuilder {
                     "mount paths must be absolute",
                 ));
             }
+            // Stored normalised: the native tools match mounts by string
+            // prefix, and would miss `/data/` or `/a/./b`.
             let guest = fs::normalize_guest_path(&m.guest, "/")?;
             check_mount_path(&guest, &seen)?;
-            seen.push(guest);
+            seen.push(guest.clone());
             let host = fs::host_dir(handle.clone(), &m.host, &fs_protected)?;
             mounts.push(Mount {
-                guest: m.guest.clone(),
+                guest,
                 fs: if m.writable {
                     host
                 } else {

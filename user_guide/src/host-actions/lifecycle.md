@@ -27,6 +27,8 @@
                                                       ▼
                                                 wait: timeout or killed Bash call
                                                   ──▶ SIGKILL the whole group
+                                                on exit: SIGKILL what is left in the group,
+                                                  read remaining output for at most 2 s
                                                 restore protected files if changed
                                                       │
    ◀────────── exit code, bounded stdout/stderr, network notes ──────────┘
@@ -43,7 +45,12 @@ The worker and the broker are the two halves of `claustrum serve`, see
 - **Every input is validated** before it is substituted into a single argv element.
 - **The process is contained in time and output.** Clean environment, closed stdin, a working
   directory inside the workspace, its own process group, a timeout, capped output, one action
-  at a time.
+  at a time. An action is one job: when it exits, background processes it left in its group
+  are killed. A process that detached into a session of its own (`setsid`, a daemon) is out
+  of reach there; Claustrum then stops reading the output after two seconds, notes it on
+  stderr and moves on, so it cannot hold up later actions. Under bubblewrap such a process
+  dies with the action's PID namespace; elsewhere it keeps running, so do not declare
+  programs that leave daemons behind unless you want them.
 - **The configuration stays what it was.** Protected files are snapshotted before and restored
   after every action.
 - **The program is confined** by the OS sandbox: writes stay in the workspace, `$TMPDIR` and

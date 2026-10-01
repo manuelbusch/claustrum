@@ -52,7 +52,7 @@ pub struct ActionParams {
 pub struct BashParams {
     /// The shell command to run with `bash -c`.
     pub command: String,
-    /// Optional timeout in milliseconds (max 600000). Defaults to the sandbox policy.
+    /// Optional timeout in milliseconds (max 600000). Defaults to the sandbox policy; 0 means the default too.
     pub timeout: Option<u64>,
     /// Short description of what the command does, for the user's benefit.
     #[allow(dead_code)]
@@ -117,6 +117,20 @@ pub struct GrepParams {
     pub head_limit: Option<usize>,
 }
 
+/// The timeout of one Bash call: as requested (in milliseconds), else the
+/// policy's default, at most [`MAX_BASH_TIMEOUT`]. Never without a limit,
+/// even when the policy has none (`timeout_secs = 0`): a runaway command
+/// would hold its call and the guest's memory forever. A requested 0 is
+/// taken as "no preference", not as a deadline that has already passed.
+fn bash_timeout(requested_ms: Option<u64>, default: Option<Duration>) -> Duration {
+    requested_ms
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .or(default)
+        .unwrap_or(MAX_BASH_TIMEOUT)
+        .min(MAX_BASH_TIMEOUT)
+}
+
 fn text(s: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(s)])
 }
@@ -161,18 +175,11 @@ impl ClaustrumServer {
         Parameters(p): Parameters<BashParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // Never without a limit, even when the policy has no default
-        // (`timeout_secs = 0`): a runaway command would hold its call and
-        // the guest's memory forever.
-        let timeout = Some(
-            p.timeout
-                .map(Duration::from_millis)
-                .or(self.sandbox.policy().default_timeout)
-                .unwrap_or(MAX_BASH_TIMEOUT)
-                .min(MAX_BASH_TIMEOUT),
-        );
         let options = ExecOptions {
-            timeout,
+            timeout: Some(bash_timeout(
+                p.timeout,
+                self.sandbox.policy().default_timeout,
+            )),
             ..Default::default()
         };
 
@@ -475,4 +482,20 @@ pub async fn serve_stdio(sandbox: Sandbox) -> anyhow::Result<()> {
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_timeouts_are_bounded_and_zero_means_the_default() {
+        let default = Some(Duration::from_secs(120));
+        assert_eq!(bash_timeout(Some(5_000), default), Duration::from_secs(5));
+        assert_eq!(bash_timeout(Some(0), default), Duration::from_secs(120));
+        assert_eq!(bash_timeout(None, default), Duration::from_secs(120));
+        assert_eq!(bash_timeout(None, None), MAX_BASH_TIMEOUT);
+        assert_eq!(bash_timeout(Some(0), None), MAX_BASH_TIMEOUT);
+        assert_eq!(bash_timeout(Some(u64::MAX), default), MAX_BASH_TIMEOUT);
+    }
 }

@@ -25,7 +25,8 @@ The same holds for Claude Code's own project settings, `.claude/settings.json` a
 the hooks, status line and helper commands configured there. The guest can neither create
 those files nor turn `.claude` into a link. Other files in `.claude` (agents, commands,
 skills) stay writable. Their shell snippets only run through the built-in Bash tool, which
-Claustrum removes.
+Claustrum removes. When `[sandbox] workspace` points to a directory above the project, the
+settings next to the loaded `claustrum.toml` are protected as well.
 
 With OS confinement, `claustrum serve` creates `.claude` in the workspace if it is missing.
 Under bubblewrap, a settings file that does not exist yet cannot be protected by a bind mount

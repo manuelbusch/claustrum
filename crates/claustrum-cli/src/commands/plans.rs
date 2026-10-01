@@ -16,7 +16,7 @@ pub struct Args {
 pub fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
     config.migrate_state(&workspace);
-    let Some(plans) = config.host_plans(&workspace) else {
+    let Some(plans) = config.host_plans(&workspace)? else {
         println!("Plans are disabled ([claude] plans = false).");
         return Ok(());
     };

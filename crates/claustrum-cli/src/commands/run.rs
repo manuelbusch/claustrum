@@ -66,9 +66,13 @@ pub fn run(config: Config, args: Args) -> Result<()> {
     config.migrate_state(&workspace);
     let actions = config.validate_actions(&workspace)?;
     let network = config.network_policy(&workspace)?;
-    let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;
+    let confinement = config.confinement()?;
+    let confined = confinement.active().map_err(anyhow::Error::msg)?;
     eprintln!("claustrum: {}", Config::network_notice(&network));
-    eprintln!("claustrum: {}", Config::confinement_notice(confined));
+    eprintln!(
+        "claustrum: {}",
+        Config::confinement_notice(confinement.mode, confined)
+    );
     if let Some(notice) = Config::actions_notice(&actions, confined) {
         eprintln!("claustrum: {notice}");
     }
@@ -98,7 +102,9 @@ pub fn run(config: Config, args: Args) -> Result<()> {
         .unwrap_or_else(|| which::which("claude").map_err(anyhow::Error::from))
         .context("cannot find the `claude` binary; pass --claude or set [claude].binary")?;
 
-    let plans = config.host_plans(&workspace).map(|p| p.dir().to_path_buf());
+    let plans = config
+        .host_plans(&workspace)?
+        .map(|p| p.dir().to_path_buf());
     if let Some(dir) = &plans {
         eprintln!(
             "claustrum: plans: {} (written through WritePlan/EditPlan, this workspace's files only)",

@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use claustrum_sandbox::net::{LogEntry, read_log};
+use claustrum_sandbox::net::{LogEntry, is_query_name, read_log};
 
 use crate::config::Config;
 
@@ -29,7 +29,7 @@ pub fn run(config: Config, cmd: Command) -> Result<()> {
         Command::Report { workspace, all } => {
             let workspace = config.workspace(workspace.as_deref())?;
             config.migrate_state(&workspace);
-            let path = config.network_log_path(&workspace);
+            let path = config.network_log_path(&workspace)?;
             let entries = match read_log(&path) {
                 Ok(e) => e,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -46,16 +46,21 @@ pub fn run(config: Config, cmd: Command) -> Result<()> {
     }
 }
 
-/// Destination key: the host name when known, else the address.
+/// Destination key: the host name when known (control characters escaped),
+/// else the address.
 fn host_of(e: &LogEntry) -> String {
-    e.host.clone().unwrap_or_else(|| {
-        e.addr
-            .map(|a| match a {
-                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-                v4 => v4.to_string(),
-            })
-            .unwrap_or_else(|| "?".into())
-    })
+    e.host
+        .as_deref()
+        .map(str::escape_debug)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| {
+            e.addr
+                .map(|a| match a {
+                    std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                    v4 => v4.to_string(),
+                })
+                .unwrap_or_else(|| "?".into())
+        })
 }
 
 #[derive(Default)]
@@ -128,7 +133,10 @@ fn report(entries: &[LogEntry], all: bool, path: &str) -> String {
                 .kinds
                 .iter()
                 .any(|k| matches!(k.as_str(), "dns" | "tcp" | "connect" | "http"));
-            if verdict != "allowed" && suggestible && host != "?" {
+            // Only what an entry can hold, so that nothing from the log
+            // can inject TOML into the suggestion.
+            let valid = is_query_name(host.trim_start_matches('[').trim_end_matches(']'));
+            if verdict != "allowed" && suggestible && valid {
                 suggestions
                     .entry(host.clone())
                     .or_default()
@@ -221,5 +229,24 @@ mod tests {
         assert!(!r.contains("\"0.0.0.0"), "{r}");
         assert!(report(&entries, true, "log").contains("github.com"));
         assert!(report(&[], false, "log").contains("Nothing was refused"));
+    }
+
+    #[test]
+    fn hosts_from_the_log_cannot_inject_suggestions() {
+        let entries = vec![
+            entry(
+                "refused",
+                "connect",
+                Some("x\",\n  \"*.evil.com"),
+                None,
+                Some(443),
+            ),
+            entry("refused", "tcp", None, Some("2001:db8::1"), Some(443)),
+        ];
+        let r = report(&entries, false, "log");
+        assert!(!r.contains("\n  \"*.evil.com"), "{r}");
+        assert!(r.contains("x\\\",\\n"), "{r}");
+        assert!(r.contains("  \"[2001:db8::1]:443\",\n"), "{r}");
+        assert!(!r.contains("\"x"), "{r}");
     }
 }

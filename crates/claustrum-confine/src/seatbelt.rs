@@ -106,8 +106,13 @@ pub(crate) fn render(profile: &Profile) -> String {
     }
 
     rule(&mut s, "deny file-read*", "subpath", &profile.deny_read);
+    // Nor written: a hard link is a write on the linked file, and would
+    // make a secret readable under a new name.
+    rule(&mut s, "deny file-write*", "subpath", &profile.deny_read);
+    // Protected files and denied paths keep their place: renamed, or with a
+    // directory above them renamed, they would fall out of their rules.
     let mut frozen: Vec<PathBuf> = Vec::new();
-    for p in &profile.deny_write {
+    for p in profile.deny_write.iter().chain(&profile.deny_read) {
         let p = resolve(p);
         for a in ancestors(&p) {
             if !frozen.iter().any(|f| f == a) {
@@ -275,6 +280,23 @@ mod tests {
     }
 
     #[test]
+    fn denied_paths_and_their_parents_are_frozen() {
+        let mut p = Profile::new("test", "/bin/sh");
+        p.write = vec![PathBuf::from("/Users/u")];
+        p.deny_read = vec![PathBuf::from("/Users/u/.ssh")];
+        let text = render(&p);
+        let deny_write = &text[text.find("(deny file-write*").unwrap()..];
+        assert!(deny_write.contains("(subpath \"/Users/u/.ssh\")"), "{text}");
+        let frozen = &text[text.rfind("(deny file-write*").unwrap()..];
+        for literal in ["/Users", "/Users/u", "/Users/u/.ssh"] {
+            assert!(
+                frozen.contains(&format!("(literal \"{literal}\")")),
+                "{literal} not frozen:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn denied_reads_and_network() {
         let (_d, ws) = workspace();
         std::fs::create_dir(ws.join("secret")).unwrap();
@@ -283,6 +305,19 @@ mod tests {
         p.deny_read = vec![ws.join("secret")];
         let (ok, _) = run(&p, &format!("cat {}/secret/key", ws.display()));
         assert!(!ok);
+        // Neither moved out of the rule nor linked under another name.
+        for attempt in [
+            "mv secret moved && cat moved/key",
+            "ln secret/key stolen && cat stolen",
+        ] {
+            let (ok, out) = run(&p, &format!("cd {} && {attempt}", ws.display()));
+            assert!(!ok, "`{attempt}` succeeded: {out}");
+        }
+        assert!(ws.join("secret/key").exists());
+        assert!(!ws.join("stolen").exists());
+        // The workspace around it stays writable.
+        let (ok, out) = run(&p, &format!("cd {} && echo y > other", ws.display()));
+        assert!(ok, "{out}");
         let (ok, _) = run(&p, "/usr/bin/nc -z -G 2 1.1.1.1 443");
         assert!(!ok, "network should be denied");
     }

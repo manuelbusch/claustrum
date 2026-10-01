@@ -4,14 +4,16 @@
 //! closed stdin, its own process group and, when a [`Profile`] is given, the
 //! OS sandbox. Output is captured with a limit,
 //! the wall-clock timeout and the guest's cancel flag both end in a SIGKILL
-//! of the whole group, and the protected files (the Claustrum configuration)
-//! are put back if the program touched them.
+//! of the whole group, as does the program's own exit for whatever it left
+//! running there. The protected files (the Claustrum configuration) are put
+//! back if the program touched them.
 
 use std::{
     collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -43,6 +45,9 @@ pub struct ActionOutcome {
     pub duration: Duration,
     /// Protected files the program changed and Claustrum restored.
     pub restored: Vec<PathBuf>,
+    /// Protected files the program changed and Claustrum could not restore.
+    #[serde(default)]
+    pub restore_failed: Vec<PathBuf>,
     /// Network refusals (through the proxy) during the run, for the model.
     pub network_notes: Vec<String>,
 }
@@ -77,9 +82,37 @@ pub(crate) fn execute(
         Some(p) => claustrum_confine::command(p, &spec.program).map_err(|e| e.to_string())?,
         None => Command::new(&spec.program),
     };
+    // The working directory was resolved when the definition was compiled;
+    // since then the guest may have replaced a directory on the way with a
+    // link to somewhere else. Open it without following links and enter
+    // that very directory, so neither the program nor the `path` inputs
+    // (relative to it) end up outside the workspace.
+    #[cfg(unix)]
+    let cwd = open_dir_nofollow(&spec.cwd).map_err(|e| {
+        format!(
+            "the working directory {} changed since startup: {e}",
+            spec.cwd.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
+        let fd = cwd.as_raw_fd();
+        // SAFETY: fchdir is async-signal-safe; `cwd` outlives the spawn.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(fd) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    command.current_dir(&spec.cwd);
     command
         .args(&bound.argv)
-        .current_dir(&spec.cwd)
         .env_clear()
         .envs(base_env())
         .envs(
@@ -102,41 +135,50 @@ pub(crate) fn execute(
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start `{}`: {e}", spec.program.display()))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
     let limit = spec.max_output_bytes;
+    let out = Drain::start(child.stdout.take().expect("stdout is piped"), limit);
+    let err = Drain::start(child.stderr.take().expect("stderr is piped"), limit);
 
-    let (status, killed, out, err) = std::thread::scope(|s| {
-        let out = s.spawn(move || drain(stdout, limit));
-        let err = s.spawn(move || drain(stderr, limit));
-        let deadline = spec.timeout.map(|t| started + t);
-        let mut killed = false;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => {}
-                Err(e) => break Err(e),
-            }
-            let expired = deadline.is_some_and(|d| Instant::now() >= d);
-            if expired || cancel.is_cancelled() {
-                tracing::warn!(
-                    action = spec.name,
-                    reason = if expired { "timeout" } else { "guest killed" },
-                    "killing host action"
-                );
-                kill_group(&mut child);
-                killed = true;
-                break child.wait();
-            }
-            std::thread::sleep(POLL);
-        };
-        (
-            status,
-            killed,
-            out.join().unwrap_or_default(),
-            err.join().unwrap_or_default(),
-        )
-    });
+    let deadline = spec.timeout.map(|t| started + t);
+    let mut killed = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        let expired = deadline.is_some_and(|d| Instant::now() >= d);
+        if expired || cancel.is_cancelled() {
+            tracing::warn!(
+                action = spec.name,
+                reason = if expired { "timeout" } else { "guest killed" },
+                "killing host action"
+            );
+            kill_group(&mut child);
+            killed = true;
+            break child.wait();
+        }
+        std::thread::sleep(POLL);
+    };
+    // An action is one job: whatever it left running in its process group
+    // goes with it, instead of holding the output pipes open.
+    kill_process_group(&child);
+    // Output still in the pipes arrives at once. A descendant that left the
+    // group (`setsid`, a daemon) may keep them open for good; it must not
+    // hold up the action, and with it every later one.
+    let until = Instant::now() + DRAIN_GRACE;
+    let (out, out_done) = out.finish(until);
+    let (mut err, err_done) = err.finish(until);
+    if !(out_done && err_done) {
+        tracing::warn!(
+            action = spec.name,
+            "a process started by the action still holds its output open; stopped reading"
+        );
+        err.0.extend_from_slice(
+            b"\nclaustrum: a background process started by the action still holds its output \
+              open; stopped reading\n",
+        );
+    }
     let status =
         status.map_err(|e| format!("waiting for `{}` failed: {e}", spec.program.display()))?;
 
@@ -152,15 +194,19 @@ pub(crate) fn execute(
         stderr: err.0,
         stderr_truncated: err.1,
         duration: started.elapsed(),
-        restored: restore(&snapshot),
+        restored: Vec::new(),
+        restore_failed: Vec::new(),
         network_notes: Vec::new(),
     };
-    if !outcome.restored.is_empty() {
-        let names: Vec<_> = outcome
-            .restored
+    (outcome.restored, outcome.restore_failed) = restore(&snapshot);
+    let names = |paths: &[PathBuf]| {
+        paths
             .iter()
             .map(|p| p.display().to_string())
-            .collect();
+            .collect::<Vec<_>>()
+    };
+    if !outcome.restored.is_empty() {
+        let names = names(&outcome.restored);
         tracing::warn!(action = spec.name, files = ?names, "action changed protected files; restored");
         outcome.stderr.extend_from_slice(
             format!(
@@ -169,11 +215,69 @@ pub(crate) fn execute(
             )
             .as_bytes(),
         );
-        if outcome.exit_code == 0 {
-            outcome.exit_code = 1;
-        }
+    }
+    if !outcome.restore_failed.is_empty() {
+        let names = names(&outcome.restore_failed);
+        tracing::error!(action = spec.name, files = ?names, "action changed protected files; restoring them failed");
+        outcome.stderr.extend_from_slice(
+            format!(
+                "\nclaustrum: the action modified protected file(s) {} and they could NOT be restored; inspect them before the next run\n",
+                names.join(", ")
+            )
+            .as_bytes(),
+        );
+    }
+    if (!outcome.restored.is_empty() || !outcome.restore_failed.is_empty())
+        && outcome.exit_code == 0
+    {
+        outcome.exit_code = 1;
     }
     Ok(outcome)
+}
+
+/// Open the directory `path` (absolute and free of links when the action
+/// was compiled) one component at a time, refusing any link on the way.
+#[cfg(unix)]
+fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+            unix::ffi::OsStrExt as _,
+        },
+    };
+    let open = |dir: libc::c_int, name: &CString| {
+        // SAFETY: `name` is a valid C string; the result is checked.
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: a fresh descriptor owned by nobody else.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    let mut dir = open(libc::AT_FDCWD, &CString::new("/")?)?;
+    for c in path.components() {
+        match c {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                let name = CString::new(name.as_bytes())?;
+                dir = open(dir.as_raw_fd(), &name)?;
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "the path is not absolute and normalised",
+                ));
+            }
+        }
+    }
+    Ok(dir)
 }
 
 /// The environment every action starts from.
@@ -204,40 +308,86 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 }
 
 fn kill_group(child: &mut std::process::Child) {
+    kill_process_group(child);
+    let _ = child.kill();
+}
+
+/// SIGKILL the child's process group. The child is its leader (see
+/// `execute`), so this reaches everything it spawned that did not start a
+/// group or session of its own. After the child exited, the id stays
+/// reserved for the group while any member is alive; without members
+/// killpg fails with ESRCH (short of the pid space wrapping around first).
+fn kill_process_group(child: &std::process::Child) {
     #[cfg(unix)]
     {
-        // The child is the leader of its own process group (see `execute`),
-        // so this reaches everything it spawned.
-        // SAFETY: killpg has no memory-safety preconditions; a stale pid can
-        // at worst fail with ESRCH.
+        // SAFETY: killpg has no memory-safety preconditions; a group
+        // without members fails with ESRCH.
         unsafe {
             libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
         }
     }
-    let _ = child.kill();
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
-/// Read a stream to EOF, keeping at most `limit` bytes.
-fn drain(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let mut truncated = false;
+/// How long the output is still read after the action ended.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Output captured by a reader thread of its own. The thread is detached:
+/// if a leftover process keeps the pipe open it stays blocked in `read`
+/// (holding at most `limit` bytes) until that process exits, but the action
+/// does not wait for it.
+struct Drain {
+    captured: Arc<Mutex<(Vec<u8>, bool)>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl Drain {
+    fn start(reader: impl Read + Send + 'static, limit: usize) -> Drain {
+        let captured = Arc::new(Mutex::new((Vec::new(), false)));
+        let (tx, done) = mpsc::channel();
+        let buf = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            drain(reader, limit, &buf);
+            drop(tx);
+        });
+        Drain { captured, done }
+    }
+
+    /// What was read so far, and whether the stream reached its end, waiting
+    /// for that at most until `until`.
+    fn finish(self, until: Instant) -> ((Vec<u8>, bool), bool) {
+        let wait = until.saturating_duration_since(Instant::now());
+        // The sender is only dropped, never used: disconnected means done.
+        let done = matches!(
+            self.done.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        let mut captured = self.captured.lock().unwrap_or_else(|e| e.into_inner());
+        (std::mem::take(&mut *captured), done)
+    }
+}
+
+/// Read a stream to EOF, keeping at most `limit` bytes in `captured`.
+fn drain(mut reader: impl Read, limit: usize, captured: &Mutex<(Vec<u8>, bool)>) {
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
+                let mut c = captured.lock().unwrap_or_else(|e| e.into_inner());
+                let (buf, truncated) = &mut *c;
                 let room = limit.saturating_sub(buf.len());
                 let take = room.min(n);
                 buf.extend_from_slice(&chunk[..take]);
                 if take < n {
-                    truncated = true;
+                    *truncated = true;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
-    (buf, truncated)
 }
 
 /// State of a protected path, observed without following links.
@@ -279,19 +429,23 @@ impl Entry {
         }
     }
 
-    /// Same contents in the same file (a hard link to another file with
-    /// equal bytes still counts as changed).
+    /// Same contents and permissions in the same file (a hard link to
+    /// another file with equal bytes still counts as changed).
     fn unchanged(&self, before: &Entry) -> bool {
         match (self, before) {
             (Entry::Absent, Entry::Absent) => true,
             (
                 Entry::File {
-                    bytes: a, id: ia, ..
+                    bytes: a,
+                    mode: ma,
+                    id: ia,
                 },
                 Entry::File {
-                    bytes: b, id: ib, ..
+                    bytes: b,
+                    mode: mb,
+                    id: ib,
                 },
-            ) => a == b && ia == ib,
+            ) => a == b && ma == mb && ia == ib,
             _ => false,
         }
     }
@@ -329,24 +483,29 @@ fn snapshot(protected: &[PathBuf]) -> Vec<(PathBuf, Entry)> {
         .collect()
 }
 
-/// Put back every protected file the action changed; returns those paths.
+/// Put back every protected file the action changed; returns the paths
+/// restored and those that could not be.
 ///
 /// This runs outside any OS sandbox, so it never writes through what the
 /// action left behind: links in place of the file or of a parent directory
 /// are removed, directories are moved aside instead of deleted, and the
 /// original contents go to a new file that is renamed into place.
-fn restore(snapshot: &[(PathBuf, Entry)]) -> Vec<PathBuf> {
+fn restore(snapshot: &[(PathBuf, Entry)]) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut restored = Vec::new();
+    let mut failed = Vec::new();
     for (path, before) in snapshot {
         if ancestors_intact(path) && Entry::observe(path).unchanged(before) {
             continue;
         }
-        if let Err(e) = restore_one(path, before) {
-            tracing::error!(path = %path.display(), error = %e, "cannot restore protected file");
+        match restore_one(path, before) {
+            Ok(()) => restored.push(path.clone()),
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "cannot restore protected file");
+                failed.push(path.clone());
+            }
         }
-        restored.push(path.clone());
     }
-    restored
+    (restored, failed)
 }
 
 fn restore_one(path: &Path, before: &Entry) -> std::io::Result<()> {
@@ -380,6 +539,12 @@ fn restore_one(path: &Path, before: &Entry) -> std::io::Result<()> {
     let written = opts.open(&tmp).and_then(|mut f| {
         use std::io::Write;
         f.write_all(bytes)?;
+        // The mode given to open is masked by the umask; set it exactly.
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(*m))?;
+        }
         f.sync_all()
     });
     // rename replaces a file or link at `path` without following it.
@@ -533,6 +698,41 @@ mod tests {
         assert!(out.stdout_truncated);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_swapped_for_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let s = ActionDef {
+            name: "t".into(),
+            command: vec!["/bin/pwd".into()],
+            cwd: Some("sub".into()),
+            ..Default::default()
+        }
+        .compile(&CompileContext {
+            workspace: &ws,
+            default_timeout: None,
+            max_output_bytes: 4096,
+            resolve_programs: true,
+        })
+        .unwrap();
+        let out = run(&s, &ws, &[]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            ws.join("sub").display().to_string()
+        );
+
+        std::fs::remove_dir(ws.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("sub")).unwrap();
+        let bound = bind(&s, &[], &BTreeMap::new(), crate::WORKSPACE, &ws).unwrap();
+        let err = execute(&s, &bound, &[], &BTreeMap::new(), &Cancel::new(), None).unwrap_err();
+        assert!(err.contains("changed since startup"), "{err}");
+    }
+
     #[test]
     fn timeout_kills_the_process_group() {
         let ws = tempfile::tempdir().unwrap();
@@ -560,6 +760,83 @@ mod tests {
         // SAFETY: signal 0 only checks for existence.
         let alive = unsafe { libc::kill(gpid, 0) } == 0;
         assert!(!alive, "grandchild {gpid} survived");
+    }
+
+    fn pid_in(file: &Path) -> i32 {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks for existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn background_children_do_not_hold_up_a_finished_action() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        // The background sleep inherits stdout and would keep it open.
+        let s = spec(
+            &ws,
+            &[
+                "/bin/sh",
+                "-c",
+                "/bin/sleep 30 & echo $! > gpid; echo started",
+            ],
+            None,
+        );
+        let started = Instant::now();
+        let out = run(&s, &ws, &[]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.killed);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        let gpid = pid_in(&ws.join("gpid"));
+        assert!(!alive(gpid), "background child {gpid} survived");
+    }
+
+    #[test]
+    fn a_descendant_in_its_own_session_does_not_hold_up_the_action() {
+        if !Path::new("/usr/bin/perl").exists() {
+            eprintln!("skipped: needs /usr/bin/perl for setsid");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        // Out of reach of killpg, holding stdout and stderr open.
+        let s = spec(
+            &ws,
+            &[
+                "/bin/sh",
+                "-c",
+                "/usr/bin/perl -MPOSIX -e 'setsid(); open(my $f, \">\", \"ready\"); \
+                 close($f); exec \"/bin/sleep\", \"30\"' & echo $! > spid; \
+                 while [ ! -e ready ]; do /bin/sleep 0.05; done; echo started",
+            ],
+            Some(10),
+        );
+        let started = Instant::now();
+        let out = run(&s, &ws, &[]);
+        let spid = pid_in(&ws.join("spid"));
+        // SAFETY: plain kill of the test's own leftover.
+        unsafe { libc::kill(spid, libc::SIGKILL) };
+        assert!(
+            started.elapsed() < DRAIN_GRACE + Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "started\n");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("stopped reading"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -603,6 +880,53 @@ mod tests {
         assert_eq!(out.exit_code, 1);
         assert!(String::from_utf8_lossy(&out.stderr).contains("restored"));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_permissions_are_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let config = ws.join("claustrum.toml");
+        std::fs::write(&config, "# original\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let s = spec(&ws, &["/bin/sh", "-c", "chmod 666 claustrum.toml"], None);
+        let out = run(&s, &ws, std::slice::from_ref(&config));
+        assert_eq!(out.restored, std::slice::from_ref(&config));
+        assert!(out.restore_failed.is_empty());
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_restores_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root ignores the directory permissions");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().canonicalize().unwrap();
+        let config = ws.join("claustrum.toml");
+        std::fs::write(&config, "# original\n").unwrap();
+        // The restore needs a new file next to the config, which the
+        // read-only directory refuses.
+        let s = spec(
+            &ws,
+            &["/bin/sh", "-c", "echo hacked > claustrum.toml; chmod 555 ."],
+            None,
+        );
+        let out = run(&s, &ws, std::slice::from_ref(&config));
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(out.restored.is_empty(), "{out:?}");
+        assert_eq!(out.restore_failed, [config]);
+        assert_eq!(out.exit_code, 1);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("could NOT be restored"), "{stderr}");
+        assert!(!stderr.contains("were restored"), "{stderr}");
     }
 
     /// Runs `script` as an action in a fresh workspace with a protected

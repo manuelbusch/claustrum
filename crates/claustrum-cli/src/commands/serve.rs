@@ -33,10 +33,14 @@ pub struct Args {
 pub async fn run(config: Config, args: Args) -> Result<()> {
     let workspace = config.workspace(args.workspace.as_deref())?;
     config.migrate_state(&workspace);
-    let confined = config.confinement()?.active().map_err(anyhow::Error::msg)?;
+    let confinement = config.confinement()?;
+    let confined = confinement.active().map_err(anyhow::Error::msg)?;
     let network = config.network_policy(&workspace)?;
     eprintln!("claustrum: {}", Config::network_notice(&network));
-    eprintln!("claustrum: {}", Config::confinement_notice(confined));
+    eprintln!(
+        "claustrum: {}",
+        Config::confinement_notice(confinement.mode, confined)
+    );
     #[cfg(unix)]
     if confined {
         return broker::broker(config, &workspace).await;
@@ -87,18 +91,20 @@ mod broker {
         let specs = config.validate_actions(workspace)?;
         // So that the missing Claude Code settings have a directory that
         // bubblewrap can bind read-only (see `claustrum_confine::linux`).
-        let claude_dir = workspace.join(".claude");
-        std::fs::create_dir_all(&claude_dir)
-            .with_context(|| format!("cannot create {}", claude_dir.display()))?;
+        for claude_dir in config.claude_settings_dirs(workspace) {
+            std::fs::create_dir_all(&claude_dir)
+                .with_context(|| format!("cannot create {}", claude_dir.display()))?;
+        }
         let protected = resolve_all(&config.protected_paths(workspace));
         let log_path = policy
             .network
             .log
             .clone()
             .context("the network log path is not set")?;
+        claustrum_sandbox::net::rotate_full_log(&log_path);
 
         let plans: Option<Arc<dyn PlanStore>> = config
-            .host_plans(workspace)
+            .host_plans(workspace)?
             .map(|p| Arc::new(p) as Arc<dyn PlanStore>);
         let host: Option<Arc<ActionHost>> = if specs.is_empty() {
             None
@@ -408,13 +414,9 @@ mod broker {
         let _ = std::fs::remove_file(&own);
         report(
             "other-log-write",
-            std::fs::write(
-                config
-                    .network_log_path(workspace)
-                    .with_file_name("claustrum-probe.jsonl"),
-                "x",
-            )
-            .is_ok(),
+            config.network_log_path(workspace).is_ok_and(|log| {
+                std::fs::write(log.with_file_name("claustrum-probe.jsonl"), "x").is_ok()
+            }),
         );
         let plans = crate::config::claude_plans_dir();
         report("claude-plans-read", std::fs::read_dir(&plans).is_ok());

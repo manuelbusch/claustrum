@@ -4,7 +4,7 @@
 
 | Tool | Parameters (same as Claude Code) | Implementation |
 | --- | --- | --- |
-| `Bash` | `command`, `timeout` (ms, max 600 000), `description` | `bash -c` in a fresh WASIX process |
+| `Bash` | `command`, `timeout` (ms, max 600 000; 0 or none: the default), `description` | `bash -c` in a fresh WASIX process |
 | `Read` | `file_path`, `offset`, `limit` | native, `cat -n` style output |
 | `Write` | `file_path`, `content` | native, creates parent directories |
 | `Edit` | `file_path`, `old_string`, `new_string`, `replace_all` | native, exact string replacement |

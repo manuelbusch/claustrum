@@ -42,6 +42,15 @@ fn confine_helper() {
     });
 }
 
+/// Best effort, so that the tests run on machines without a backend; the
+/// ones about confinement check for one themselves.
+fn best_effort() -> claustrum_sandbox::Confinement {
+    claustrum_sandbox::Confinement {
+        mode: claustrum_sandbox::ConfinementMode::BestEffort,
+        ..Default::default()
+    }
+}
+
 async fn sandbox(workspace: &std::path::Path) -> Option<Sandbox> {
     sandbox_with(workspace, |b| b).await
 }
@@ -59,6 +68,7 @@ async fn sandbox_with(
     }
     let policy = Policy {
         default_timeout: Some(Duration::from_secs(60)),
+        confinement: best_effort(),
         ..Policy::default()
     };
     let mut builder = Sandbox::builder()
@@ -314,6 +324,18 @@ async fn host_links_cannot_leave_the_mount() {
     )
     .await;
     assert_eq!(allowed, "", "these attempts were not refused");
+
+    // `..` behind the link never reaches the directory above its target,
+    // whether the write is refused or lands in the workspace.
+    let _ = sb
+        .bash("echo x > absdir/../escaped.txt", ExecOptions::default())
+        .await
+        .unwrap();
+    let _ = sb.write("absdir/../escaped2.txt", "x\n").await;
+    let above = outside.path().canonicalize().unwrap();
+    let above = above.parent().unwrap();
+    assert!(!above.join("escaped.txt").exists());
+    assert!(!above.join("escaped2.txt").exists());
 
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET\n");
     let mut names: Vec<_> = std::fs::read_dir(outside.path())
@@ -699,6 +721,34 @@ async fn config_file_is_read_only() {
     assert_eq!(
         std::fs::read_to_string(ws.path().join("d/notes.txt")).unwrap(),
         "notes\nmore\n"
+    );
+}
+
+/// A mount written with a trailing slash or `.` is the same mount for the
+/// native tools as for Bash; a nested read-only one used to fall through
+/// to the writable workspace for them.
+#[tokio::test(flavor = "multi_thread")]
+async fn mount_paths_are_normalised() {
+    let ws = tempfile::tempdir().unwrap();
+    let ro = tempfile::tempdir().unwrap();
+    std::fs::write(ro.path().join("data.txt"), "data\n").unwrap();
+    let Some(sb) = sandbox_with(ws.path(), |b| b.mount("/workspace/./ro/", ro.path())).await else {
+        return;
+    };
+    let read = sb
+        .read("/workspace/ro/data.txt", ReadOptions::default())
+        .await
+        .unwrap();
+    assert!(read.content.contains("data"), "{}", read.content);
+    let err = sb
+        .write("/workspace/ro/data.txt", "changed\n")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("read-only"), "{err}");
+    assert!(!ws.path().join("ro").exists());
+    assert_eq!(
+        std::fs::read_to_string(ro.path().join("data.txt")).unwrap(),
+        "data\n"
     );
 }
 
@@ -1283,15 +1333,6 @@ async fn confined_actions_cannot_even_write_the_configuration() {
     let ws = tempfile::tempdir().unwrap();
     let config = ws.path().join("claustrum.toml");
     std::fs::write(&config, "# original\n").unwrap();
-    // The library default confines where the platform can.
-    let Some(sb) = sandbox_with(ws.path(), |b| {
-        b.protect(ws.path().join("claustrum.toml"))
-            .actions(test_actions())
-    })
-    .await
-    else {
-        return;
-    };
     if !claustrum_sandbox::Confinement::default()
         .active()
         .unwrap_or(false)
@@ -1299,6 +1340,19 @@ async fn confined_actions_cannot_even_write_the_configuration() {
         eprintln!("skipping: no confinement backend");
         return;
     }
+    // The library default requires confinement.
+    let Some(sb) = sandbox_with(ws.path(), |b| {
+        b.protect(ws.path().join("claustrum.toml"))
+            .actions(test_actions())
+            .policy(Policy {
+                default_timeout: Some(Duration::from_secs(60)),
+                ..Policy::default()
+            })
+    })
+    .await
+    else {
+        return;
+    };
     let out = sb
         .bash("host tamper", ExecOptions::default())
         .await
@@ -1394,6 +1448,7 @@ fn network_policy(network: claustrum_sandbox::NetworkPolicy) -> Policy {
     Policy {
         default_timeout: Some(Duration::from_secs(300)),
         network,
+        confinement: best_effort(),
         ..Policy::default()
     }
 }

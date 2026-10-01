@@ -8,13 +8,20 @@ your user with read access to most of the file system.
 | --- | --- | --- |
 | Programs execute code from the workspace, which Claude can write | `cargo` honours `.cargo/config.toml`, `build.rs`, proc macros; `git` honours `.git/config` and hooks; `npm` runs `package.json` scripts; `make` runs the Makefile | keep such actions confined; never `confine = "none"` for them |
 | Validated inputs are still interpreted by the program | `ext::sh -c …` is a valid git URL, `@file` reads a file for curl, `key=value` after `git -c` changes behaviour | keep patterns to the characters the program needs; check how it treats them |
-| Placeholders reaching an interpreter | `sh -c "… {x}"`, `python -c "{x}"` | refused at startup; put the code in a script and pass the input as an argument |
+| Placeholders reaching an interpreter | `sh -c "… {x}"`, `sh -ec {x}`, `python -c "{x}"`, `perl -M{x}`, `env sh -c {x}`, `git -c {x}`, `cargo --config {x}` | refused at startup; put the code in a script and pass the input as an argument |
+| Placeholders choosing the program | `env {x}`, `timeout 5 {x}`, `python3 {x}`, `find . -exec {x} ;` | refused at startup; name the program or script in the definition |
 | Environment values are inputs too | `RUSTFLAGS = "{flags}"`, `env_passthrough` of `PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND` | warned at startup; avoid |
 | Path inputs are checked before the program opens them | a file replaced by a symlink between check and open | do not rely on `path` inputs to keep a program away from host files |
 | Side effects leave the sandbox | `git push`, `npm publish` ship whatever the workspace contains | only declare commands you would let Claude run on the host directly |
 | Writable caches | `~/.cargo/bin`, `~/.cargo/config.toml`, shell profiles | never make a directory writable that the host executes from later |
 
-Claustrum refuses placeholders that reach an interpreter at startup and warns about
+Claustrum refuses placeholders that reach an interpreter at startup. It follows the option
+syntax of shells, interpreters (python, perl, node, ruby, php, awk, sed, ...) and wrappers
+(`env`, `nice`, `timeout`, `xargs`, `busybox`, ...) far enough to tell code from data: in
+`sh -c 'echo "$1"' sh {x}` the input is data (`$1`), in `sh -ec {x}` it is code. Where it
+cannot tell, it refuses: an option it does not know in a command with placeholders, a
+placeholder inside an option, and any placeholder for programs that hand their arguments to a
+shell or expand them (`sudo`, `ssh`, `watch`, `make`, `pwsh`, `open`, ...). It also warns about
 placeholders in environment values, risky variables, patterns that accept almost anything and
 `confine = "none"` for programs that run workspace code. The other risks in the table are not
 detected; they are up to you. Without OS confinement (`confine = "none"`,
