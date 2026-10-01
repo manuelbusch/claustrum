@@ -319,6 +319,102 @@ PY"#;
     }
 }
 
+/// x32 system calls (`nr | 0x40000000` with the x86_64 audit arch) match
+/// no seccompiler rule; they must not get around the filter.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn x32_system_calls_are_refused() {
+    let (_d, ws) = workspace();
+    let p = profile(&ws);
+    // socket(AF_UNIX) and unshare(CLONE_NEWUSER), both refused natively,
+    // through the x32 numbers (41 and 272 with the x32 bit).
+    let script = r#"python3 - <<'PY'
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+for name, nr, args in (("socket", 41, (1, 1, 0)), ("unshare", 272, (0x10000000,))):
+    r = libc.syscall(0x40000000 | nr, *args)
+    print(name, 0 if r >= 0 else ctypes.get_errno())
+PY"#;
+    let (ok, out) = run(&p, script);
+    assert!(ok, "{out}");
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let errno: i32 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|e| e.parse().ok())
+            .unwrap_or(-1);
+        assert_eq!(errno, libc::ENOSYS, "{line}\n{out}");
+    }
+}
+
+/// Only IP sockets, in every network mode: families that no namespace
+/// confines (vsock, kernel crypto) are refused like Unix sockets.
+#[test]
+fn only_ip_socket_families_are_allowed() {
+    let (_d, ws) = workspace();
+    let script = r#"python3 - <<'PY'
+import socket
+for name, family, ty in (
+    ("unix", socket.AF_UNIX, socket.SOCK_STREAM),
+    ("netlink", socket.AF_NETLINK, socket.SOCK_RAW),
+    ("alg", 38, socket.SOCK_SEQPACKET),
+    ("vsock", 40, socket.SOCK_STREAM),
+    ("can", 29, socket.SOCK_RAW),
+):
+    try:
+        socket.socket(family, ty, 0).close()
+        print(name, 0)
+    except OSError as e:
+        print(name, e.errno)
+PY"#;
+    for net in [Network::None, Network::Outbound, Network::Any] {
+        let mut p = profile(&ws);
+        p.network = net;
+        let (ok, out) = run(&p, script);
+        assert!(ok, "{out}");
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            let errno: i32 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|e| e.parse().ok())
+                .unwrap_or(-1);
+            assert_eq!(errno, libc::EPERM, "{net:?}: {line}\n{out}");
+        }
+    }
+}
+
+/// Without bubblewrap, only Landlock's TCP rules (ABI 4) keep a loopback
+/// profile on its port; an older kernel must refuse it, not run it with
+/// TCP open to everywhere.
+#[test]
+fn loopback_without_bubblewrap_needs_tcp_rules() {
+    setup();
+    if backend().unwrap() != Backend::Landlock {
+        eprintln!("skipped: bubblewrap provides a network namespace");
+        return;
+    }
+    // SAFETY: with a null attribute and the VERSION flag the call only
+    // returns the ABI version.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            1u32,
+        )
+    };
+    let (_d, ws) = workspace();
+    let mut p = profile(&ws);
+    p.network = Network::Loopback(1);
+    let result = command(&p, Path::new("/bin/sh"));
+    if abi < 4 {
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Landlock ABI"), "{err}");
+    } else {
+        result.unwrap();
+    }
+}
+
 #[test]
 fn name_service_lookups_work_without_unix_sockets() {
     // glibc's NSS modules for systemd (nss-resolve, nss-systemd) talk over

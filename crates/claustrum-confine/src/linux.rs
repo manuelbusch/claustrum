@@ -51,6 +51,9 @@ struct Spec {
     bwrap: bool,
 }
 
+/// First Landlock ABI with TCP port rules (Linux 6.7).
+const LANDLOCK_ABI_TCP: i64 = 4;
+
 fn landlock_abi() -> i64 {
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
     // SAFETY: with a null attribute pointer and the VERSION flag the call
@@ -83,7 +86,13 @@ pub(crate) fn backend() -> Result<Backend, Unavailable> {
                     landlock_abi = abi,
                     "bubblewrap is missing or cannot create namespaces: confining with Landlock \
                      only (no read-only protection inside writable directories, no private \
-                     network namespace)"
+                     network namespace{})",
+                    if abi < LANDLOCK_ABI_TCP {
+                        "; this kernel cannot restrict TCP either, so host actions that \
+                         must use the proxy are refused"
+                    } else {
+                        ""
+                    }
                 );
                 Ok(Backend::Landlock)
             }
@@ -157,6 +166,18 @@ pub(crate) fn command(
     let helper = helper_binary()?;
     let profile = resolved(profile);
     let bwrap = backend == Backend::Bubblewrap;
+    // Without bubblewrap's network namespace, only Landlock's TCP rules keep
+    // a loopback profile on the proxy port; seccomp lets TCP through.
+    if !bwrap && matches!(profile.network, Network::Loopback(_)) {
+        let abi = landlock_abi();
+        if abi < LANDLOCK_ABI_TCP {
+            return Err(Unavailable(format!(
+                "{}: without bubblewrap, keeping TCP on the proxy port needs Landlock ABI \
+                 {LANDLOCK_ABI_TCP} (Linux 6.7), and this kernel has ABI {abi}",
+                profile.name
+            )));
+        }
+    }
     let json = serde_json::to_string(&Spec {
         profile: profile.clone(),
         bwrap,
@@ -515,9 +536,21 @@ fn apply_landlock(spec: &Spec) -> Result<(), String> {
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| e.to_string())?;
     if !handle_net.is_empty() {
+        // Best effort would silently drop TCP rules on kernels without them
+        // (the status then only says "partially enforced", as it does for
+        // any newer feature). Without bubblewrap they are all that keeps a
+        // loopback profile on the proxy port, so there they are required;
+        // `command` refuses such a profile before it gets here.
+        let net_required = !spec.bwrap && matches!(p.network, Network::Loopback(_));
         ruleset = ruleset
+            .set_compatibility(if net_required {
+                CompatLevel::HardRequirement
+            } else {
+                CompatLevel::BestEffort
+            })
             .handle_access(handle_net)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("cannot restrict TCP: {e}"))?
+            .set_compatibility(CompatLevel::BestEffort);
     }
     ruleset = ruleset
         .scope(Scope::AbstractUnixSocket | Scope::Signal)
@@ -621,16 +654,20 @@ fn apply_seccomp(spec: &Spec) -> Result<(), String> {
     }
     rules.insert(libc::SYS_clone, clone_rules);
 
-    // Sockets: never new Unix sockets (host daemons such as docker.sock are
-    // reachable through them) or raw packet access; IP only as the profile
-    // allows.
-    let mut socket_rules = Vec::new();
-    for domain in [libc::AF_UNIX, libc::AF_NETLINK, libc::AF_PACKET] {
-        socket_rules.push(
-            SeccompRule::new(vec![cond(0, Len::Dword, Op::Eq, domain as u64)?])
-                .map_err(|e| e.to_string())?,
-        );
-    }
+    // Sockets: IP only, and only as the profile allows. Every other family
+    // is refused, whether listed here or added to the kernel later: Unix
+    // sockets (host daemons such as docker.sock are reachable through
+    // them), netlink, packet, and families that no network namespace
+    // confines, such as AF_VSOCK (the hypervisor) and AF_ALG (kernel
+    // crypto). No confined process needs them; the broker socket is
+    // inherited, not created.
+    let mut socket_rules = vec![
+        SeccompRule::new(vec![
+            cond(0, Len::Dword, Op::Ne, libc::AF_INET as u64)?,
+            cond(0, Len::Dword, Op::Ne, libc::AF_INET6 as u64)?,
+        ])
+        .map_err(|e| e.to_string())?,
+    ];
     let no_ip = p_no_ip(spec);
     for domain in [libc::AF_INET, libc::AF_INET6] {
         if no_ip {
@@ -687,9 +724,46 @@ fn apply_seccomp(spec: &Spec) -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error().to_string());
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        seccompiler::apply_filter(&x32_filter()).map_err(|e| e.to_string())?;
+    }
     seccompiler::apply_filter(&deny).map_err(|e| e.to_string())?;
     seccompiler::apply_filter(&clone3).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Refuses the x32 ABI. On kernels built with `CONFIG_X86_X32_ABI` its
+/// system calls report `AUDIT_ARCH_X86_64`, so they pass the architecture
+/// check every seccompiler filter starts with, and carry
+/// `__X32_SYSCALL_BIT` in their number, so they match none of its rules
+/// (keyed by exact number) and would get the default action, Allow: every
+/// rule above could be sidestepped. seccompiler cannot match a range of
+/// numbers, hence this hand-written filter; stacked filters all apply, the
+/// strictest result wins. Other architectures (i386, `int 0x80`) are
+/// already killed by the architecture check.
+#[cfg(target_arch = "x86_64")]
+fn x32_filter() -> seccompiler::BpfProgram {
+    use seccompiler::sock_filter;
+    const LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    const JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
+    const RET_K: u16 = 0x06; // BPF_RET | BPF_K
+    const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    let op = |code, k, jt, jf| sock_filter { code, jt, jf, k };
+    vec![
+        // seccomp_data.arch
+        op(LD_W_ABS, 4, 0, 0),
+        op(JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        op(RET_K, libc::SECCOMP_RET_KILL_PROCESS, 0, 0),
+        // seccomp_data.nr
+        op(LD_W_ABS, 0, 0, 0),
+        op(JGE_K, X32_SYSCALL_BIT, 0, 1),
+        // What a kernel without x32 answers.
+        op(RET_K, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32, 0, 0),
+        op(RET_K, libc::SECCOMP_RET_ALLOW, 0, 0),
+    ]
 }
 
 /// No IP sockets at all: no network, and no private namespace that would
@@ -701,6 +775,20 @@ fn p_no_ip(spec: &Spec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_filter_is_well_formed() {
+        let f = x32_filter();
+        assert_eq!(f.len(), 7);
+        // Both jumps land inside the program.
+        for (i, ins) in f.iter().enumerate() {
+            if ins.code & 0x07 == 0x05 {
+                assert!(i + 1 + (ins.jt.max(ins.jf) as usize) < f.len(), "{i}");
+            }
+        }
+        assert_eq!(f[5].k, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
+    }
 
     #[test]
     fn carve_grants_siblings_of_denied_paths() {
